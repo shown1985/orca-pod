@@ -1,4 +1,4 @@
-# my-orca-sdlc-kit — 定制版三轨编排脚手架说明
+# orca-pod — 定制版三轨编排脚手架说明
 
 本仓库基于开源项目 [`vankhangfet/orca-sdlc-kit`](https://github.com/vankhangfet/orca-sdlc-kit) 定制构建。核心编排引擎 `.orca/flow.mjs` 与 `.orca/agent-config.mjs` 保持上游原版零魔改，所有定制均收口在三轨配置模板、Prompts、工程/设计规范文件、CI 模板与 `bin/init.mjs` 安装器中，确保日后可平滑同步上游更新。
 
@@ -11,19 +11,21 @@
 在目标业务仓库根目录执行：
 
 ```bash
-npx /Users/shawn/agents-dev-kit/my-orca-sdlc-kit
+npx /Users/shawn/agents-dev-kit/orca-pod
 ```
 
-### 2. 从私有 GitHub / Gitea 仓库一键安装
+### 2. 从 GitHub / 私有 Gitea 仓库一键安装
 
-推送到你自己的私有仓库后，可在任意机器执行：
+推送到你的仓库后，可在任意机器执行：
 
 ```bash
-# GitHub 私有库（依赖本机 SSH 密钥）
-npx git+ssh://git@github.com/<你的用户名>/my-orca-sdlc-kit.git
+# GitHub（公开或已配置 SSH 密钥的私有库）
+npx github:shown1985/orca-pod
+# 或显式 SSH 方式
+npx git+ssh://git@github.com/shown1985/orca-pod.git
 
 # Gitea 私有库
-npx git+ssh://git@<你的-gitea-域名>/<你的用户名>/my-orca-sdlc-kit.git
+npx git+ssh://git@<你的-gitea-域名>/shown1985/orca-pod.git
 ```
 
 ### 3. 安全不覆盖与强制更新机制
@@ -31,7 +33,7 @@ npx git+ssh://git@<你的-gitea-域名>/<你的用户名>/my-orca-sdlc-kit.git
 - **默认安全模式**：已存在的自定义文件（如 `AGENTS.md`、`DESIGN.md`、`.worktreeinclude`、`.orca/flow.config.json`、`ci-release.yml`）**不会被覆盖**，安装脚本会保留你的本地版本并输出 `diff -u` 合并提示命令。
 - **强制覆盖模式**（仅在确认需要用脚手架模板整体覆盖时使用）：
   ```bash
-  npx /Users/shawn/agents-dev-kit/my-orca-sdlc-kit --force
+  npx /Users/shawn/agents-dev-kit/orca-pod --force
   ```
 
 ---

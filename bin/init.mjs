@@ -1,11 +1,12 @@
 #!/usr/bin/env node
-// my-orca-sdlc-kit — npx scaffolder (delivery only, not pipeline logic).
+// orca-pod — npx scaffolder (delivery only, not pipeline logic).
 // Copies the customized 3-Track Orca SDLC kit into the CWD (the user's project root).
 // Zero dependencies: Node builtins only.
 //
 // Usage:
-//   npx /path/to/my-orca-sdlc-kit            # install (existing user files kept safely)
-//   npx /path/to/my-orca-sdlc-kit --force    # overwrite existing files
+//   npx /path/to/orca-pod                    # install (existing user files kept safely)
+//   npx github:shown1985/orca-pod            # install directly from GitHub
+//   npx /path/to/orca-pod --force            # overwrite existing files
 //
 // Rules:
 //   - explicit whitelist ONLY: the repo's .orca/ also holds dev/runtime junk
@@ -18,8 +19,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const KIT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const log = (...a) => console.log("[my-orca-sdlc-kit]", ...a);
-const die = (m) => { console.error("[my-orca-sdlc-kit] ERROR:", m); process.exit(1); };
+const log = (...a) => console.log("[orca-pod]", ...a);
+const die = (m) => { console.error("[orca-pod] ERROR:", m); process.exit(1); };
 
 // Whitelist — mirrors package.json "files". KEEP THE TWO LISTS IN SYNC.
 const FILES = [

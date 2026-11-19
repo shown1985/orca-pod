@@ -1,0 +1,10 @@
+# .worktreeinclude — 派生新 Git Worktree 时自动复制的本地忽略文件
+# 用于确保并发 Worktree 拥有必要的本地环境变量与私有配置（不会提交到 Git）
+
+.env
+.env.local
+.env.development
+.env.development.local
+.env.test
+.env.test.local
+.npmrc

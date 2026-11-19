@@ -1,16 +1,16 @@
 #!/usr/bin/env node
-// Orca SDLC Flow Kit — npx scaffolder (delivery only, not pipeline logic).
-// Copies the kit into the CWD (the user's project root). Zero dependencies:
-// Node builtins only. Spec: docs/superpowers/specs/2026-09-06-npx-install-design.md
+// my-orca-sdlc-kit — npx scaffolder (delivery only, not pipeline logic).
+// Copies the customized 3-Track Orca SDLC kit into the CWD (the user's project root).
+// Zero dependencies: Node builtins only.
 //
 // Usage:
-//   npx github:vankhangfet/orca-sdlc-kit            # install (existing files kept)
-//   npx github:vankhangfet/orca-sdlc-kit --force    # overwrite existing files
+//   npx /path/to/my-orca-sdlc-kit            # install (existing user files kept safely)
+//   npx /path/to/my-orca-sdlc-kit --force    # overwrite existing files
 //
 // Rules:
 //   - explicit whitelist ONLY: the repo's .orca/ also holds dev/runtime junk
 //     (artifacts/, status-preview/, usage-test/) that must never ship.
-//   - never clobber existing files without --force (safe upgrades).
+//   - never clobber existing files without --force (safe upgrades + merge hint).
 //   - no interactive prompts (must be scriptable in CI).
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
@@ -18,8 +18,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const KIT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const log = (...a) => console.log("[orca-sdlc-kit]", ...a);
-const die = (m) => { console.error("[orca-sdlc-kit] ERROR:", m); process.exit(1); };
+const log = (...a) => console.log("[my-orca-sdlc-kit]", ...a);
+const die = (m) => { console.error("[my-orca-sdlc-kit] ERROR:", m); process.exit(1); };
 
 // Whitelist — mirrors package.json "files". KEEP THE TWO LISTS IN SYNC.
 const FILES = [
@@ -28,17 +28,39 @@ const FILES = [
   ".orca/designer.mjs",
   ".orca/designer.html",
   ".orca/flow.config.json",
+  ".orca/flow-hotfix.json",
+  ".orca/flow-feature.json",
+  ".orca/flow-epic.json",
   ".orca/fixbug.config.json",
   ".orca/cr.config.json",
   ".orca/CONFIGURATION.md",
   ".orca/README.md",
   ".orca/notify.json",
+  ".orca/prompts/triage-po.md",
+  ".orca/prompts/frontend-worker.md",
+  ".orca/prompts/senior-auditor.md",
   ".orca/workflow-template/README.md",
   ".orca/workflow-template/sdlc.config.json",
   ".orca/workflow-template/fixbug.config.json",
   ".orca/workflow-template/cr.config.json",
+  "AGENTS.md",
+  "DESIGN.md",
+  ".worktreeinclude",
+  ".github/workflows/ci-release.yml",
+  ".gitea/workflows/ci-release.yml",
   "orca.yaml",
 ];
+
+// Files that users frequently customize in their own repos — highlight merge hints if skipped.
+const MERGE_SENSITIVE = new Set([
+  "AGENTS.md",
+  "DESIGN.md",
+  ".worktreeinclude",
+  "orca.yaml",
+  ".orca/flow.config.json",
+  ".github/workflows/ci-release.yml",
+  ".gitea/workflows/ci-release.yml",
+]);
 
 const force = process.argv.slice(2).includes("--force");
 
@@ -47,12 +69,14 @@ const missing = FILES.filter((f) => !existsSync(join(KIT_ROOT, f)));
 if (missing.length) die(`corrupt package — missing: ${missing.join(", ")}`);
 
 // --- Copy whitelist into CWD ---
-// writeFileSync creates no parent dirs, so mkdir each file's dir (recursive
-// covers .orca, .orca/workflow-template, and "." for root files like orca.yaml).
-const copied = [], skipped = [];
+const copied = [], skipped = [], mergeHints = [];
 try {
   for (const f of FILES) {
-    if (existsSync(f) && !force) { skipped.push(f); continue; }
+    if (existsSync(f) && !force) {
+      skipped.push(f);
+      if (MERGE_SENSITIVE.has(f)) mergeHints.push(f);
+      continue;
+    }
     mkdirSync(dirname(f), { recursive: true });
     writeFileSync(f, readFileSync(join(KIT_ROOT, f)));   // Buffer copy = byte-exact
     copied.push(f);
@@ -69,14 +93,21 @@ if (gitignoreAdded) {
   catch (e) { die(`could not update .gitignore: ${e.message}`); }
 }
 
-// --- Report + next steps ---
+// --- Report + merge hints + next steps ---
 log(`installing into ${process.cwd()}`);
 for (const f of copied) log(`  installed   ${f}`);
 for (const f of skipped) log(`  kept yours  ${f}  (already exists; --force to overwrite)`);
 if (gitignoreAdded) log(`  updated     .gitignore  (+ ${GI_LINE})`);
+if (mergeHints.length) {
+  log("");
+  log("Safe merge hint — the following existing files were preserved:");
+  for (const f of mergeHints) {
+    log(`  diff -u "${f}" "${join(KIT_ROOT, f)}"`);
+  }
+}
 log("");
-log("Next steps:");
-log("  1. Orca: Settings -> Experimental -> enable Orchestration (check: orca status --json)");
-log("  2. Create a worktree in Orca — the hook prepares .orca/artifacts for you");
-log('  3. Preview, then run:  node .orca/flow.mjs --dry-run "Build a login page"');
-log('                        node .orca/flow.mjs "Build a login page"');
+log("Next steps (3-Track Workflow):");
+log("  1. Track 0 (Hotfix, <=3 files):  node .orca/flow.mjs --config flow-hotfix.json --dry-run \"#hotfix ...\"");
+log("  2. Track 1 (Feature, default):   node .orca/flow.mjs --dry-run \"#feat ...\"");
+log("  3. Track 2 (Epic / 0->1):        node .orca/flow.mjs --config flow-epic.json --dry-run \"#epic ...\"");
+log("  4. CI Secrets: set TOKENHUB_API_KEY in GitHub/Gitea repo secrets for headless PR summaries.");

@@ -1,13 +1,14 @@
 {
-  "name": "orca-sdlc-kit",
-  "version": "0.1.0",
-  "description": "Orca SDLC Flow Kit — a pipeline of AI agents inside Orca ADE whose every step lands on disk as verifiable output. This package is only the installer (npx scaffolding); the kit itself is one zero-dependency Node script that stays in your project.",
+  "name": "my-orca-sdlc-kit",
+  "version": "0.1.0-custom.1",
+  "description": "Customized 3-Track Orca SDLC Flow Kit — extends vankhangfet/orca-sdlc-kit with Track 0/1/2 pipelines, personal model-pool & reasoning-effort routing, AGENTS.md, Stitch-compatible DESIGN.md, custom prompts, and GitHub/Gitea TokenHub CI templates.",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/vankhangfet/orca-sdlc-kit.git"
   },
   "bin": {
+    "my-orca-sdlc-kit": "bin/init.mjs",
     "orca-sdlc-kit": "bin/init.mjs"
   },
   "scripts": {
@@ -19,15 +20,26 @@
     ".orca/designer.mjs",
     ".orca/designer.html",
     ".orca/flow.config.json",
+    ".orca/flow-hotfix.json",
+    ".orca/flow-feature.json",
+    ".orca/flow-epic.json",
     ".orca/fixbug.config.json",
     ".orca/cr.config.json",
     ".orca/CONFIGURATION.md",
     ".orca/README.md",
     ".orca/notify.json",
+    ".orca/prompts/triage-po.md",
+    ".orca/prompts/frontend-worker.md",
+    ".orca/prompts/senior-auditor.md",
     ".orca/workflow-template/README.md",
     ".orca/workflow-template/sdlc.config.json",
     ".orca/workflow-template/fixbug.config.json",
     ".orca/workflow-template/cr.config.json",
+    "AGENTS.md",
+    "DESIGN.md",
+    ".worktreeinclude",
+    ".github/workflows/ci-release.yml",
+    ".gitea/workflows/ci-release.yml",
     "orca.yaml",
     "bin/"
   ],

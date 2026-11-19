@@ -1,14 +1,14 @@
 {
-  "name": "my-orca-sdlc-kit",
+  "name": "orca-pod",
   "version": "0.1.0-custom.1",
   "description": "Customized 3-Track Orca SDLC Flow Kit — extends vankhangfet/orca-sdlc-kit with Track 0/1/2 pipelines, personal model-pool & reasoning-effort routing, AGENTS.md, Stitch-compatible DESIGN.md, custom prompts, and GitHub/Gitea TokenHub CI templates.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vankhangfet/orca-sdlc-kit.git"
+    "url": "git+https://github.com/shown1985/orca-pod.git"
   },
   "bin": {
-    "my-orca-sdlc-kit": "bin/init.mjs",
+    "orca-pod": "bin/init.mjs",
     "orca-sdlc-kit": "bin/init.mjs"
   },
   "scripts": {

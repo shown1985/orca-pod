@@ -2,13 +2,14 @@
   "//": "flow-feature.json — Track 1 标准通道（#feat / 单个明确 Feature 或常规 Bug，也是默认 flow.config.json 指向的轨道）。",
   "//usage": "node .orca/flow.mjs --config flow-feature.json \"#feat <需求或常规 Bug 描述>\"",
   "//switch": "切换轨道：Track 0 (--config flow-hotfix.json) | Track 1 (默认 flow.config.json / --config flow-feature.json) | Track 2 (--config flow-epic.json)",
-  "//workflow": "轻量跳过完整 PO（<=10 行微型 Plan）-> 单 Worktree 编码+单测 ->（如涉 UI 走 Playwright 1440px+390px Visual Gate）-> GPT-6.2 Sol (High) 跨家族审查 (Max Retry=2) -> 提 PR 触发 CI。",
-  "//modelPool": {
-    "micro-plan & visual-gate": "Gemini 4 Neon (Medium，禁止对 Carbon/Neon 开 Low)。",
-    "coding (70% 常规)": "DeepSeek-V4.1-Flash-1017 (High, OpenCode Go；疑难 Bug 可临时切 Max)。",
-    "coding (30% 复杂终端排错/深度重构)": "可临时 --agent coding=opencode 并切 Kimi K3.1 Pro / Kimi K2.7 Code 或 GLM-5.3 (手动降为 Low/High，严禁放任 GLM-5.3 走默认 Max 卡死并发队列)。",
-    "code-review": "GPT-6.2 Sol (High, Codex CLI；绝对不要开 Max)。",
-    "pr-submit": "DeepSeek-V4.1-Flash-1017 (Low) 或 Hy4 flash / Gemini 4 Hydrogen (Low/Medium)。"
+  "//workflow": "轻量跳过完整 PO（<=10 行微型 Plan）-> 单 Worktree 编码+单测 ->（如涉 UI 走 Playwright 1440px+390px Visual Gate）-> 跨家族审查 (Max Retry=2) -> 提 PR 触发 CI。",
+  "//modelNote": "默认 model 均为 \"default\"（沿用各 CLI 自身默认配置，可自由替换为任意闭源或开源模型）。下方为参考推荐组合，如需锁定模型将对应步骤的 model 改为实际模型 ID 即可。",
+  "//recommendedModelPool": {
+    "micro-plan & visual-gate": "参考：Gemini 4 Neon (Medium，禁止对 Carbon/Neon 开 Low) 或其他多模态模型。",
+    "coding (70% 常规)": "参考：DeepSeek-V4.1-Flash-1017 (High；疑难 Bug 可临时切 Max) 或任意高吞吐开源/闭源编码模型。",
+    "coding (30% 复杂终端排错/深度重构)": "参考：Kimi K3.1 Pro / Kimi K2.7 Code 或 GLM-5.3 (手动降为 Low/High，严禁放任 GLM-5.3 走默认 Max 卡死并发队列)。",
+    "code-review": "参考：GPT-6.2 Sol (High，绝对不要开 Max) 或任意与编码模型不同家族的强推理模型。",
+    "pr-submit": "参考：DeepSeek-V4.1-Flash-1017 (Low) 或 Hy4 flash / Gemini 4 Hydrogen (Low/Medium)。"
   },
   "artifactsDir": ".orca/artifacts",
   "maxRetries": 2,
@@ -40,22 +41,22 @@
       "title": "Micro Plan (<=10 lines)",
       "enabled": true,
       "agent": "gemini",
-      "model": "gemini-4-neon",
-      "effort": "medium",
+      "model": "default",
+      "//recommendedModel": "gemini-4-neon (effort: medium; never low) or any coordinator model",
       "writes": "MICRO_PLAN.md",
       "reads": [],
       "skills": [
         "triage-po"
       ],
-      "spec": "You are a Track 1 (#feat) lightweight coordinator (Gemini 4 Neon, Medium effort — never Low). Skip full PO/Backlog ceremonies. Inspect the repo briefly and write {out} as a MICRO PLAN strictly within 10 bullet lines covering: (1) exact goal & scope, (2) target files to touch, (3) unit test cases to add/update, (4) whether UI/UX is touched (`UI_TOUCHED: yes|no` — if yes, Visual Gate applies against DESIGN.md), and (5) acceptance criteria. Do NOT write code."
+      "spec": "You are a Track 1 (#feat) lightweight coordinator. Skip full PO/Backlog ceremonies. Inspect the repo briefly and write {out} as a MICRO PLAN strictly within 10 bullet lines covering: (1) exact goal & scope, (2) target files to touch, (3) unit test cases to add/update, (4) whether UI/UX is touched (`UI_TOUCHED: yes|no` — if yes, Visual Gate applies against DESIGN.md), and (5) acceptance criteria. Do NOT write code."
     },
     {
       "id": "coding",
       "title": "Single-Worktree Coding & Unit Tests",
       "enabled": true,
       "agent": "opencode",
-      "model": "deepseek-v4.1-flash-1017",
-      "effort": "high",
+      "model": "default",
+      "//recommendedModel": "deepseek-v4.1-flash-1017 (effort: high) or kimi-k3.1-pro / glm-5.3 (low/high, never max)",
       "writes": "CHANGES.md",
       "progress": "TASKS.md",
       "reads": [
@@ -66,15 +67,15 @@
       ],
       "onFailGoto": null,
       "hardTimeoutMs": 7200000,
-      "spec": "You are a Track 1 single-worktree coding worker (DeepSeek-V4.1-Flash-1017, High effort). FIRST ACTION - TASK CHECKLIST: break down {reads} into a Markdown checklist in {tasks} ('- [ ]' / '- [~]' / '- [x]') and update it live. Implement the feature/bugfix cleanly in this worktree, add/update unit tests, and run lint, typecheck, and unit tests until green. If UI is touched, follow DESIGN.md strictly (anti-AI-slop rules, 4 states: Default/Loading Skeleton/Empty/Error, component reuse) and capture Playwright screenshots (1440px desktop + 390px mobile) under .orca/artifacts/screenshots/ if available. If re-run after failed visual-gate or code-review, read VISUAL_GATE.md and REVIEW.md and resolve every issue. Write {out} with changed files, design/test notes, and command outputs."
+      "spec": "You are a Track 1 single-worktree coding worker. FIRST ACTION - TASK CHECKLIST: break down {reads} into a Markdown checklist in {tasks} ('- [ ]' / '- [~]' / '- [x]') and update it live. Implement the feature/bugfix cleanly in this worktree, add/update unit tests, and run lint, typecheck, and unit tests until green. If UI is touched, follow DESIGN.md strictly (anti-AI-slop rules, 4 states: Default/Loading Skeleton/Empty/Error, component reuse) and capture Playwright screenshots (1440px desktop + 390px mobile) under .orca/artifacts/screenshots/ if available. If re-run after failed visual-gate or code-review, read VISUAL_GATE.md and REVIEW.md and resolve every issue. Write {out} with changed files, design/test notes, and command outputs."
     },
     {
       "id": "visual-gate",
       "title": "Visual Gate (UI/UX Check)",
       "enabled": true,
       "agent": "gemini",
-      "model": "gemini-4-neon",
-      "effort": "medium",
+      "model": "default",
+      "//recommendedModel": "gemini-4-neon (effort: medium; never low) or any vision-capable reviewer model",
       "writes": "VISUAL_GATE.md",
       "reads": [
         "micro-plan",
@@ -83,15 +84,15 @@
       "onFailGoto": "coding",
       "maxRetries": 2,
       "timeoutMs": 900000,
-      "spec": "You are the Track 1 UI/UX Visual Gate reviewer (Gemini 4 Neon, Medium effort — never Low). Check {reads}: if MICRO_PLAN.md and git diff confirm NO UI/UX files were modified (`UI_TOUCHED: no`), record 'Visual Gate skipped (backend/non-UI change)' in {out} and return PASS (outcome=succeeded). Otherwise, inspect DESIGN.md and verify Playwright screenshots at 1440px desktop and 390px mobile (capture them into .orca/artifacts/screenshots/ if not yet captured). Audit strictly: token compliance, restrained whitespace, crisp typography hierarchy, 1px subtle borders, NO AI-slop purple/blue gradients or decorative filler cards, component reuse, and 4-state completeness (Default/Loading Skeleton/Empty/Error). Write {out} with VERDICT: PASS or FAIL (outcome=failed loops back to coding, maxRetries=2)."
+      "spec": "You are the Track 1 UI/UX Visual Gate reviewer. Check {reads}: if MICRO_PLAN.md and git diff confirm NO UI/UX files were modified (`UI_TOUCHED: no`), record 'Visual Gate skipped (backend/non-UI change)' in {out} and return PASS (outcome=succeeded). Otherwise, inspect DESIGN.md and verify Playwright screenshots at 1440px desktop and 390px mobile (capture them into .orca/artifacts/screenshots/ if not yet captured). Audit strictly: token compliance, restrained whitespace, crisp typography hierarchy, 1px subtle borders, NO AI-slop purple/blue gradients or decorative filler cards, component reuse, and 4-state completeness (Default/Loading Skeleton/Empty/Error). Write {out} with VERDICT: PASS or FAIL (outcome=failed loops back to coding, maxRetries=2)."
     },
     {
       "id": "code-review",
-      "title": "Cross-Family Code Review (GPT-6.2 Sol)",
+      "title": "Cross-Family Code Review",
       "enabled": true,
       "agent": "codex",
-      "model": "gpt-6.2-sol",
-      "effort": "high",
+      "model": "default",
+      "//recommendedModel": "gpt-6.2-sol (effort: high; NEVER max) or any cross-family senior reviewer model",
       "writes": "REVIEW.md",
       "reads": [
         "micro-plan",
@@ -105,15 +106,15 @@
       "maxRetries": 2,
       "timeoutMs": 1800000,
       "hardTimeoutMs": 5400000,
-      "spec": "You are a Track 1 cross-family senior reviewer (GPT-6.2 Sol, High effort — NEVER Max). Review git diff against {reads} and AGENTS.md. Check correctness, edge cases, security basics, test quality, and adherence to scope. Write {out} with BLOCKER/MAJOR/MINOR findings and VERDICT: if any BLOCKER/MAJOR exists, report FAIL (outcome=failed) to loop back to coding (hard cap Max Retry = 2); otherwise PASS."
+      "spec": "You are a Track 1 cross-family senior reviewer. Review git diff against {reads} and AGENTS.md. Check correctness, edge cases, security basics, test quality, and adherence to scope. Write {out} with BLOCKER/MAJOR/MINOR findings and VERDICT: if any BLOCKER/MAJOR exists, report FAIL (outcome=failed) to loop back to coding (hard cap Max Retry = 2); otherwise PASS."
     },
     {
       "id": "pr-submit",
       "title": "Open PR & Trigger CI",
       "enabled": true,
       "agent": "opencode",
-      "model": "deepseek-v4.1-flash-1017",
-      "effort": "low",
+      "model": "default",
+      "//recommendedModel": "deepseek-v4.1-flash-1017 / hy4-flash / gemini-4-hydrogen (effort: low/medium)",
       "writes": "PR_SUMMARY.md",
       "reads": [
         "micro-plan",
@@ -122,7 +123,7 @@
         "code-review"
       ],
       "onFailGoto": null,
-      "spec": "You are a Track 1 PR delivery assistant. Based on {reads}: (1) verify current branch is a feature/fix branch (NEVER push directly to main/master and NEVER auto-merge to main); (2) commit clean changes (never commit .orca/artifacts/), push with `git push -u origin HEAD`, and create/update a Pull Request targeting main (via `gh pr create` or `tea pr create` if available, else output ready-to-run PR command & body); (3) write a concise Chinese PR summary + test/visual verification checklist to {out}."
+      "spec": "You are a Track 1 PR delivery assistant. Based on {reads}: (1) verify current branch is a feature/fix branch (NEVER push directly to main/master and NEVER auto-merge to main); (2) commit clean changes (never commit .orca/artifacts/), push with `git push -u origin HEAD`, and create/update a Pull Request targeting main (via `gh pr create` or `tea pr create` if available, else output ready-to-run PR command & body); (3) write a concise PR summary + test/visual verification checklist to {out}."
     }
   ]
 }

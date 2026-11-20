@@ -11,7 +11,7 @@
 | 类别 | 新增 / 改造内容 | 核心价值 |
 |---|---|---|
 | **三轨工作流** | 新增 `.orca/flow-hotfix.json`（Track 0）、`.orca/flow-feature.json`（Track 1，默认 `flow.config.json`）、`.orca/flow-epic.json`（Track 2） | 按任务规模精准分流，避免“小改动走重流水线”或“大重构跳过契约” |
-| **模型池与推理强度路由** | 在三轨配置与规范中固化 `Gemini 4 Carbon / Neon`、`DeepSeek-V4.1-Flash-1017`、`Kimi K3.1 Pro / GLM-5.3`、`GPT-6.2 Sol` 分工与避坑规则 | 写审跨家族隔离，规避 `GLM-5.3` 默认 Max 阻塞、`GPT-6.2 Sol` Max 负优化、Carbon/Neon Low 降智 |
+| **模型池与推理强度参考** | 三轨配置默认 `"model": "default"`（不锁死模型，支持任意闭源或开源模型替换），并在注释与文档中提供参考推荐组合与避坑约束 | 开箱即用不报错，同时支持跨家族写审隔离，规避 `GLM-5.3` 默认 Max、`GPT-6.2 Sol` Max 负优化、Carbon/Neon Low 降智 |
 | **工程规范与契约纪律** | 新增 `AGENTS.md` 与 `.worktreeinclude` | 固化 `#hotfix`/`#feat`/`#epic` 分诊、禁止直推/自动合并 `main`、Hotfix Red→Green 测试先行、Track 2 契约 Commit 先行与 2 轮熔断上限 |
 | **前端 UI/UX 闭环** | 新增 `DESIGN.md`（兼容 Google Stitch YAML Tokens + Open Design MCP）与 Visual Gate 步骤 | 落地反 AI 塑料感红线、四态完整性、组件复用优先与 Playwright 1440px/390px 双端视觉验收 |
 | **定制 Prompts (Skills)** | 新增 `.orca/prompts/triage-po.md`、`frontend-worker.md`、`senior-auditor.md` | 通过 `flow.mjs` 原生 `skills` 机制按步骤自动注入并清理，无需硬编码 |
@@ -44,7 +44,7 @@ flowchart LR
 npx github:shown1985/orca-pod
 
 # 或使用本机本地路径安装
-npx /Users/shawn/agents-dev-kit/orca-pod
+npx /path/to/orca-pod
 ```
 
 > 默认**不会覆盖**业务仓库中已有的 `AGENTS.md`、`DESIGN.md`、`.worktreeinclude`、`ci-release.yml` 等文件，并会在终端给出 `diff -u` 安全合并命令。如需强制覆盖，追加 `--force`。

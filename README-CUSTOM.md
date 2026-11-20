@@ -43,7 +43,7 @@ npx git+ssh://git@github.com/shown1985/orca-pod.git
 ### 2. 本机离线安装
 
 ```bash
-npx /Users/shawn/agents-dev-kit/orca-pod
+npx /path/to/orca-pod
 ```
 
 ### 3. 安全不覆盖与合并提示
@@ -92,9 +92,11 @@ node .orca/flow.mjs --config flow-epic.json --grill-me "#epic ..."
 
 ---
 
-## 四、 个人模型池与推理强度（Reasoning Effort）路由规范
+## 四、 参考模型池与推理强度（Reasoning Effort）建议
 
-| 角色 / 阶段 | 推荐模型 | 推理强度 | 入口 / 通道 | 硬性避坑约束 |
+> **默认不锁死模型**：三轨 JSON 配置中所有步骤默认均为 `"model": "default"`（沿用各 CLI 自身默认配置），**你可以自由替换为任意开源或闭源模型**（如 DeepSeek、Qwen、Kimi、GLM、Claude、GPT、Gemini 或本地 Ollama/vLLM 端点）。下表仅作为参考推荐组合与避坑指南，如需指定具体模型，修改对应步骤的 `"model"` 字段或运行时追加 `--agent <step>=<cli>` 即可。
+
+| 角色 / 阶段 | 参考模型（可自由替换） | 建议推理强度 | 常见通道 | 避坑与选型原则 |
 |---|---|---|---|---|
 | **0→1 架构与契约设计** | `Gemini 4 Carbon` | **High** | Google AI Ultra / Antigravity / Gemini CLI | **禁止开 Low** |
 | **日常协调 / PO 拆解 / 视觉验收** | `Gemini 4 Neon` | **Medium** | Gemini CLI / Antigravity | **禁止对 Carbon / Neon 开 Low** |

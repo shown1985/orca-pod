@@ -2,12 +2,13 @@
   "//": "flow-hotfix.json — Track 0 极速通道（#hotfix / 微调：改动 <=3 文件、无 API/DB/类型契约变更）。",
   "//usage": "node .orca/flow.mjs --config flow-hotfix.json \"#hotfix <问题描述与复现方式>\"",
   "//switch": "切换轨道：Track 0 (--config flow-hotfix.json) | Track 1 (默认 flow.config.json / --config flow-feature.json) | Track 2 (--config flow-epic.json)",
-  "//workflow": "完全跳过 PO / Backlog -> Red->Green 测试先行最小修复 -> GPT-6.2 Sol (High) 极速 Diff 审计 (Max Retry=2) -> 单测绿灯 + 提 PR 触发 CI（不直推/不自动合并 main）。",
-  "//modelPool": {
-    "hotfix-coding": "主力 DeepSeek-V4.1-Flash-1017 (High, OpenCode Go；疑难 Bug 可切 Max)，或切换 gemini / gemini-4-neon (Medium，禁止对 Carbon/Neon 开 Low)。",
-    "diff-audit": "GPT-6.2 Sol (High, Codex CLI；绝对不要开 Max，避免实测负优化与额度浪费)。",
-    "pr-ci-submit": "DeepSeek-V4.1-Flash-1017 (Low) 或 Hy4 flash / Gemini 4 Hydrogen (Low/Medium)。",
-    "ciFallback": "远端 CI 无头审 PR 兜底使用腾讯 TokenHub API (DeepSeek-V4.1-Flash-1017 / Hy4 flash)，严禁在 CI Runner 中使用个人订阅账号。"
+  "//workflow": "完全跳过 PO / Backlog -> Red->Green 测试先行最小修复 -> 跨家族极速 Diff 审计 (Max Retry=2) -> 单测绿灯 + 提 PR 触发 CI（不直推/不自动合并 main）。",
+  "//modelNote": "默认 model 均为 \"default\"（沿用各 CLI 自身默认配置，可自由替换为任意闭源或开源模型）。下方为参考推荐组合，如需锁定模型将对应步骤的 model 改为实际模型 ID 即可。",
+  "//recommendedModelPool": {
+    "hotfix-coding": "参考：DeepSeek-V4.1-Flash-1017 (High) 或 Gemini 4 Neon (Medium，禁止对 Carbon/Neon 开 Low)；也可换 Qwen/Claude/本地开源模型。",
+    "diff-audit": "参考：GPT-6.2 Sol (High，绝对不要开 Max)；核心原则是与编码模型跨家族隔离。",
+    "pr-submit": "参考：DeepSeek-V4.1-Flash-1017 (Low) 或 Hy4 flash / Gemini 4 Hydrogen (Low/Medium)。",
+    "ciFallback": "远端无头 CI 审 PR 推荐使用独立 API（如腾讯 TokenHub / 任意 OpenAI 兼容端点），严禁在 CI Runner 中使用个人订阅账号。"
   },
   "artifactsDir": ".orca/artifacts",
   "maxRetries": 2,
@@ -33,8 +34,8 @@
       "title": "Hotfix Red->Green Fix",
       "enabled": true,
       "agent": "opencode",
-      "model": "deepseek-v4.1-flash-1017",
-      "effort": "high",
+      "model": "default",
+      "//recommendedModel": "deepseek-v4.1-flash-1017 (effort: high) or gemini-4-neon (effort: medium)",
       "writes": "HOTFIX_CHANGES.md",
       "progress": "HOTFIX_TASKS.md",
       "reads": [],
@@ -44,11 +45,11 @@
     },
     {
       "id": "diff-audit",
-      "title": "Fast Diff Audit (GPT-6.2 Sol)",
+      "title": "Fast Diff Audit (Cross-Family)",
       "enabled": true,
       "agent": "codex",
-      "model": "gpt-6.2-sol",
-      "effort": "high",
+      "model": "default",
+      "//recommendedModel": "gpt-6.2-sol (effort: high; NEVER max) or any cross-family reviewer model",
       "writes": "HOTFIX_AUDIT.md",
       "reads": [
         "hotfix-coding"
@@ -60,22 +61,22 @@
       "maxRetries": 2,
       "timeoutMs": 900000,
       "hardTimeoutMs": 2700000,
-      "spec": "You are a Track 0 cross-family senior diff auditor (GPT-6.2 Sol, High effort — NEVER Max). Inspect the git diff and {reads}. Verify strictly: (1) scope <= 3 files and zero contract changes; (2) genuine Red->Green regression test exists and passes; (3) no security regressions, side effects, or test-cheating. Write {out} with severity-grouped findings (BLOCKER/MAJOR/MINOR) and a clear VERDICT at the end: if any BLOCKER/MAJOR exists, report FAIL (outcome=failed) to loop back to hotfix-coding (hard cap Max Retry = 2); otherwise PASS."
+      "spec": "You are a Track 0 cross-family senior diff auditor. Inspect the git diff and {reads}. Verify strictly: (1) scope <= 3 files and zero contract changes; (2) genuine Red->Green regression test exists and passes; (3) no security regressions, side effects, or test-cheating. Write {out} with severity-grouped findings (BLOCKER/MAJOR/MINOR) and a clear VERDICT at the end: if any BLOCKER/MAJOR exists, report FAIL (outcome=failed) to loop back to hotfix-coding (hard cap Max Retry = 2); otherwise PASS."
     },
     {
       "id": "pr-submit",
       "title": "Unit Test Green & Open PR",
       "enabled": true,
       "agent": "opencode",
-      "model": "deepseek-v4.1-flash-1017",
-      "effort": "low",
+      "model": "default",
+      "//recommendedModel": "deepseek-v4.1-flash-1017 / hy4-flash / gemini-4-hydrogen (effort: low/medium)",
       "writes": "HOTFIX_PR.md",
       "reads": [
         "hotfix-coding",
         "diff-audit"
       ],
       "onFailGoto": null,
-      "spec": "You are a Track 0 release assistant. Based on {reads}: (1) re-verify local unit tests are green; (2) ensure HEAD is on a hotfix/<slug> branch (NEVER push directly to main/master and NEVER auto-merge to main); (3) commit clean changes if uncommitted (exclude .orca/artifacts/), push the branch (`git push -u origin HEAD`), and create/update a Pull Request targeting main (using `gh pr create` or `tea pr create` if available, otherwise output the exact PR title/body and CLI command); (4) summarize the Chinese PR description and CI trigger status in {out}."
+      "spec": "You are a Track 0 release assistant. Based on {reads}: (1) re-verify local unit tests are green; (2) ensure HEAD is on a hotfix/<slug> branch (NEVER push directly to main/master and NEVER auto-merge to main); (3) commit clean changes if uncommitted (exclude .orca/artifacts/), push the branch (`git push -u origin HEAD`), and create/update a Pull Request targeting main (using `gh pr create` or `tea pr create` if available, otherwise output the exact PR title/body and CLI command); (4) summarize the PR description and CI trigger status in {out}."
     }
   ]
 }

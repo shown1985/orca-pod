@@ -43,7 +43,7 @@ npx git+ssh://git@github.com/shown1985/orca-pod.git
 ### Install from a Local Clone
 
 ```bash
-npx /Users/shawn/agents-dev-kit/orca-pod
+npx /path/to/orca-pod
 ```
 
 ### Safe Non-Overwrite Behavior
@@ -92,9 +92,11 @@ node .orca/flow.mjs --config flow-epic.json --grill-me "#epic ..."
 
 ---
 
-## 4. Personal Model Pool & Reasoning Effort Routing
+## 4. Reference Model Pool & Reasoning Effort Preset
 
-| Role / Stage | Model | Reasoning Effort | Access Channel | Hard Guardrails |
+> **No Model Lock-In**: Every step in the 3-track JSON configs defaults to `"model": "default"` (inheriting your local CLI's configured default). **You can freely swap in any commercial or open-source model** (DeepSeek, Qwen, Kimi, GLM, Claude, GPT, Gemini, or local Ollama/vLLM). The table below is a battle-tested reference preset — set `"model"` in JSON or pass `--agent <step>=<cli>` whenever you want to pin a specific model.
+
+| Role / Stage | Reference Model (Swappable) | Suggested Effort | Access Channel | Guardrails |
 |---|---|---|---|---|
 | **0→1 Architecture & Contracts** | `Gemini 4 Carbon` | **High** | Google AI Ultra / Antigravity / Gemini CLI | **Never use Low** |
 | **Coordinator / PO / Visual Gate** | `Gemini 4 Neon` | **Medium** | Gemini CLI / Antigravity | **Never use Low on Carbon/Neon** |

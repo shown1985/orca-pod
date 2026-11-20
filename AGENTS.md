@@ -37,17 +37,19 @@
 
 ---
 
-## 3. 个人模型池与推理强度（Reasoning Effort）路由规范
+## 3. 参考模型池与推理强度（Reasoning Effort）路由建议
 
-| 角色 / 场景 | 指定模型 | 推理强度 (Effort) | 入口 / 通道 | 避坑与硬性约束 |
+> **默认不锁死模型**：本脚手架所有三轨配置文件均默认使用 `"model": "default"`（自动沿用你本机各 CLI 工具的默认模型），**你可以自由替换为任意闭源或开源模型**（如 Claude、GPT、Gemini、DeepSeek、Qwen、Kimi、GLM 或本地 Ollama/vLLM 模型）。下表仅作为经过实践验证的**参考推荐组合**与避坑备忘：
+
+| 角色 / 场景 | 参考模型 | 建议推理强度 (Effort) | 常见通道 | 避坑与选型原则 |
 |---|---|---|---|---|
-| **0→1 架构与契约设计** | `Gemini 4 Carbon` | **High** | Google AI Ultra / Antigravity / Gemini CLI | **禁止开 Low** |
-| **日常协调者 / PO 拆解 / 视觉验收** | `Gemini 4 Neon` | **Medium** | Gemini CLI / Antigravity | **禁止对 Carbon / Neon 开 Low** |
-| **主力并发开发 Worker（70%）** | `DeepSeek-V4.1-Flash-1017` | **High** | OpenCode Go | 疑难 Bug 可临时切 **Max** |
-| **复杂终端排错 / 长会话深度重构（30%）** | `Kimi K3.1 Pro` / `Kimi K2.7 Code` 或 `GLM-5.3` | **Low 或 High**（手动指定） | OpenCode Go | Kimi 终端排错强；**严禁放任 GLM-5.3 走默认 Max 卡死并发队列** |
-| **单测 / Lint / 文档 / PR 摘要** | `DeepSeek-V4.1-Flash-1017` 或 `Hy4 flash` / `Gemini 4 Hydrogen` | **Low / Medium** | OpenCode / Gemini CLI | 轻量低成本任务，避免杀鸡用牛刀 |
-| **资深 Reviewer（写审分离）** | `GPT-6.2 Sol` | 常规 **High** / 核心安全与并发终审 **Xhigh** | GPT Plus / Codex CLI | **绝对不要开 Max**（实测负优化且浪费额度） |
-| **无头 CI/CD 自动审 PR 兜底** | `DeepSeek-V4.1-Flash-1017` / `Hy4 flash` | **Low / Medium** | **腾讯 TokenHub API** | **严禁在远端 CI Runner 中使用个人订阅账号** |
+| **0→1 架构与契约设计** | `Gemini 4 Carbon`（或同类旗舰推理模型） | **High** | Gemini CLI / Antigravity | 若使用 Carbon/Neon，**禁止开 Low** |
+| **日常协调者 / PO 拆解 / 视觉验收** | `Gemini 4 Neon`（或同类多模态模型） | **Medium** | Gemini CLI / Antigravity | 若使用 Carbon/Neon，**禁止开 Low** |
+| **主力并发开发 Worker（70%）** | `DeepSeek-V4.1-Flash-1017`（或高吞吐开源/闭源编码模型） | **High** | OpenCode Go / 本地 API | 疑难 Bug 可临时切 **Max** |
+| **复杂终端排错 / 长会话深度重构（30%）** | `Kimi K3.1 Pro` / `Kimi K2.7 Code` 或 `GLM-5.3` | **Low 或 High**（手动指定） | OpenCode Go | Kimi 终端排错强；若用 GLM-5.3，**严禁放任默认 Max 卡死并发队列** |
+| **单测 / Lint / 文档 / PR 摘要** | `DeepSeek-V4.1-Flash-1017` / `Hy4 flash` / `Gemini 4 Hydrogen` | **Low / Medium** | OpenCode / Gemini CLI | 轻量低成本任务，优先高性价比或开源小模型 |
+| **资深 Reviewer（写审分离）** | `GPT-6.2 Sol`（或与编码模型不同家族的强模型） | 常规 **High** / 安全并发终审 **Xhigh** | Codex CLI / 其他跨家族 CLI | 若用 GPT-6.2 Sol，**绝对不要开 Max**（避免实测负优化与额度浪费） |
+| **无头 CI/CD 自动审 PR 兜底** | `DeepSeek-V4.1-Flash-1017` / `Hy4 flash`（任意 OpenAI 兼容 API） | **Low / Medium** | 腾讯 TokenHub API 等无头端点 | **严禁在远端 CI Runner 中使用个人订阅账号** |
 
 ---
 

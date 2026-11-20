@@ -11,7 +11,7 @@
 | Area | Additions / Customizations | Why It Matters |
 |---|---|---|
 | **3-Track Workflow** | Added `.orca/flow-hotfix.json` (Track 0), `.orca/flow-feature.json` (Track 1, default `flow.config.json`), and `.orca/flow-epic.json` (Track 2) | Right-sizes orchestration: fast surgical fixes for hotfixes, contract-first parallelism for epics |
-| **Model Pool & Effort Routing** | Codified routing & guardrails for `Gemini 4 Carbon / Neon`, `DeepSeek-V4.1-Flash-1017`, `Kimi K3.1 Pro / GLM-5.3`, and `GPT-6.2 Sol` | Enforces cross-family write/review separation and avoids known effort pitfalls (`GLM-5.3` default Max stalls, `GPT-6.2 Sol` Max degradation, `Carbon/Neon` Low degradation) |
+| **Flexible Model Pool Reference** | All 3-track configs default to `"model": "default"` (zero lock-in; swap in any commercial or open-source model), with a documented reference preset & effort guardrails | Works out of the box with your CLI defaults while preserving cross-family review & avoiding known effort pitfalls |
 | **Engineering Standards** | Added `AGENTS.md` and `.worktreeinclude` | Codifies `#hotfix`/`#feat`/`#epic` triage, no direct push/auto-merge to `main`, Red→Green hotfix discipline, Contract-First commits, and Max Retry = 2 |
 | **Frontend UI/UX Closed Loop** | Added Stitch-compatible `DESIGN.md` (YAML Tokens + Markdown) & Visual Gate steps | Enforces anti-AI-slop rules, 4-state completeness, component reuse, and Playwright 1440px/390px visual audits |
 | **Custom Prompts (Skills)** | Added `.orca/prompts/triage-po.md`, `frontend-worker.md`, and `senior-auditor.md` | Injected dynamically per step via native `flow.mjs` `skills` support and restored cleanly afterward |
@@ -44,7 +44,7 @@ flowchart LR
 npx github:shown1985/orca-pod
 
 # Or install from your local clone
-npx /Users/shawn/agents-dev-kit/orca-pod
+npx /path/to/orca-pod
 ```
 
 > Existing project files (`AGENTS.md`, `DESIGN.md`, `.worktreeinclude`, `ci-release.yml`, etc.) are **preserved by default** with `diff -u` merge hints printed. Pass `--force` only if you want to overwrite them.

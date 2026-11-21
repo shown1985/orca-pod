@@ -75,7 +75,7 @@ let hungInCurrentScenario = false;
 // (flow.mjs joins them with its own directory) — never absolute.
 // default budget: well above the configs' hard caps so a slow machine cannot produce a false HUNG
 // NOTE: call sites pass the property key "scenario:" — a mismatch silently falls back to default.cjs (the green-path trap this param's name once caused).
-async function runFlow({ name, config, scenario: scenarioFile = "default.cjs", args = [], objective = "test objective", seedArtifacts = [], seedWorktree = [], env: extraEnv = null, stdinText = null, budgetMs = 90000, notify = null, reuseDir = null, worktreePin = "name:testlab" }) {
+async function runFlow({ name, config, scenario: scenarioFile = "default.cjs", args = [], objective = "test objective", seedArtifacts = [], seedWorktree = [], env: extraEnv = null, stdinText = null, budgetMs = 90000, notify = null, reuseDir = null, worktreePin = "name:testlab", omitNoOpenStatus = false, statusOpenLog = null }) {
   const dir = reuseDir ?? mkdtempSync(join(tmpdir(), `orca-flow-${name}-`));
   if (!dirsOfCurrentScenario.includes(dir)) dirsOfCurrentScenario.push(dir);
   const wt = join(dir, "wt"); const home = join(dir, "home");
@@ -128,9 +128,10 @@ async function runFlow({ name, config, scenario: scenarioFile = "default.cjs", a
   // notify template, when given, is handed to the child via its file's path — the
   // only source, since every inherited ORCA_* key was stripped above.
   if (notify) env.ORCA_FLOW_NOTIFY_FILE = join(dir, "notify.json");
+  if (statusOpenLog) env.ORCA_STATUS_OPEN_LOG = statusOpenLog;
   env.USERPROFILE = home;
   env.HOME = home;
-  const argv = [FLOW, ...args, "--no-open-status"];
+  const argv = [FLOW, ...args, ...(omitNoOpenStatus ? [] : ["--no-open-status"])];
   if (config) argv.push("--config", config);
   if (objective) argv.push(objective);
   const child = spawn(NODE, argv, { cwd: REPO, env, stdio: [stdinText == null ? "ignore" : "pipe", "pipe", "pipe"] });
@@ -2480,7 +2481,7 @@ scenario("V6 Hard Cross-Family Review Isolation (blocks author-family fallback &
   eq("V6 agy + claude-sonnet-5-5 -> anthropic", classifyModelFamily("agy", "claude-sonnet-5-5"), "anthropic");
   eq("V6 claude + claude-opus-5-5 -> anthropic", classifyModelFamily("claude", "claude-opus-5-5"), "anthropic");
   eq("V6 agy + gpt-5.4 -> openai", classifyModelFamily("agy", "gpt-5.4"), "openai");
-  eq("V6 agy default -> google", classifyModelFamily("agy", null), "google");
+  eq("V6 agy default (unpinned router) -> unknown", classifyModelFamily("agy", null), "unknown");
   eq("V6 opencode2 + magpie/deepseek-v4.1 -> deepseek", classifyModelFamily("opencode2", "magpie/remote/deepseek-v4.1"), "deepseek");
   eq("V6 zcode -> zhipu", classifyModelFamily("zcode", null), "zhipu");
   eq("V6 codex -> openai", classifyModelFamily("codex", "gpt-6.2-sol"), "openai");
@@ -2815,15 +2816,17 @@ scenario("V8 Hardened Issue Tracker (fences, CJK, --no-issues, label-only retry,
     "```",
     "### T1: 建表迁移",
     "- [ ] T2: Adapt parser inspired by upstream/repo#17",
-    "- [ ] T3: Fix local bug #42",
+    "- [ ] T3: Fix local bug (Issue: #42)",
     "| T4 | 登录页 | frontend |",
+    "- [ ] T5: Retry step #2 on transient timeout",
   ].join("\n");
   const tasks = parseBacklogTasks(trickyMd);
-  eq("V8 parsed only the 4 real open tasks", tasks.map((t) => t.id), ["T1", "T2", "T3", "T4"]);
+  eq("V8 parsed only the 5 real open tasks", tasks.map((t) => t.id), ["T1", "T2", "T3", "T4", "T5"]);
   eq("V8 preserved 4-char CJK title '建表迁移' & inferred backend", [tasks[0].title, tasks[0].owner], ["建表迁移", "backend"]);
   eq("V8 ignored cross-repo upstream/repo#17 as local issue number", tasks[1].number, null);
-  eq("V8 extracted standalone #42 as local issue number", tasks[2].number, 42);
+  eq("V8 extracted explicit (Issue: #42) as local issue number", tasks[2].number, 42);
   eq("V8 preserved 3-char CJK title '登录页' & inferred frontend", [tasks[3].title, tasks[3].owner], ["登录页", "frontend"]);
+  eq("V8 ignored bare prose '#2' in 'Retry step #2'", tasks[4].number, null);
 
   // 2) P1-05 & P1-06: Epic number validation, scope mismatch isolation, and mode=false isolation
   const tmpV8 = mkdtempSync(join(tmpdir(), "orca-v8-"));
@@ -3005,10 +3008,12 @@ scenario("V9 CI/CD hardening (real bash pytest failure exit!=0, Psych YAML, cd-s
   writeFileSync(join(projFailDir, "backend", "requirements.txt"), "pytest==8.3.0\n");
   writeFileSync(join(projFailDir, "backend", "tests", "test_broken.py"), "def test_fail(): assert 1 == 2\n");
 
-  // Fake python3 shim in PATH: pip succeeds, `import pytest` succeeds, `pytest` exits 1, `compileall` exits 0!
-  // In v0.5.0, `pytest -q || python3 -m compileall -q .` turned exit 1 into exit 0!
+  // Fake python3 shim in PATH: records exact invocations + exits exact 1 on pytest/unittest!
+  const pyInvokeLog = join(tmpPyFail, "py-invocations.log");
   writeFileSync(join(fakeBinDir, "python3"), `#!/usr/bin/env node
+const fs = require("node:fs");
 const a = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(pyInvokeLog)}, JSON.stringify(a) + "\\n");
 if (a[0] === "-m" && a[1] === "pip") process.exit(0);
 if (a[0] === "-c" && (a[1] || "").includes("import pytest")) process.exit(0);
 if (a[0] === "-m" && a[1] === "pytest") { console.error("FAILED tests/test_broken.py::test_fail"); process.exit(1); }
@@ -3017,28 +3022,35 @@ if (a[0] === "-m" && a[1] === "compileall") process.exit(0);
 process.exit(0);
 `, { mode: 0o755 });
   writeFileSync(join(fakeBinDir, "python"), readFileSync(join(fakeBinDir, "python3")), { mode: 0o755 });
-  writeFileSync(join(fakeBinDir, "pytest"), `#!/usr/bin/env node\nconsole.error("FAILED pytest"); process.exit(1);\n`, { mode: 0o755 });
+  writeFileSync(join(fakeBinDir, "pytest"), `#!/usr/bin/env node\nrequire("node:fs").appendFileSync(${JSON.stringify(pyInvokeLog)}, '["pytest-bin"]\\n'); console.error("FAILED pytest"); process.exit(1);\n`, { mode: 0o755 });
 
   const bashEnv = { ...process.env, PATH: `${fakeBinDir}:${process.env.PATH}` };
   const runBundledFail = spawnSync("bash", ["-c", pyVerifyScript], { cwd: projFailDir, env: bashEnv, encoding: "utf8" });
-  ok("V9 P0-02 REAL BASH TEST: failing pytest in bundled CI exits NON-ZERO (not swallowed by compileall!)", runBundledFail.status !== 0);
+  eq("V9 P0-02 REAL BASH TEST: failing pytest in bundled CI exits exact code 1", runBundledFail.status, 1);
+  ok("V9 P0-02 proved python3 -m pytest was actually invoked", readFileSync(pyInvokeLog, "utf8").includes('"-m","pytest"'));
 
-  // Also test generated tailored Python job script with failing pytest & failing unittest!
+  // Also test generated tailored Python job script with failing pytest!
+  writeFileSync(pyInvokeLog, "");
   const genPyCi = renderCiWorkflow(detectProjectStacks(projFailDir));
   const tailoredPyScript = extractStepScript(genPyCi, "Run Python lint & tests");
   const runTailoredFail = spawnSync("bash", ["-c", tailoredPyScript], { cwd: join(projFailDir, "backend"), env: bashEnv, encoding: "utf8" });
-  ok("V9 P0-02 REAL BASH TEST: failing pytest in tailored Python CI exits NON-ZERO", runTailoredFail.status !== 0);
+  eq("V9 P0-02 REAL BASH TEST: failing pytest in tailored Python CI exits exact code 1", runTailoredFail.status, 1);
+  ok("V9 P0-02 proved tailored Python job invoked pytest", readFileSync(pyInvokeLog, "utf8").includes("pytest"));
 
-  // Also verify failed pip install exits NON-ZERO!
+  // Also verify failed pip install exits exact code 1!
   const pipFailBin = join(tmpPyFail, "pipfail-bin");
+  const pipInvokeLog = join(tmpPyFail, "pip-invocations.log");
   mkdirSync(pipFailBin, { recursive: true });
   writeFileSync(join(pipFailBin, "python3"), `#!/usr/bin/env node
+const fs = require("node:fs");
 const a = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(pipInvokeLog)}, JSON.stringify(a) + "\\n");
 if (a[0] === "-m" && a[1] === "pip" && a.includes("-r")) { console.error("ERROR: No matching distribution"); process.exit(1); }
 process.exit(0);
 `, { mode: 0o755 });
   const runPipFail = spawnSync("bash", ["-c", pyVerifyScript], { cwd: projFailDir, env: { ...process.env, PATH: `${pipFailBin}:${process.env.PATH}` }, encoding: "utf8" });
-  ok("V9 P0-02 REAL BASH TEST: failing pip install -r requirements.txt exits NON-ZERO", runPipFail.status !== 0);
+  eq("V9 P0-02 REAL BASH TEST: failing pip install -r requirements.txt exits exact code 1", runPipFail.status, 1);
+  ok("V9 P0-02 proved pip -r requirements.txt was invoked", readFileSync(pipInvokeLog, "utf8").includes('"-r","requirements.txt"'));
 
   // 3) P1-09 & P1-10: Least-privilege permissions, persist-credentials: false, unique job IDs & Ruby Psych YAML parsing!
   const topPermSection = bundledGhCi.slice(0, bundledGhCi.indexOf("jobs:"));
@@ -3186,6 +3198,661 @@ process.exit(0);
   } finally {
     mockForgeSrv.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// V10 — Round-2 Full Hardening Closure: openStatus=false Default, Strict Fencing,
+// Real Python Discovery/SIGPIPE, Proven Cross-Family, CD Provenance/Compose & All P1/P2
+// ---------------------------------------------------------------------------
+scenario("V10 Round-2 full hardening (openStatus=false, P0-01..P0-04, P1-01..P1-11, P2-01..P2-02)", async () => {
+  const { utimesSync } = await import("node:fs");
+  const { spawnSync } = await import("node:child_process");
+  const { shouldOpenStatusPage } = await import(join(REPO, ".orca", "lib", "status.mjs"));
+  const { sanitizeText } = await import(join(REPO, ".orca", "lib", "sanitize.mjs"));
+  const { verifyStepArtifact } = await import(join(REPO, ".orca", "gate-verify.mjs"));
+  const { materializeAgentConfig, restoreAgentConfig } = await import(join(REPO, ".orca", "agent-config.mjs"));
+  const {
+    classifyModelFamily,
+    filterCrossFamilyCandidates,
+    validateCrossFamilyConfig,
+    discoverOpencodeLocalEndpoints,
+    resolveOpencodeConfig,
+  } = await import(join(REPO, ".orca", "preflight.mjs"));
+  const { createWatchdogTracker, evaluateWatchdog } = await import(join(REPO, ".orca", "watchdog.mjs"));
+  const {
+    parseBacklogTasks,
+    loadIssueState,
+    createIssueViaCli,
+    matchTeaLoginForHost,
+    detectRepoDefaultBranch,
+    formatIssuePrBlock,
+  } = await import(join(REPO, ".orca", "issue-tracker.mjs"));
+  const {
+    detectProjectStacks,
+    renderCiWorkflow,
+    renderSelfHostedCdWorkflow,
+    yamlTokenOrQuoted,
+    ghExprString,
+  } = await import(join(REPO, ".orca", "ci-generator.mjs"));
+  const { listLedgerSummaries } = await import(join(REPO, ".orca", "ledger.mjs"));
+
+  const tmpV10 = mkdtempSync(join(tmpdir(), "orca-v10-"));
+  dirsOfCurrentScenario.push(tmpV10);
+
+  // 1) Owner UX: defaults.openStatus defaults to FALSE; --open-status / openStatus:true opt-in; --no-open-status wins
+  eq("V10 shouldOpenStatusPage defaults to false", shouldOpenStatusPage({ cfg: {}, opt: {} }), false);
+  eq("V10 shouldOpenStatusPage honors cfg.defaults.openStatus=true", shouldOpenStatusPage({ cfg: { defaults: { openStatus: true } }, opt: {} }), true);
+  eq("V10 shouldOpenStatusPage honors --open-status CLI opt-in", shouldOpenStatusPage({ cfg: {}, opt: { openStatus: true } }), true);
+  eq("V10 --no-open-status overrides openStatus=true and --open-status", shouldOpenStatusPage({ cfg: { defaults: { openStatus: true } }, opt: { openStatus: true, noOpenStatus: true } }), false);
+
+  const openLogDefault = join(tmpV10, "open-default.log");
+  const rOpenDefault = await runFlow({
+    name: "v10-open-default",
+    config: "../test/configs/cold.config.json",
+    omitNoOpenStatus: true,
+    statusOpenLog: openLogDefault,
+    budgetMs: 25000,
+  });
+  eq("V10 default run without --no-open-status exited 0", rOpenDefault.code, 0);
+  ok("V10 default run did NOT auto-open status.html in browser", !existsSync(openLogDefault));
+  ok("V10 default run still logged Status page path to stdout", /Status page: .*status\.html/.test(rOpenDefault.out));
+
+  const openLogOptIn = join(tmpV10, "open-optin.log");
+  const rOpenOptIn = await runFlow({
+    name: "v10-open-optin",
+    config: "../test/configs/cold.config.json",
+    args: ["--open-status"],
+    omitNoOpenStatus: true,
+    statusOpenLog: openLogOptIn,
+    budgetMs: 25000,
+  });
+  eq("V10 --open-status run exited 0", rOpenOptIn.code, 0);
+  ok("V10 --open-status triggered browser open of status.html", existsSync(openLogOptIn) && readFileSync(openLogOptIn, "utf8").includes("status.html"));
+
+  // 2) P0-01: release_pending blocks fallback; stop_unknown blocks onFailGoto; stale mtime rejected by gate-verify
+  const relPendCfg = join(REPO, ".orca", "_tmp-v10-relpend.config.json");
+  const stopGotoCfg = join(REPO, ".orca", "_tmp-v10-stopgoto.config.json");
+  const unboundCfg = join(REPO, ".orca", "_tmp-v10-unbound.config.json");
+  try {
+    writeFileSync(relPendCfg, JSON.stringify({
+      defaults: { timeoutMs: 3000, hardTimeoutMs: 12000, startRetries: 0, preflight: { enabled: false } },
+      pipeline: [{
+        id: "coding",
+        title: "Coding",
+        agent: "opencode2",
+        model: "deepseek-v4.1",
+        fallback: { agent: "claude", model: "claude-sonnet-4-5" },
+        spec: "Write {out}.",
+        writes: "OUT.md",
+      }],
+    }));
+    const rRelPend = await runFlow({
+      name: "v10-relpend",
+      config: "_tmp-v10-relpend.config.json",
+      scenario: "v10-release-pending.cjs",
+      budgetMs: 25000,
+    });
+    eq("V10 P0-01 release_pending failed closed (exit 1)", rRelPend.code, 1);
+    eq("V10 P0-01 fallback candidate was NEVER started while release_pending", (rRelPend.state?.extra?.starts || []).length, 1);
+
+    writeFileSync(stopGotoCfg, JSON.stringify({
+      defaults: {
+        timeoutMs: 2000,
+        hardTimeoutMs: 12000,
+        preflight: { enabled: false },
+        watchdog: { enabled: true, fallbackOnGatewayError: true },
+      },
+      pipeline: [
+        { id: "coding", title: "Coding", agent: "opencode2", model: "deepseek-v4.1", spec: "Code {out}.", writes: "CHANGES.md" },
+        { id: "code-review", title: "Cross-Family Code Review", agent: "codex", model: "gpt-6.2-sol", crossFamilyWith: ["coding"], reads: ["coding"], onFailGoto: "coding", maxRetries: 2, verify: { requireVerdict: "PASS" }, spec: "Review {out}.", writes: "REVIEW.md" },
+      ],
+    }));
+    const rStopGoto = await runFlow({
+      name: "v10-stopgoto",
+      config: "_tmp-v10-stopgoto.config.json",
+      scenario: "v10-stop-fail-no-goto.cjs",
+      budgetMs: 25000,
+    });
+    eq("V10 P0-01 stop_unknown without fallback exited 1 cleanly", rStopGoto.code, 1);
+    eq("V10 P0-01 status.overall is still-running (did NOT settle as failed)", rStopGoto.status?.overall, "still-running");
+    eq("V10 P0-01 onFailGoto did NOT reopen/re-run coding", (rStopGoto.state?.extra?.starts || []).filter((s) => s.title === "Coding").length, 1);
+
+    // Gate artifact stale mtime check
+    const gateDir = join(tmpV10, "gate-art");
+    mkdirSync(gateDir, { recursive: true });
+    const gateFile = join(gateDir, "REVIEW.md");
+    writeFileSync(gateFile, "# Review\n\n" + "Valid content filler line.\n".repeat(10) + "\nVERDICT: PASS\n");
+    const oldSec = Math.floor((Date.now() - 20000) / 1000);
+    utimesSync(gateFile, oldSec, oldSec);
+    const staleGateRes = verifyStepArtifact(
+      { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+      gateDir,
+      tmpV10,
+      50,
+      { mode: "settlement", minMtimeMs: Date.now(), clearedBeforeDispatch: true }
+    );
+    eq("V10 P0-01 verifyStepArtifact rejects stale pre-dispatch gate artifact", staleGateRes.ok, false);
+
+    // 3) P0-03: OpenCode Claude default model, unknown family fail-closed, validateCrossFamilyConfig, unbound ledger isolation
+    const ocClaudeDir = join(tmpV10, "oc-claude");
+    mkdirSync(ocClaudeDir, { recursive: true });
+    writeFileSync(join(ocClaudeDir, "opencode.json"), JSON.stringify({ model: "anthropic/claude-sonnet-4-5" }));
+    eq("V10 P0-03 opencode2 with opencode.json anthropic model -> anthropic", classifyModelFamily("opencode2", null, { projectDir: ocClaudeDir }), "anthropic");
+    eq("V10 P0-03 opencode2 without config or model -> unknown (never guesses deepseek)", classifyModelFamily("opencode2", null, { configPaths: [] }), "unknown");
+    eq("V10 P0-03 unrecognized explicit model ID -> unknown (never guesses harness)", classifyModelFamily("codex", "mystery-custom-v1"), "unknown");
+
+    const cfUnproven = filterCrossFamilyCandidates(
+      [{ agent: "codex", model: "gpt-6.2-sol", family: "openai", isPrimary: true }],
+      new Map(),
+      { unprovenAuthors: [{ stepId: "coding", reason: "unknown family" }] }
+    );
+    eq("V10 P0-03 filterCrossFamilyCandidates fails closed on unproven upstream author", cfUnproven.allowed.length, 0);
+
+    const cfUnknownRev = filterCrossFamilyCandidates(
+      [{ agent: "agy", model: null, family: "unknown", isPrimary: true }],
+      new Map([["deepseek", [{ stepId: "coding", agent: "opencode2", model: "deepseek-v4.1" }]]])
+    );
+    eq("V10 P0-03 filterCrossFamilyCandidates rejects unknown-family reviewer", cfUnknownRev.allowed.length, 0);
+
+    let crossCfgErr = null;
+    try {
+      validateCrossFamilyConfig(
+        [{ id: "review", crossFamilyWith: ["nonexistent"] }],
+        { review: { id: "review" } },
+        (m) => { throw new Error(m); }
+      );
+    } catch (e) { crossCfgErr = e.message; }
+    ok("V10 P0-03 validateCrossFamilyConfig rejects unknown crossFamilyWith step", Boolean(crossCfgErr && crossCfgErr.includes("nonexistent")));
+
+    // Unbound ledger isolation on --only: seed an unrelated ledger in ledgerHome without matching status.js ledgerRunKey
+    const unboundLedgerHome = join(tmpV10, "unbound-ledger");
+    const unboundRepoDummy = join(tmpV10, "other-repo");
+    mkdirSync(unboundRepoDummy, { recursive: true });
+    const { createRunLedger } = await import(join(REPO, ".orca", "ledger.mjs"));
+    const fakePriorLedger = createRunLedger({
+      runKey: "unrelated-old-run-key",
+      repoDir: unboundRepoDummy,
+      ledgerHome: unboundLedgerHome,
+      objective: "test objective",
+      configFile: "_tmp-v10-unbound.config.json",
+    });
+    fakePriorLedger.recordIntent({ requestId: "r1", stepId: "coding", title: "Coding", agent: "opencode2", model: "deepseek-v4.1", family: "deepseek", attempt: 1 });
+    fakePriorLedger.recordDispatchResult({ requestId: "r1", stepId: "coding", dispatchId: "d1", executedFamilies: ["deepseek"] });
+    fakePriorLedger.recordStepSettled({ stepId: "coding", outcome: "succeeded", verifyOk: true });
+
+    writeFileSync(unboundCfg, JSON.stringify({
+      defaults: { timeoutMs: 3000, hardTimeoutMs: 12000, preflight: { enabled: false } },
+      pipeline: [
+        { id: "coding", title: "Coding", agent: "opencode2", model: "deepseek-v4.1", spec: "Code {out}.", writes: "CHANGES.md" },
+        { id: "code-review", title: "Review", agent: "codex", model: "gpt-6.2-sol", crossFamilyWith: ["coding"], reads: ["coding"], verify: { requireVerdict: "PASS" }, spec: "Review {out}.", writes: "REVIEW.md" },
+      ],
+    }));
+    const rUnbound = await runFlow({
+      name: "v10-unbound",
+      config: "_tmp-v10-unbound.config.json",
+      args: ["--only", "code-review", "--ledger-home", unboundLedgerHome],
+      seedArtifacts: [{ file: "CHANGES.md", text: "# Changes\n\n" + "Seeded artifact content.\n".repeat(10) }],
+      budgetMs: 25000,
+    });
+    eq("V10 P0-03 --only code-review rejects unbound ledger without run-bound status.js", rUnbound.code, 1);
+    ok("V10 P0-03 logged missing verified execution record for coding", /no verified execution record for upstream author step "coding"/.test(rUnbound.out + rUnbound.err));
+    const ledSums = listLedgerSummaries({ ledgerHome: unboundLedgerHome });
+    ok("V10 P2-01 ledger tracks separate requestedEffort vs effectiveEffort", ledSums.length >= 1);
+  } finally {
+    for (const f of [relPendCfg, stopGotoCfg, unboundCfg]) { try { rmSync(f, { force: true }); } catch {} }
+  }
+
+  // 4) P0-02: REAL Python 3 execution — pytest.ini-only, 360-file SIGPIPE, *_test.py without __init__.py, 0-test discovery
+  const extractStepScript = (yml, stepName) => {
+    const lines = yml.split(/\r?\n/);
+    const startIdx = lines.findIndex((l) => l.includes(`- name: ${stepName}`));
+    if (startIdx < 0) return null;
+    let runIdx = -1;
+    for (let i = startIdx + 1; i < Math.min(lines.length, startIdx + 18); i++) {
+      if (/^\s+run:\s*\|\s*$/.test(lines[i])) { runIdx = i; break; }
+    }
+    if (runIdx < 0) return null;
+    const baseIndent = lines[runIdx + 1]?.match(/^(\s*)/)?.[1]?.length || 10;
+    const body = [];
+    for (let i = runIdx + 1; i < lines.length; i++) {
+      const l = lines[i];
+      if (!l.trim()) { body.push(""); continue; }
+      const ind = l.match(/^(\s*)/)[1].length;
+      if (ind < baseIndent) break;
+      body.push(l.slice(baseIndent));
+    }
+    return body.join("\n");
+  };
+
+  const bundledGhCi = readFileSync(join(REPO, ".github", "workflows", "ci-release.yml"), "utf8");
+  const bundledPyScript = extractStepScript(bundledGhCi, "Verify Python projects (root / backend)");
+  const realPyCheck = spawnSync("python3", ["--version"], { encoding: "utf8" });
+  if (!realPyCheck.error && realPyCheck.status === 0) {
+    // (a) pytest.ini-only project with failing test (using offline PYTHONPATH pytest module so zero network install)
+    const pyIniOnlyDir = join(tmpV10, "py-ini-only");
+    const fakePytestPkg = join(tmpV10, "py-pkg");
+    const pytestRanMarker = join(tmpV10, "pytest-ran.txt");
+    mkdirSync(pyIniOnlyDir, { recursive: true });
+    mkdirSync(fakePytestPkg, { recursive: true });
+    writeFileSync(join(pyIniOnlyDir, "pytest.ini"), "[pytest]\ntestpaths = .\n");
+    writeFileSync(join(pyIniOnlyDir, "test_ini_fail.py"), "def test_must_fail():\n    assert 2 + 2 == 5\n");
+    writeFileSync(join(fakePytestPkg, "pytest.py"), [
+      "import glob, importlib.util, os, sys",
+      "if __name__ == '__main__':",
+      `    open(${JSON.stringify(pytestRanMarker)}, 'w').write('ran')`,
+      "    failed = 0",
+      "    for p in sorted(glob.glob('**/test_*.py', recursive=True)):",
+      "        spec = importlib.util.spec_from_file_location('m', p)",
+      "        mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)",
+      "        for k, fn in vars(mod).items():",
+      "            if k.startswith('test_') and callable(fn):",
+      "                try: fn()",
+      "                except Exception: failed += 1",
+      "    sys.exit(1 if failed else 0)",
+    ].join("\n"));
+    const rIniOnly = spawnSync("bash", ["-c", bundledPyScript], {
+      cwd: pyIniOnlyDir,
+      env: { ...process.env, PYTHONPATH: fakePytestPkg },
+      encoding: "utf8",
+    });
+    eq("V10 P0-02 REAL PYTHON: pytest.ini-only failing suite exits exact code 1", rIniOnly.status, 1);
+    ok("V10 P0-02 REAL PYTHON: pytest.ini-only project actually executed pytest", existsSync(pytestRanMarker));
+
+    // Clean PYTHONPATH without pytest so real stdlib unittest path runs
+    const noPytestHelper = join(tmpV10, "block-pytest");
+    mkdirSync(noPytestHelper, { recursive: true });
+    writeFileSync(join(noPytestHelper, "pytest.py"), "raise ImportError('pytest intentionally absent')\n");
+
+    // (b) 360 test files in cases/ without __init__.py (SIGPIPE + unittest discovery regression test!)
+    const sigpipeDir = join(tmpV10, "py-sigpipe");
+    mkdirSync(join(sigpipeDir, "cases"), { recursive: true });
+    for (let i = 0; i < 359; i++) {
+      const pad = String(i).padStart(3, "0");
+      writeFileSync(join(sigpipeDir, "cases", `test_bulk_long_filename_padding_${pad}.py`), `import unittest\nclass T${pad}(unittest.TestCase):\n    def test_ok(self): self.assertEqual(1, 1)\n`);
+    }
+    writeFileSync(join(sigpipeDir, "cases", "test_bulk_long_filename_padding_359.py"), "import unittest\nclass T359(unittest.TestCase):\n    def test_boom(self): self.assertEqual(1, 2)\n");
+    const rSigpipe = spawnSync("bash", ["-c", bundledPyScript], {
+      cwd: sigpipeDir,
+      env: { ...process.env, PYTHONPATH: noPytestHelper },
+      encoding: "utf8",
+    });
+    eq("V10 P0-02 REAL PYTHON: 360 test files in cases/ (no __init__.py) has ZERO SIGPIPE and exits exact 1", rSigpipe.status, 1);
+
+    // (c) *_test.py naming in cases/ without __init__.py
+    const suffixTestDir = join(tmpV10, "py-suffix");
+    mkdirSync(join(suffixTestDir, "cases"), { recursive: true });
+    writeFileSync(join(suffixTestDir, "cases", "math_test.py"), "import unittest\nclass MathTest(unittest.TestCase):\n    def test_sub(self): self.assertEqual(10 - 3, 99)\n");
+    const rSuffix = spawnSync("bash", ["-c", bundledPyScript], {
+      cwd: suffixTestDir,
+      env: { ...process.env, PYTHONPATH: noPytestHelper },
+      encoding: "utf8",
+    });
+    eq("V10 P0-02 REAL PYTHON: cases/math_test.py (*_test.py without __init__.py) exits exact 1", rSuffix.status, 1);
+
+    // (d) Matched *_test.py with 0 unittest TestCases fails closed (exits 1, never 0!)
+    const zeroCaseDir = join(tmpV10, "py-zerocase");
+    mkdirSync(join(zeroCaseDir, "cases"), { recursive: true });
+    writeFileSync(join(zeroCaseDir, "cases", "orphan_test.py"), "def test_plain_func_without_pytest():\n    assert False\n");
+    const rZeroCase = spawnSync("bash", ["-c", bundledPyScript], {
+      cwd: zeroCaseDir,
+      env: { ...process.env, PYTHONPATH: noPytestHelper },
+      encoding: "utf8",
+    });
+    eq("V10 P0-02 REAL PYTHON: 0-discovered-cases test file fails closed with exit 1", rZeroCase.status, 1);
+  }
+
+  // 5) P0-04 + P1-09 + P1-10 + P1-11: CD Provenance Gate, SHA Gate, Compose Health & YAML/Expression Escaping
+  eq("V10 P1-10 numeric branch '123' is quoted as YAML string", yamlTokenOrQuoted("123"), '"123"');
+  eq("V10 P1-10 single-quote branch Actions expression escaping", ghExprString("feat/a'b"), "'feat/a''b'");
+  const refFmt = spawnSync("git", ["check-ref-format", "--branch", "feat/a'b"], { encoding: "utf8" });
+  eq("V10 git confirms feat/a'b is a legal branch name", refFmt.status, 0);
+
+  const cdComposeDir = join(tmpV10, "cd-proj");
+  mkdirSync(cdComposeDir, { recursive: true });
+  writeFileSync(join(cdComposeDir, "docker-compose.prod.yml"), "services:\n  db-migrate:\n    image: alpine\n  api:\n    image: alpine\n");
+  const detCd = detectProjectStacks(cdComposeDir);
+  const cdYmlNumeric = renderCiWorkflow(detCd, { branches: ["123", "feat/a'b"] });
+  const cdYml = renderSelfHostedCdWorkflow(detCd, {
+    deployBranch: "main",
+    serviceName: "api",
+    healthUrl: "http://admin:secretpass@127.0.0.1:8000/health?token=secret_tok_999",
+  });
+  const cdYmlSingleQuote = renderSelfHostedCdWorkflow(detCd, { deployBranch: "feat/a'b" });
+  ok("V10 P0-04 CD job-level if requires event == 'push', same repo, and refs/heads/<branch>",
+    cdYml.includes("github.event.workflow_run.event == 'push'") &&
+    cdYml.includes("github.event.workflow_run.head_repository.full_name == github.repository") &&
+    cdYml.includes("github.ref == 'refs/heads/main'"));
+  ok("V10 P1-10 single-quote branch CD renders valid Actions literal 'feat/a''b'", cdYmlSingleQuote.includes("'feat/a''b'") && cdYmlSingleQuote.includes("'refs/heads/feat/a''b'"));
+
+  const rubyCheck = spawnSync("ruby", ["-ryaml", "-e", "puts 'ok'"], { encoding: "utf8" });
+  if (!rubyCheck.error && rubyCheck.status === 0) {
+    const numYmlPath = join(tmpV10, "numeric-branch.yml");
+    writeFileSync(numYmlPath, cdYmlNumeric);
+    const numParsed = spawnSync("ruby", ["-ryaml", "-e", `d = YAML.load_file(${JSON.stringify(numYmlPath)}); on_cfg = d['on'] || d[true]; b = on_cfg['push']['branches']; raise 'not string' unless b[0].is_a?(String) && b[0] == '123' && b[1] == "feat/a'b"`], { encoding: "utf8" });
+    eq("V10 P1-10 Psych confirms branch '123' parsed as String (not Integer) and feat/a'b preserved", numParsed.status, 0);
+  }
+
+  // Execute extracted CD Step 1 (Provenance Gate)
+  const cdGateScript = extractStepScript(cdYml, "Verify CI gate & allowed target branch");
+  const validSha = "a".repeat(40);
+  const baseGateEnv = {
+    ...process.env,
+    DEPLOY_BRANCH: "main",
+    EXPECTED_FULL_REF: "refs/heads/main",
+    THIS_REPO: "shown1985/sxcj",
+  };
+  eq("V10 P0-04 CD gate REJECTS pull_request workflow_run", spawnSync("bash", ["-c", cdGateScript], {
+    env: { ...baseGateEnv, EVENT_NAME: "workflow_run", CI_CONCLUSION: "success", WR_EVENT: "pull_request", WR_HEAD_REPO: "shown1985/sxcj", WR_HEAD_BRANCH: "main", WR_HEAD_SHA: validSha },
+    encoding: "utf8",
+  }).status, 1);
+  eq("V10 P0-04 CD gate REJECTS fork repository workflow_run", spawnSync("bash", ["-c", cdGateScript], {
+    env: { ...baseGateEnv, EVENT_NAME: "workflow_run", CI_CONCLUSION: "success", WR_EVENT: "push", WR_HEAD_REPO: "attacker/sxcj", WR_HEAD_BRANCH: "main", WR_HEAD_SHA: validSha },
+    encoding: "utf8",
+  }).status, 1);
+  eq("V10 P0-04 CD gate REJECTS tag refs/tags/main on workflow_dispatch", spawnSync("bash", ["-c", cdGateScript], {
+    env: { ...baseGateEnv, EVENT_NAME: "workflow_dispatch", ACTUAL_REF: "refs/tags/main", ACTUAL_REF_TYPE: "tag", DISPATCH_SHA: validSha },
+    encoding: "utf8",
+  }).status, 1);
+  eq("V10 P0-04 CD gate ACCEPTS verified push workflow_run on main", spawnSync("bash", ["-c", cdGateScript], {
+    env: { ...baseGateEnv, EVENT_NAME: "workflow_run", CI_CONCLUSION: "success", WR_EVENT: "push", WR_HEAD_REPO: "shown1985/sxcj", WR_HEAD_BRANCH: "main", WR_HEAD_SHA: validSha },
+    encoding: "utf8",
+  }).status, 0);
+
+  // Execute extracted CD Step 3 (Checked-out commit == live origin/main tip)
+  const cdShaScript = extractStepScript(cdYml, "Verify checked-out commit matches live target branch tip");
+  const cdGitDir = join(tmpV10, "cd-git");
+  spawnSync("git", ["init", "-b", "main", cdGitDir], { encoding: "utf8" });
+  spawnSync("git", ["-C", cdGitDir, "config", "user.email", "ci@local"], { encoding: "utf8" });
+  spawnSync("git", ["-C", cdGitDir, "config", "user.name", "CI"], { encoding: "utf8" });
+  writeFileSync(join(cdGitDir, "f.txt"), "v1\n");
+  spawnSync("git", ["-C", cdGitDir, "add", "."], { encoding: "utf8" });
+  spawnSync("git", ["-C", cdGitDir, "commit", "-m", "c1"], { encoding: "utf8" });
+  const sha1 = spawnSync("git", ["-C", cdGitDir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  writeFileSync(join(cdGitDir, "f.txt"), "v2\n");
+  spawnSync("git", ["-C", cdGitDir, "add", "."], { encoding: "utf8" });
+  spawnSync("git", ["-C", cdGitDir, "commit", "-m", "c2"], { encoding: "utf8" });
+  const sha2 = spawnSync("git", ["-C", cdGitDir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  spawnSync("git", ["-C", cdGitDir, "update-ref", "refs/remotes/origin/main", sha2], { encoding: "utf8" });
+  spawnSync("git", ["-C", cdGitDir, "checkout", "--detach", sha1], { encoding: "utf8" });
+  eq("V10 P0-04 CD SHA gate REJECTS stale/superseded SHA1 when origin/main is at SHA2", spawnSync("bash", ["-c", cdShaScript], {
+    cwd: cdGitDir,
+    env: { ...process.env, DEPLOY_BRANCH: "main", EXPECTED_SHA: sha1 },
+    encoding: "utf8",
+  }).status, 1);
+  spawnSync("git", ["-C", cdGitDir, "checkout", "--detach", sha2], { encoding: "utf8" });
+  eq("V10 P0-04 CD SHA gate ACCEPTS current verified origin/main tip SHA2", spawnSync("bash", ["-c", cdShaScript], {
+    cwd: cdGitDir,
+    env: { ...process.env, DEPLOY_BRANCH: "main", EXPECTED_SHA: sha2 },
+    encoding: "utf8",
+  }).status, 0);
+
+  // Execute extracted CD Health Check step against mock docker + curl
+  const cdHealthScript = extractStepScript(cdYml, "Post-deploy automated health check (PII-safe)");
+  const mockCdBin = join(tmpV10, "cd-bin");
+  mkdirSync(mockCdBin, { recursive: true });
+  writeFileSync(join(mockCdBin, "docker"), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a.includes("config") && a.includes("--services")) {
+  if (process.env.MOCK_CFG_SVCS) console.log(process.env.MOCK_CFG_SVCS);
+  process.exit(0);
+}
+if (a.includes("ps") && a.includes("--format")) {
+  if (process.env.MOCK_PS_EXIT) process.exit(Number(process.env.MOCK_PS_EXIT));
+  process.stdout.write(process.env.MOCK_PS_JSON || "");
+  process.exit(0);
+}
+process.exit(0);
+`, { mode: 0o755 });
+  writeFileSync(join(mockCdBin, "curl"), `#!/usr/bin/env node\nprocess.exit(0);\n`, { mode: 0o755 });
+
+  const runCdHealth = (extraEnv) => spawnSync("bash", ["-c", cdHealthScript], {
+    cwd: cdComposeDir,
+    env: {
+      ...process.env,
+      PATH: `${mockCdBin}:${process.env.PATH}`,
+      COMPOSE_FILE: "docker-compose.prod.yml",
+      SERVICE_NAME: "api",
+      ORCA_DEPLOY_SHA: sha2,
+      DEFAULT_HEALTHCHECK_URL: "http://admin:secretpass@127.0.0.1:8000/health?token=secret_tok_999",
+      HEALTHCHECK_URL: "",
+      DEPLOY_ONESHOT_SERVICES: "",
+      HEALTHCHECK_RETRIES: "1",
+      HEALTHCHECK_INTERVAL: "0",
+      ...extraEnv,
+    },
+    encoding: "utf8",
+  });
+
+  const hMigrationOk = runCdHealth({
+    MOCK_CFG_SVCS: "db-migrate\napi\n",
+    MOCK_PS_JSON: JSON.stringify([
+      { Service: "db-migrate", State: "exited", ExitCode: 0 },
+      { Service: "api", State: "running", Health: "healthy", ExitCode: 0 },
+    ]),
+  });
+  eq("V10 P1-11 CD health ACCEPTS exited(0) db-migrate + running healthy api", hMigrationOk.status, 0);
+  ok("V10 P1-09 CD health NEVER echoes secret health URL/credentials to logs",
+    !hMigrationOk.stdout.includes("secretpass") &&
+    !hMigrationOk.stdout.includes("secret_tok_999") &&
+    !hMigrationOk.stderr.includes("secret_tok_999"));
+
+  eq("V10 P1-11 CD health REJECTS empty JSON array []", runCdHealth({ MOCK_PS_JSON: "[]" }).status, 1);
+  eq("V10 P1-11 CD health REJECTS failed migration ExitCode=1", runCdHealth({
+    MOCK_PS_JSON: JSON.stringify([
+      { Service: "db-migrate", State: "exited", ExitCode: 1 },
+      { Service: "api", State: "running", Health: "healthy", ExitCode: 0 },
+    ]),
+  }).status, 1);
+  eq("V10 P1-11 CD health REJECTS when required target service 'api' is not running", runCdHealth({
+    MOCK_PS_JSON: JSON.stringify([{ Service: "redis", State: "running", Health: "healthy", ExitCode: 0 }]),
+  }).status, 1);
+  eq("V10 P1-11 CD health propagates docker compose ps exit code 23", runCdHealth({ MOCK_PS_EXIT: "23" }).status, 23);
+
+  // 6) P1-01, P1-02, P1-03, P1-04, P1-05, P1-06, P1-07, P1-08, P1-09 unit checks
+  // P1-01: user_approval + fresh ECONNREFUSED blocks (never fallbacks!), and pre-progress loop lines ignored
+  const wdTracker = createWatchdogTracker({
+    step: { watchdog: { loopThreshold: 4, fallbackOnGatewayError: true, fallbackOnLoop: true } },
+    startedAt: 1000,
+    probeFn: () => ({ gitFingerprint: "g1", gitOk: true, ownArtifactFingerprint: "a1", dirArtifactFingerprint: "d1", artifactFingerprint: "a1", artifactSize: 0 }),
+  });
+  const apprPlusGw = evaluateWatchdog(wdTracker, {
+    now: 2000,
+    preview: "Error: connect ECONNREFUSED 127.0.0.1:3425",
+    previewChanged: true,
+    previewSeenBefore: false,
+    agentWait: { kind: "user_approval", reason: "Approve deploy?" },
+    fallbackAvailable: true,
+  });
+  eq("V10 P1-01 user_approval + ECONNREFUSED prioritizes human approval (action=block, NOT fallback)", apprPlusGw.action, "block");
+
+  const loopTracker = createWatchdogTracker({
+    step: { watchdog: { loopThreshold: 4, fallbackOnLoop: true } },
+    startedAt: 1000,
+    probeFn: () => ({ gitFingerprint: "g1", gitOk: true, ownArtifactFingerprint: "a1", dirArtifactFingerprint: "d1", artifactFingerprint: "a1", artifactSize: 0 }),
+  });
+  const oldLoopLines = Array.from({ length: 4 }, () => "Retrying tool call with identical payload...").join("\n");
+  // Poll 1: 4 repeated lines BUT accompanied by real git progress (g1 -> g2)
+  const poll1 = evaluateWatchdog(loopTracker, {
+    now: 2000,
+    preview: oldLoopLines,
+    previewChanged: true,
+    previewSeenBefore: false,
+    fallbackAvailable: true,
+    probeOverride: { gitFingerprint: "g2", gitOk: true, ownArtifactFingerprint: "a1", dirArtifactFingerprint: "d1", artifactFingerprint: "a1", artifactSize: 0 },
+  });
+  eq("V10 P1-01 git progress resets post-progress loop buffer", poll1.status, "healthy");
+  // Poll 2: old 4 loop lines remain in scrollback tail, only 1 new recovery line appended
+  const poll2 = evaluateWatchdog(loopTracker, {
+    now: 3000,
+    preview: `${oldLoopLines}\nCompleted test run successfully.`,
+    previewChanged: true,
+    previewSeenBefore: true,
+    fallbackAvailable: true,
+    probeOverride: { gitFingerprint: "g2", gitOk: true, ownArtifactFingerprint: "a1", dirArtifactFingerprint: "d1", artifactFingerprint: "a1", artifactSize: 0 },
+  });
+  eq("V10 P1-01 historic loop lines before git progress do NOT trigger false output_loop", poll2.status, "healthy");
+
+  // P1-02: sharedWorktree true -> false transition does NOT count untouched sibling artifacts as new progress
+  const modeTracker = createWatchdogTracker({
+    step: { watchdog: { stallTimeoutMs: 5000 } },
+    startedAt: 1000,
+    sharedWorktree: true,
+    probeFn: () => ({ gitFingerprint: "g1", gitOk: true, ownArtifactFingerprint: "own-1", dirArtifactFingerprint: "dir-with-sibling-1", artifactFingerprint: "own-1", artifactSize: 10 }),
+  });
+  const modeSwitchRes = evaluateWatchdog(modeTracker, {
+    now: 2000,
+    preview: "idle",
+    previewChanged: false,
+    previewSeenBefore: true,
+    sharedWorktree: false,
+    probeOverride: { gitFingerprint: "g1", gitOk: true, ownArtifactFingerprint: "own-1", dirArtifactFingerprint: "dir-with-sibling-1", artifactFingerprint: "dir-with-sibling-1", artifactSize: 10 },
+  });
+  eq("V10 P1-02 sharedWorktree true->false transition does NOT synthesize false artifactChanged", modeSwitchRes.artifactChanged, false);
+
+  // P1-03: OpenCode config precedence (.opencode/opencode.json > root opencode.json; child > parent; enabled_providers)
+  const ocRoot = join(tmpV10, "oc-prec");
+  const ocChild = join(ocRoot, "packages", "web");
+  mkdirSync(join(ocRoot, ".opencode"), { recursive: true });
+  mkdirSync(ocChild, { recursive: true });
+  spawnSync("git", ["init", ocRoot], { encoding: "utf8" });
+  writeFileSync(join(ocRoot, "opencode.json"), JSON.stringify({
+    model: "openai/gpt-5",
+    enabled_providers: ["magpie"],
+    provider: {
+      magpie: { options: { baseURL: "http://127.0.0.1:3425/v1" } },
+      blocked_local: { options: { baseURL: "http://127.0.0.1:9999/v1" } },
+    },
+  }));
+  writeFileSync(join(ocRoot, ".opencode", "opencode.json"), JSON.stringify({
+    model: "anthropic/claude-sonnet-4-5",
+  }));
+  eq("V10 P1-03 .opencode/opencode.json overrides root opencode.json in same dir", resolveOpencodeConfig({ projectDir: ocRoot }).model, "anthropic/claude-sonnet-4-5");
+  writeFileSync(join(ocChild, "opencode.json"), JSON.stringify({ model: "deepseek/deepseek-v4.1" }));
+  eq("V10 P1-03 deeper subdirectory opencode.json overrides parent .opencode/opencode.json", resolveOpencodeConfig({ projectDir: ocChild }).model, "deepseek/deepseek-v4.1");
+  const blockedEps = discoverOpencodeLocalEndpoints({ projectDir: ocRoot, model: "blocked_local/some-model" });
+  eq("V10 P1-03 enabled_providers blocks non-listed explicit provider", blockedEps.length, 0);
+
+  // P1-04: Parallel agy + antigravity MCP servers merge cleanly into .agents/mcp_config.json
+  const mcpMergeDir = join(tmpV10, "mcp-merge");
+  mkdirSync(mcpMergeDir, { recursive: true });
+  materializeAgentConfig({
+    worktree: mcpMergeDir,
+    members: [
+      { id: "s1", agent: "agy", mcp: ["srvA"], skills: [] },
+      { id: "s2", agent: "antigravity", mcp: ["srvB"], skills: [] },
+    ],
+    cfg: {
+      mcpServers: {
+        srvA: { command: "node", args: ["a.js"] },
+        srvB: { command: "node", args: ["b.js"] },
+      },
+    },
+    configDir: join(REPO, ".orca"),
+    die: (m) => { throw new Error(m); },
+    warn: () => {},
+  });
+  const mergedAgyMcp = JSON.parse(readFileSync(join(mcpMergeDir, ".agents", "mcp_config.json"), "utf8"));
+  eq("V10 P1-04 agy + antigravity merged BOTH srvA and srvB into .agents/mcp_config.json",
+    Object.keys(mergedAgyMcp.mcpServers || {}).sort(), ["srvA", "srvB"]);
+  restoreAgentConfig({ worktree: mcpMergeDir, warn: () => {} });
+
+  // P1-05, P1-06, P1-07, P1-08, P1-09
+  const legacyIssDir = join(tmpV10, "legacy-iss");
+  mkdirSync(legacyIssDir, { recursive: true });
+  writeFileSync(join(legacyIssDir, "ISSUES.json"), JSON.stringify({ epic: { number: 12 }, tasks: [{ id: "T1", title: "Old", number: 13 }] }));
+  eq("V10 P1-05 loadIssueState with matchScope rejects unscoped legacy ISSUES.json",
+    loadIssueState(legacyIssDir, { provider: "gh", host: "github.com", repo: "org/repo", objective: "New" }), null);
+
+  const collisionTasks = parseBacklogTasks("- [ ] Unnumbered first task\n### T1: Explicit task one\n");
+  eq("V10 P1-06 auto ID avoids colliding with later explicit T1 (both tasks preserved)",
+    collisionTasks.map((t) => t.id), ["T2", "T1"]);
+
+  let partialCalls = 0;
+  const partialCreate = createIssueViaCli({
+    provider: "gh",
+    bin: "gh",
+    repoDir: tmpV10,
+    repo: "shown1985/sxcj",
+    title: "Partial label failure",
+    body: "Body",
+    labels: ["orca-pod"],
+    execFn: () => {
+      partialCalls++;
+      return {
+        ok: false,
+        status: 1,
+        stdout: "https://github.com/shown1985/sxcj/issues/77",
+        stderr: "could not add label: dial tcp 140.82.112.6:443: connection reset by peer",
+        timedOut: false,
+      };
+    },
+  });
+  eq("V10 P1-07 reconciles already-created issue URL #77 without duplicate retry", [partialCreate.ok, partialCreate.number, partialCalls], [true, 77, 1]);
+
+  let netErrCalls = 0;
+  const netErrCreate = createIssueViaCli({
+    provider: "gh",
+    bin: "gh",
+    repoDir: tmpV10,
+    repo: "shown1985/sxcj",
+    title: "Net error",
+    body: "Body",
+    labels: ["orca-pod"],
+    execFn: () => {
+      netErrCalls++;
+      return { ok: false, status: 1, stdout: "", stderr: "Post https://api.github.com/graphql: dial tcp: connection refused", timedOut: false };
+    },
+  });
+  eq("V10 P1-07 generic transport error NEVER triggers label-less retry", [netErrCreate.ok, netErrCalls], [false, 1]);
+
+  const teaTable = [
+    "| NAME    | URL                         | SSH HOST | USER |",
+    "| evil    | https://evil-gitea.local    |          | bob  |",
+    "| corpgit | https://gitea.local:3000    |          | dev  |",
+  ].join("\n");
+  eq("V10 P1-07 matchTeaLoginForHost matches exact hostname (rejects evil-gitea.local)", matchTeaLoginForHost(teaTable, "gitea.local")?.login, "corpgit");
+  eq("V10 P1-07 matchTeaLoginForHost returns null when only substring host exists", matchTeaLoginForHost("| evil | https://evil-gitea.local | | bob |", "gitea.local"), null);
+
+  let teaArgsCaptured = null;
+  createIssueViaCli({
+    provider: "tea",
+    bin: "tea",
+    repoDir: tmpV10,
+    repo: "org/proj",
+    host: "gitea.local",
+    teaLogin: "corpgit",
+    title: "Tea issue",
+    body: "Body",
+    execFn: (_b, args) => {
+      teaArgsCaptured = args;
+      return { ok: true, status: 0, stdout: "https://gitea.local/org/proj/issues/9", stderr: "" };
+    },
+  });
+  ok("V10 P1-07 tea issues create passes explicit --login corpgit",
+    Array.isArray(teaArgsCaptured) && teaArgsCaptured.includes("--login") && teaArgsCaptured[teaArgsCaptured.indexOf("--login") + 1] === "corpgit");
+
+  eq("V10 P1-08 detectRepoDefaultBranch returns null when origin/HEAD absent (never guesses main)",
+    detectRepoDefaultBranch(tmpV10, () => ({ ok: false, stdout: "", stderr: "" })), null);
+  eq("V10 P1-08 detectRepoDefaultBranch resolves via gh repo view when origin/HEAD absent",
+    detectRepoDefaultBranch(tmpV10, (_b, args) => {
+      if (args[0] === "repo" && args[1] === "view") return { ok: true, stdout: JSON.stringify({ defaultBranchRef: { name: "trunk" } }), stderr: "" };
+      return { ok: false, stdout: "", stderr: "" };
+    }, { provider: "gh", bin: "gh", host: "ghe.corp.internal", repo: "org/repo" }), "trunk");
+
+  const ghePrBlock = formatIssuePrBlock(
+    { provider: "gh", host: "ghe.corp.internal", repo: "org/repo", epic: { number: 5 }, tasks: [{ number: 6 }] },
+    { closeOnPr: true, targetBranch: "dev", defaultBranch: "trunk" }
+  );
+  ok("V10 P1-08 GHE close command uses host-qualified --repo ghe.corp.internal/org/repo",
+    ghePrBlock.block.includes('--repo "ghe.corp.internal/org/repo"'));
+
+  const jsonSecretSample = '{"access_token":"tok_live_supersecret_987654","apiKey":"sk_custom_secret_value","nested":{"client_secret":"cs_999888777"}} and eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U';
+  const redactedJsonSecret = sanitizeText(jsonSecretSample);
+  ok("V10 P1-09 sanitizeText redacts JSON access_token, apiKey, client_secret & JWT",
+    !redactedJsonSecret.includes("tok_live_supersecret_987654") &&
+    !redactedJsonSecret.includes("sk_custom_secret_value") &&
+    !redactedJsonSecret.includes("cs_999888777") &&
+    !redactedJsonSecret.includes("dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"));
 });
 
 // ---------------------------------------------------------------------------

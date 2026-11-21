@@ -315,10 +315,25 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
   if (!existsSync(filePath)) {
     return { ok: false, reason: "missing" };
   }
-  let size = -1;
-  try { size = statSync(filePath).size; } catch { return { ok: false, reason: "unreadable" }; }
-  if (size < minBytes) {
-    return { ok: false, reason: `too small (${size} bytes < ${minBytes} min)` };
+  let st = null;
+  try { st = statSync(filePath); } catch { return { ok: false, reason: "unreadable" }; }
+  if (st.size < minBytes) {
+    return { ok: false, reason: `too small (${st.size} bytes < ${minBytes} min)` };
+  }
+  if ((opts.mode || "settlement") === "settlement") {
+    if (opts.clearedBeforeDispatch === false) {
+      return { ok: false, reason: `stale artifact guard: ${step.writes} was not cleared prior to dispatch` };
+    }
+    if (opts.minMtimeMs != null && Number.isFinite(opts.minMtimeMs)) {
+      // Allow 1s filesystem timestamp resolution floor (HFS+/ext4/FAT/APFS coarse stat)
+      const floorMs = Math.floor(opts.minMtimeMs / 1000) * 1000;
+      if (st.mtimeMs < floorMs) {
+        return {
+          ok: false,
+          reason: `stale artifact: ${step.writes} mtime (${Math.round(st.mtimeMs)}) predates current dispatch (${Math.round(opts.minMtimeMs)})`,
+        };
+      }
+    }
   }
   if (!step.verify) {
     return { ok: true, reason: null };

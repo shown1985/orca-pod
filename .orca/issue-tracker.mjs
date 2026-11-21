@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // GitHub (gh) / Gitea (tea) Issue + PR full traceability loop for Orca-Pod.
-// Auto-detects gh/tea when available, binds explicitly to origin host/repo,
+// Auto-detects gh/tea when available, binds explicitly to origin host/repo/login,
 // creates/links Epic & sub-task issues with atomic per-issue persistence,
-// scopes ISSUES.json per repo+objective/run, and handles non-default targetBranch (e.g. dev)
-// close semantics. Zero external dependencies (Node >= 18).
+// scopes ISSUES.json per run+repo+host+objective+epic (rejecting legacy unscoped files),
+// and handles non-default or unverified defaultBranch close semantics.
+// Zero external dependencies (Node >= 18).
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -30,6 +31,7 @@ export const DEFAULT_ISSUE_TRACKING = {
 };
 
 const CJK_CHAR_RE = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g;
+const TRANSPORT_ERR_RE = /\b(?:ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|socket hang up|TLS|SSL|network error|connection refused|connection reset|dial tcp|50[0234]\b|bad gateway|service unavailable|gateway timeout)\b/i;
 
 function hasValidTaskTitleLength(title) {
   if (!title) return false;
@@ -99,7 +101,6 @@ export function parseRemoteHost(remoteUrl) {
   if (!remoteUrl || typeof remoteUrl !== "string") return null;
   const u = remoteUrl.trim();
   if (!u) return null;
-  // Local filesystem path (e.g. /tmp/origin.git or file://...) -> not a hosted forge
   if (u.startsWith("/") || u.startsWith("./") || u.startsWith("../") || u.startsWith("file://") || /^[A-Za-z]:[\\/]/.test(u)) {
     return { isRemote: false, host: null, repoSlug: null, raw: sanitizeText(u, { maxLen: 160 }) };
   }
@@ -127,17 +128,75 @@ export function parseRemoteHost(remoteUrl) {
   };
 }
 
-export function detectRepoDefaultBranch(repoDir = process.cwd(), execFn = defaultExec) {
+export function buildGhRepoSelector(host, repo) {
+  if (!repo) return null;
+  if (host && host !== "github.com" && !repo.startsWith(`${host}/`)) return `${host}/${repo}`;
+  return repo;
+}
+
+/**
+ * Parse `tea logins list` table/plain output to find a login entry whose server URL
+ * matches `targetHost` by exact hostname (never substring match!).
+ */
+export function matchTeaLoginForHost(stdoutText, targetHost = null) {
+  const lines = String(stdoutText || "").split(/\r?\n/);
+  const entries = [];
+  for (const rawLine of lines) {
+    const urlMatch = rawLine.match(/https?:\/\/[^\s|│]+/i);
+    if (!urlMatch) continue;
+    let hostname = null;
+    try {
+      hostname = new URL(urlMatch[0]).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    } catch {
+      continue;
+    }
+    const cols = rawLine
+      .split(/[|│]/)
+      .map((c) => c.trim())
+      .filter((c) => c && !/^[─━┌┐└┘├┤┬┴┼+-]+$/.test(c));
+    let loginName = null;
+    if (cols.length >= 2 && !/^https?:\/\//i.test(cols[0]) && !/^name$/i.test(cols[0])) {
+      loginName = cols[0];
+    } else {
+      const tokens = rawLine.trim().split(/\s+/);
+      if (tokens.length >= 2 && !/^https?:\/\//i.test(tokens[0]) && !/^name$/i.test(tokens[0])) {
+        loginName = tokens[0];
+      }
+    }
+    if (loginName && hostname) {
+      entries.push({ login: loginName, host: hostname, url: urlMatch[0] });
+    }
+  }
+  if (!targetHost) return entries[0] || null;
+  const want = String(targetHost).trim().replace(/^\[|\]$/g, "").toLowerCase();
+  return entries.find((e) => e.host === want) || null;
+}
+
+/**
+ * Resolve the repository's verified default branch WITHOUT blindly guessing `main` or `master`!
+ * Checks `refs/remotes/origin/HEAD` first, then `gh repo view --json defaultBranchRef` when available;
+ * returns `null` if unverified.
+ */
+export function detectRepoDefaultBranch(repoDir = process.cwd(), execOrOpts = defaultExec, extraOpts = {}) {
+  const execFn = typeof execOrOpts === "function" ? execOrOpts : (execOrOpts?.execFn || defaultExec);
+  const opts = typeof execOrOpts === "object" && execOrOpts !== null ? execOrOpts : (extraOpts || {});
   const sym = execFn("git", ["-C", repoDir, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], { cwd: repoDir, timeoutMs: 2500 });
   if (sym.ok && sym.stdout) {
     const cleaned = sym.stdout.trim().replace(/^origin\//, "");
     if (cleaned) return cleaned;
   }
-  for (const cand of ["main", "master"]) {
-    const chk = execFn("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${cand}`], { cwd: repoDir, timeoutMs: 2000 });
-    if (chk.ok) return cand;
+  if (opts.provider === "gh" && opts.bin && opts.repo) {
+    const repoSel = buildGhRepoSelector(opts.host || null, opts.repo);
+    const view = execFn(opts.bin, ["repo", "view", repoSel, "--json", "defaultBranchRef"], { cwd: repoDir, timeoutMs: 5000 });
+    if (view.ok && view.stdout) {
+      try {
+        const parsed = JSON.parse(view.stdout);
+        const name = parsed?.defaultBranchRef?.name;
+        if (typeof name === "string" && name.trim()) return name.trim();
+      } catch {}
+    }
   }
-  return "main";
+  return null;
 }
 
 export function detectIssueProvider({
@@ -149,7 +208,7 @@ export function detectIssueProvider({
   allowLocalRemote = process.env.ORCA_ISSUE_ALLOW_LOCAL === "1",
 } = {}) {
   if (mode === false || mode === "off" || mode === "disabled") {
-    return { enabled: false, provider: null, bin: null, repo: null, host: null, defaultBranch: defaultBranchOverride || "main", reason: "disabled by config" };
+    return { enabled: false, provider: null, bin: null, repo: null, host: null, teaLogin: null, defaultBranch: defaultBranchOverride || null, reason: "disabled by config" };
   }
 
   const remoteRes = execFn("git", ["-C", repoDir, "remote", "get-url", "origin"], { cwd: repoDir, timeoutMs: 3000 });
@@ -162,12 +221,12 @@ export function detectIssueProvider({
       bin: null,
       repo: null,
       host: null,
-      defaultBranch: defaultBranchOverride || "main",
+      teaLogin: null,
+      defaultBranch: defaultBranchOverride || null,
       reason: remoteUrl ? `origin is local (${sanitizeText(remoteUrl, { maxLen: 120 })})` : "no git origin remote configured",
     };
   }
 
-  const defaultBranch = defaultBranchOverride || detectRepoDefaultBranch(repoDir, execFn);
   const customCli = process.env.ORCA_ISSUE_CLI || null;
   const order = providerOverride === "gh"
     ? ["gh"]
@@ -180,16 +239,22 @@ export function detectIssueProvider({
     if (prov === "gh") {
       const ver = execFn(bin, ["--version"], { cwd: repoDir, timeoutMs: 3000 });
       if (!ver.ok) continue;
-      // Bind auth check to exact origin host when known
       const authArgs = remote?.host ? ["auth", "status", "--hostname", remote.host] : ["auth", "status"];
       const auth = execFn(bin, authArgs, { cwd: repoDir, timeoutMs: 5000 });
       if (!auth.ok) continue;
+      const defaultBranch = defaultBranchOverride || detectRepoDefaultBranch(repoDir, execFn, {
+        provider: "gh",
+        bin,
+        host: remote?.host || null,
+        repo: remote?.repoSlug || null,
+      });
       return {
         enabled: true,
         provider: "gh",
         bin,
         repo: remote?.repoSlug || null,
         host: remote?.host || null,
+        teaLogin: null,
         defaultBranch,
         reason: "gh CLI authenticated",
       };
@@ -199,72 +264,79 @@ export function detectIssueProvider({
       if (!ver.ok) continue;
       const logins = execFn(bin, ["logins", "list"], { cwd: repoDir, timeoutMs: 5000 });
       if (!logins.ok || !logins.stdout) continue;
-      if (remote?.host && !allowLocalRemote && !logins.stdout.toLowerCase().includes(remote.host.toLowerCase())) {
+      const matchedLogin = matchTeaLoginForHost(logins.stdout, remote?.host || null);
+      if (remote?.host && !allowLocalRemote && !matchedLogin) {
         continue;
       }
+      const defaultBranch = defaultBranchOverride || detectRepoDefaultBranch(repoDir, execFn, {
+        provider: "tea",
+        bin,
+        host: remote?.host || null,
+        repo: remote?.repoSlug || null,
+      });
       return {
         enabled: true,
         provider: "tea",
         bin,
         repo: remote?.repoSlug || null,
         host: remote?.host || null,
+        teaLogin: matchedLogin?.login || null,
         defaultBranch,
         reason: "tea CLI authenticated",
       };
     }
   }
 
+  const fallbackDefault = defaultBranchOverride || detectRepoDefaultBranch(repoDir, execFn);
   return {
     enabled: false,
     provider: null,
     bin: null,
     repo: remote?.repoSlug || null,
     host: remote?.host || null,
-    defaultBranch,
+    teaLogin: null,
+    defaultBranch: fallbackDefault,
     reason: "neither gh nor tea CLI is available & authenticated",
   };
 }
 
 /**
+ * Extract an explicit current-repo issue linkage marker from a task title.
+ * Plain prose numbers like `"Retry step #2"` or cross-repo `"owner/repo#17"` are NEVER treated as local issues;
+ * requires `[#42]`, `(Issue #42)`, `Issue: #42`, or `(Refs #42)` / `Fixes #42` / `Closes #42`.
+ */
+export function extractExplicitLocalIssueNumber(text) {
+  const s = String(text || "");
+  const m = s.match(/(?:^|[\s(\[])(?:\[#(\d+)\]|(?:issue|gh|gitea)\s*[:#]?\s*#(\d+)|(?:refs?|closes|fixes|resolves)\s+#(\d+))(?=$|[\s)\],.;:])/i);
+  if (!m) return null;
+  const n = Number(m[1] || m[2] || m[3]);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/**
  * Parse sub-tasks from BACKLOG_DAG.md, MICRO_PLAN.md, or ROOT_CAUSE.md.
  * Hardened against code fences, checked-off `[x]` items, arbitrary `[bracket]` headings,
- * cross-repo `owner/repo#N` references, and short CJK titles.
+ * cross-repo `owner/repo#N` references, prose `#N` false links, auto/explicit `T<n>` ID collisions,
+ * and short CJK titles.
  */
 export function parseBacklogTasks(markdown, { maxTasks = 20 } = {}) {
   if (typeof markdown !== "string" || !markdown.trim()) return [];
-  const tasks = [];
-  const seenTitles = new Set();
-  const seenIds = new Set();
+  const rawCandidates = [];
 
-  const extractLocalIssueNum = (text) => {
-    // Only match standalone `#123` (never `owner/repo#123`, `PR#123`, or URLs)
-    const m = String(text || "").match(/(?:^|[\s(\[])#(\d+)\b/);
-    if (!m) return null;
-    const n = Number(m[1]);
-    return Number.isInteger(n) && n > 0 ? n : null;
-  };
-
-  const addTask = ({ id = null, title, owner = null, existingNumber = null }) => {
+  const collectCandidate = ({ id = null, title, owner = null, existingNumber = null }) => {
     const cleanTitle = String(title || "")
       .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
       .replace(/[*_`~]/g, "")
       .replace(/\s+/g, " ")
       .trim();
     if (!hasValidTaskTitleLength(cleanTitle)) return;
-    // Skip common boilerplate / non-task headings
     if (/^(?:overview|summary|objective|background|assumptions|decisions|verdict|risks?|dependencies|acceptance criteria|testing|notes?|references|dag|architecture|scope|non-goals?)$/i.test(cleanTitle)) {
       return;
     }
     const normId = id ? String(id).trim().replace(/\s+/g, "") : null;
-    if (normId && seenIds.has(normId.toLowerCase())) return;
-    const titleKey = cleanTitle.toLowerCase();
-    if (seenTitles.has(titleKey)) return;
-    seenTitles.add(titleKey);
-    if (normId) seenIds.add(normId.toLowerCase());
-
     const num = (Number.isInteger(existingNumber) && existingNumber > 0)
       ? existingNumber
-      : extractLocalIssueNum(cleanTitle);
+      : extractExplicitLocalIssueNumber(title);
 
     const inferredOwner = owner || (/\b(backend|server|api|db|mysql|sql|python)\b|(?:后端|数据库|建表|迁移|接口)/i.test(cleanTitle)
       ? "backend"
@@ -272,8 +344,8 @@ export function parseBacklogTasks(markdown, { maxTasks = 20 } = {}) {
         ? "frontend"
         : null);
 
-    tasks.push({
-      id: normId || `T${tasks.length + 1}`,
+    rawCandidates.push({
+      explicitId: normId,
       title: cleanTitle.slice(0, 140),
       owner: inferredOwner,
       number: num || null,
@@ -286,7 +358,6 @@ export function parseBacklogTasks(markdown, { maxTasks = 20 } = {}) {
   let fenceLen = 0;
 
   for (const rawLine of lines) {
-    if (tasks.length >= maxTasks) break;
     const trimmedFence = rawLine.trimStart();
     const fm = trimmedFence.match(/^(`{3,}|~{3,})/);
     if (fm) {
@@ -320,7 +391,7 @@ export function parseBacklogTasks(markdown, { maxTasks = 20 } = {}) {
         }
         if (/^(?:T\d+|TASK[-_ ]?\d+|BE[-_ ]?\d+|FE[-_ ]?\d+|S\d+|#\d+|\d+)$/i.test(c0) && hasValidTaskTitleLength(c1)) {
           const explicitNum = /^#(\d+)$/.test(c0) ? Number(c0.slice(1)) : null;
-          addTask({ id: c0.replace(/^#/, "T"), title: c1, owner: cells[2] || null, existingNumber: explicitNum });
+          collectCandidate({ id: c0.replace(/^#/, "T"), title: c1, owner: cells[2] || null, existingNumber: explicitNum });
           continue;
         }
       }
@@ -329,22 +400,59 @@ export function parseBacklogTasks(markdown, { maxTasks = 20 } = {}) {
     // 2) Headings with explicit Task IDs ONLY: ### T1: Title | ### Task 1 - Title | ### [BE-1] Title
     const hMatch = line.match(/^#{2,4}\s+(?:\[((?:T|TASK|BE|FE|S|SUBTASK)[-_ ]?\d+)\]\s*[:\-–—.]?\s*|((?:T|TASK|BE|FE|S|SUBTASK)[-_ ]?\d+)\s*[:\-–—.]\s*)(.+)$/i);
     if (hMatch) {
-      addTask({ id: (hMatch[1] || hMatch[2]).replace(/\s+/g, ""), title: hMatch[3] });
+      collectCandidate({ id: (hMatch[1] || hMatch[2]).replace(/\s+/g, ""), title: hMatch[3] });
       continue;
     }
 
     // 3) Unchecked / in-progress task checklist items ONLY (skip already-completed `- [x]`)
     const cbMatch = line.match(/^[-*]\s+\[[ ~]\]\s+(?:(?:\*\*|`)?((?:T|TASK|BE|FE|S|SUBTASK)[-_ ]?\d+)(?:\*\*|`)?\s*[:\-–—.]?\s+)?(.+)$/i);
     if (cbMatch) {
-      addTask({ id: cbMatch[1] ? cbMatch[1].replace(/\s+/g, "") : null, title: cbMatch[2] });
+      collectCandidate({ id: cbMatch[1] ? cbMatch[1].replace(/\s+/g, "") : null, title: cbMatch[2] });
       continue;
     }
 
     // 4) Numbered or explicit bullet tasks: - **T1**: Title  or  1. **T1** - Title
     const bMatch = line.match(/^(?:[-*]|\d+[.)])\s+(?:\*\*|`)?((?:T|TASK|BE|FE|SUBTASK)[-_ ]?\d+)(?:\*\*|`)?\s*[:\-–—.]\s+(.+)$/i);
     if (bMatch) {
-      addTask({ id: bMatch[1].replace(/\s+/g, ""), title: bMatch[2] });
+      collectCandidate({ id: bMatch[1].replace(/\s+/g, ""), title: bMatch[2] });
     }
+  }
+
+  // Reserve all explicit IDs up-front so auto-assigned `T<n>` IDs NEVER collide with later explicit `T<n>` items!
+  const reservedExplicitIds = new Set(
+    rawCandidates
+      .map((c) => (c.explicitId ? c.explicitId.toLowerCase() : null))
+      .filter(Boolean)
+  );
+  const seenIds = new Set();
+  const seenTitles = new Set();
+  const tasks = [];
+  let nextAuto = 1;
+
+  for (const cand of rawCandidates) {
+    if (tasks.length >= maxTasks) break;
+    const titleKey = cand.title.toLowerCase();
+    if (seenTitles.has(titleKey)) continue;
+
+    let finalId = cand.explicitId;
+    if (finalId) {
+      if (seenIds.has(finalId.toLowerCase())) continue;
+    } else {
+      while (seenIds.has(`t${nextAuto}`) || reservedExplicitIds.has(`t${nextAuto}`)) {
+        nextAuto++;
+      }
+      finalId = `T${nextAuto}`;
+      nextAuto++;
+    }
+
+    seenTitles.add(titleKey);
+    seenIds.add(finalId.toLowerCase());
+    tasks.push({
+      id: finalId,
+      title: cand.title,
+      owner: cand.owner,
+      number: cand.number,
+    });
   }
 
   return tasks;
@@ -365,16 +473,16 @@ export function parseIssueNumberFromOutput(text) {
   return { number: null, url: null };
 }
 
+/**
+ * Return `true` ONLY when an issue-create invocation failed BEFORE creating any issue on the forge
+ * due to a missing/unknown label rejection (never on timeouts, transport errors, or partial post-create label errors).
+ */
 export function isMissingLabelError(stderr = "", stdout = "", timedOut = false) {
   if (timedOut) return false;
   const combined = `${stderr}\n${stdout}`;
-  return /label.*(?:not found|does not exist|invalid|unknown|cannot find|could not add|not exist)|(?:not found|does not exist|unknown).*label|\b422\b.*label/i.test(combined);
-}
-
-function buildGhRepoSelector(host, repo) {
-  if (!repo) return null;
-  if (host && host !== "github.com" && !repo.includes(host)) return `${host}/${repo}`;
-  return repo;
+  if (/https?:\/\/[^\s"'<>]+\/issues\/\d+/.test(combined)) return false;
+  if (TRANSPORT_ERR_RE.test(combined)) return false;
+  return /(?:label\s+['"`]?[\w.:-]+['"`]?\s+(?:not found|does not exist)|['"`][^'"`\r\n]+['"`]\s+not found|label[^\r\n]*(?:not found|does not exist|unknown label)|\b422\b[^\r\n]*label)/i.test(combined);
 }
 
 export function createIssueViaCli({
@@ -383,6 +491,7 @@ export function createIssueViaCli({
   repoDir,
   repo = null,
   host = null,
+  teaLogin = null,
   title,
   body,
   labels = [],
@@ -401,6 +510,7 @@ export function createIssueViaCli({
     }
     if (provider === "tea") {
       const args = ["issues", "create"];
+      if (teaLogin) args.push("--login", teaLogin);
       if (repo) args.push("--repo", repo);
       args.push("--title", title, "--description", body);
       if (withLabels && labels.length) args.push("--labels", labels.join(","));
@@ -410,7 +520,21 @@ export function createIssueViaCli({
   };
 
   let res = runCreate(true);
-  // ONLY retry without labels when the CLI explicitly rejected an unknown/missing label (never on timeouts or network errors)
+  // Reconcile ALREADY-CREATED issue URL first! Some CLIs create the issue first, print its URL,
+  // and exit non-zero if a subsequent label attachment fails — NEVER create a duplicate issue in that case!
+  const firstCreated = parseIssueNumberFromOutput(`${res.stdout}\n${res.stderr}`);
+  if (firstCreated.url && firstCreated.number != null) {
+    return {
+      ok: true,
+      number: firstCreated.number,
+      url: firstCreated.url,
+      raw: sanitizeText(res.stdout || res.stderr, { maxLen: 240 }),
+      labelWarning: !res.ok ? sanitizeText(res.stderr || "label attach failed after create", { maxLen: 200 }) : null,
+      error: null,
+    };
+  }
+
+  // ONLY retry without labels when no issue URL was created and the CLI explicitly rejected a missing label
   if (!res.ok && labels.length && isMissingLabelError(res.stderr, res.stdout, res.timedOut)) {
     res = runCreate(false);
   }
@@ -428,7 +552,7 @@ export function createIssueViaCli({
   };
 }
 
-export function commentIssueViaCli({ provider, bin, repoDir, repo = null, host = null, number, body, execFn = defaultExec }) {
+export function commentIssueViaCli({ provider, bin, repoDir, repo = null, host = null, teaLogin = null, number, body, execFn = defaultExec }) {
   if (!Number.isInteger(Number(number)) || Number(number) <= 0) return { ok: false, error: "missing or invalid issue number" };
   if (provider === "gh") {
     const args = ["issue", "comment", String(number)];
@@ -440,6 +564,7 @@ export function commentIssueViaCli({ provider, bin, repoDir, repo = null, host =
   }
   if (provider === "tea") {
     const args = ["comment"];
+    if (teaLogin) args.push("--login", teaLogin);
     if (repo) args.push("--repo", repo);
     args.push(String(number), body);
     const r = execFn(bin, args, { cwd: repoDir, timeoutMs: 15000 });
@@ -476,8 +601,10 @@ function normalizeLoadedState(raw) {
 }
 
 /**
- * Load `ISSUES.json` from `artDirAbs`, validating positive integer issue numbers and
- * optionally enforcing run/repo/objective scope isolation so stale runs never leak.
+ * Load `ISSUES.json` from `artDirAbs`.
+ * When `matchScope` is provided (pipeline execution / resume), strictly requires complete v2 scope
+ * fields (`schemaVersion >= 2`, `provider`, `host`, `repo`, `objectiveHash`, `epic`, and `runScopeId`
+ * when resuming) unless `matchScope.adoptLegacy === true` is explicitly passed.
  */
 export function loadIssueState(artDirAbs, matchScope = null) {
   if (matchScope && (matchScope.mode === false || matchScope.mode === "off" || matchScope.mode === "disabled")) {
@@ -489,20 +616,39 @@ export function loadIssueState(artDirAbs, matchScope = null) {
   try { parsed = normalizeLoadedState(JSON.parse(readFileSync(p, "utf8"))); } catch { return null; }
   if (!parsed) return null;
 
-  if (matchScope && typeof matchScope === "object") {
-    if (matchScope.provider && parsed.provider && parsed.provider !== matchScope.provider) return null;
-    if (matchScope.repo && parsed.repo && parsed.repo.toLowerCase() !== matchScope.repo.toLowerCase()) return null;
-    if (matchScope.host && parsed.host && parsed.host.toLowerCase() !== matchScope.host.toLowerCase()) return null;
+  if (matchScope && typeof matchScope === "object" && !matchScope.adoptLegacy) {
+    if (!Number.isInteger(parsed.schemaVersion) || parsed.schemaVersion < 2) return null;
+    if (!parsed.provider) return null;
+    if (matchScope.provider && parsed.provider !== matchScope.provider) return null;
+
+    if (matchScope.repo != null) {
+      if (!parsed.repo || parsed.repo.toLowerCase() !== String(matchScope.repo).toLowerCase()) return null;
+    } else if (parsed.repo) {
+      return null;
+    }
+
+    if (matchScope.host != null) {
+      if (!parsed.host || parsed.host.toLowerCase() !== String(matchScope.host).toLowerCase()) return null;
+    } else if (parsed.host) {
+      return null;
+    }
+
+    if (matchScope.objective != null && String(matchScope.objective).trim()) {
+      const wantHash = computeObjectiveHash(matchScope.objective);
+      if (!parsed.objectiveHash || parsed.objectiveHash !== wantHash) return null;
+    }
+
     if (matchScope.epicIssue != null) {
       const wantEpic = Number(matchScope.epicIssue);
-      if (Number.isInteger(wantEpic) && wantEpic > 0 && parsed.epic?.number && parsed.epic.number !== wantEpic) {
+      if (Number.isInteger(wantEpic) && wantEpic > 0 && parsed.epic?.number !== wantEpic) {
         return null;
       }
     }
-    if (matchScope.objective != null && String(matchScope.objective).trim()) {
-      const wantHash = computeObjectiveHash(matchScope.objective);
-      if (parsed.objectiveHash && parsed.objectiveHash !== wantHash) return null;
-      if (!parsed.objectiveHash && parsed.objective && parsed.objective.trim() !== String(matchScope.objective).trim()) return null;
+
+    const allowedRunIds = [matchScope.runScopeId, matchScope.priorRunScopeId].filter(Boolean);
+    if (matchScope.requireRunScope && allowedRunIds.length === 0) return null;
+    if (allowedRunIds.length > 0 && (!parsed.runScopeId || !allowedRunIds.includes(parsed.runScopeId))) {
+      return null;
     }
   }
   return parsed;
@@ -518,6 +664,7 @@ export function saveIssueState(artDirAbs, state) {
     "# Issue Traceability (Orca-Pod)",
     "",
     `- **Provider**: \`${normalized.provider || "none"}\``,
+    ...(normalized.host ? [`- **Host**: \`${normalized.host}\``] : []),
     ...(normalized.repo ? [`- **Repository**: \`${normalized.repo}\``] : []),
     ...(normalized.defaultBranch ? [`- **Default Branch**: \`${normalized.defaultBranch}\``] : []),
     ...(normalized.epic ? [`- **Epic Issue**: #${normalized.epic.number}${normalized.epic.url ? ` (${normalized.epic.url})` : ""} — ${normalized.epic.title || ""}`] : []),
@@ -532,7 +679,7 @@ export function saveIssueState(artDirAbs, state) {
     }
     lines.push("");
   }
-  const pr = formatIssuePrBlock(normalized, { defaultBranch: normalized.defaultBranch || "main" });
+  const pr = formatIssuePrBlock(normalized, { defaultBranch: normalized.defaultBranch || null });
   if (pr.issueCloses) {
     lines.push("## PR Linking Trailers", "", "```text", pr.issueCloses, "```", "");
   }
@@ -547,6 +694,10 @@ export function syncPlanIssues({
   objective,
   stepId = "po-backlog",
   artifactPath = null,
+  runScopeId = null,
+  priorRunScopeId = null,
+  requireRunScope = false,
+  adoptLegacy = false,
   execFn = defaultExec,
   log = () => {},
   warn = () => {},
@@ -555,10 +706,14 @@ export function syncPlanIssues({
   const matchScope = {
     mode: config?.mode ?? "auto",
     provider: providerInfo?.provider || null,
-    host: providerInfo?.host || null,
-    repo: providerInfo?.repo || null,
+    host: providerInfo?.host ?? null,
+    repo: providerInfo?.repo ?? null,
     objective,
     epicIssue: config?.epicIssue ?? null,
+    runScopeId,
+    priorRunScopeId,
+    requireRunScope,
+    adoptLegacy,
   };
   if (!providerInfo?.enabled) return loadIssueState(artDirAbs, matchScope);
 
@@ -574,10 +729,12 @@ export function syncPlanIssues({
   const existing = loadIssueState(artDirAbs, matchScope) || {
     schemaVersion: 2,
     scopeKey,
+    runScopeId: runScopeId || null,
     provider: providerInfo.provider,
     host: providerInfo.host || null,
     repo: providerInfo.repo || null,
-    defaultBranch: providerInfo.defaultBranch || config.defaultBranch || "main",
+    teaLogin: providerInfo.teaLogin || null,
+    defaultBranch: providerInfo.defaultBranch || config.defaultBranch || null,
     objective: safeObj,
     objectiveHash: objHash,
     epic: null,
@@ -586,10 +743,12 @@ export function syncPlanIssues({
   };
   existing.schemaVersion = 2;
   existing.scopeKey = scopeKey;
+  if (runScopeId) existing.runScopeId = runScopeId;
   existing.provider = providerInfo.provider;
   existing.host = providerInfo.host || existing.host || null;
   existing.repo = providerInfo.repo || existing.repo || null;
-  existing.defaultBranch = providerInfo.defaultBranch || config.defaultBranch || existing.defaultBranch || "main";
+  existing.teaLogin = providerInfo.teaLogin || existing.teaLogin || null;
+  existing.defaultBranch = providerInfo.defaultBranch || config.defaultBranch || existing.defaultBranch || null;
   existing.objective = safeObj;
   existing.objectiveHash = objHash;
 
@@ -628,6 +787,7 @@ export function syncPlanIssues({
       repoDir,
       repo: providerInfo.repo,
       host: providerInfo.host,
+      teaLogin: providerInfo.teaLogin || null,
       title: epicTitle,
       body: epicBody,
       labels,
@@ -647,7 +807,7 @@ export function syncPlanIssues({
   if (artifactPath && existsSync(artifactPath)) {
     const md = readFileSync(artifactPath, "utf8");
     const parsed = parseBacklogTasks(md, { maxTasks: config.maxSubtasks ?? 20 });
-    const existingByTitle = new Map((existing.tasks || []).map((t) => [t.title.toLowerCase(), t]));
+    const existingByTitle = new Map((existing.tasks || []).filter((t) => t.title).map((t) => [t.title.toLowerCase(), t]));
     const existingById = new Map((existing.tasks || []).filter((t) => t.id).map((t) => [String(t.id).toLowerCase(), t]));
     const taskLabels = [...(config.labels || []), config.taskLabel].filter(Boolean);
 
@@ -681,6 +841,7 @@ export function syncPlanIssues({
         repoDir,
         repo: providerInfo.repo,
         host: providerInfo.host,
+        teaLogin: providerInfo.teaLogin || null,
         title: childTitle,
         body: childBody,
         labels: taskLabels,
@@ -712,6 +873,7 @@ export function syncPlanIssues({
         repoDir,
         repo: providerInfo.repo,
         host: providerInfo.host,
+        teaLogin: providerInfo.teaLogin || null,
         number: existing.epic.number,
         body: checklist,
         execFn,
@@ -727,13 +889,15 @@ export function syncPlanIssues({
 export function formatIssuePrBlock(state, {
   closeOnPr = true,
   targetBranch = "dev",
-  defaultBranch = "main",
+  defaultBranch = undefined,
   provider = null,
+  host = null,
   repo = null,
+  teaLogin = null,
 } = {}) {
   const norm = normalizeLoadedState(state);
   if (!norm || (!norm.epic?.number && !(norm.tasks || []).some((t) => t.number))) {
-    return { epicIssue: "", issueRefs: "", issueCloses: "", nonDefaultBranchGuidance: "", block: "" };
+    return { epicIssue: "", issueRefs: "", issueCloses: "", nonDefaultBranchGuidance: "", targetsDefaultBranch: false, block: "" };
   }
   const epicNum = norm.epic?.number || null;
   const taskNums = (norm.tasks || []).map((t) => t.number).filter((n) => Number.isInteger(n) && n > 0 && n !== epicNum);
@@ -754,24 +918,45 @@ export function formatIssuePrBlock(state, {
     issueCloses = issueRefs;
   }
 
-  const effDefault = defaultBranch || norm.defaultBranch || "main";
+  const effDefault = defaultBranch !== undefined ? defaultBranch : (norm.defaultBranch || null);
   const effProv = provider || norm.provider || "gh";
+  const effHost = host || norm.host || null;
   const effRepo = repo || norm.repo || null;
-  const isNonDefaultTarget = Boolean(targetBranch && effDefault && targetBranch !== effDefault);
+  const effTeaLogin = teaLogin || norm.teaLogin || null;
+  const ghRepoSel = buildGhRepoSelector(effHost, effRepo);
 
+  const buildCloseCommands = () => {
+    if (effProv === "tea") {
+      const loginFlag = effTeaLogin ? ` --login "${effTeaLogin}"` : "";
+      const repoFlag = effRepo ? ` --repo "${effRepo}"` : "";
+      return closeTargets.map((n) => `tea issues close${loginFlag}${repoFlag} ${n}`).join(" && ");
+    }
+    const repoFlag = ghRepoSel ? ` --repo "${ghRepoSel}"` : "";
+    return closeTargets
+      .map((n) => `gh issue close ${n}${repoFlag} --comment "Merged to ${targetBranch} via PR #<pr_number>"`)
+      .join(" && ");
+  };
+
+  const isVerifiedDefaultTarget = Boolean(targetBranch && effDefault && targetBranch === effDefault);
   let nonDefaultBranchGuidance = "";
-  if (closeOnPr && isNonDefaultTarget && closeTargets.length) {
-    const repoFlag = effRepo ? ` --repo "${effRepo}"` : "";
-    const closeCmds = effProv === "tea"
-      ? closeTargets.map((n) => `tea issues close${repoFlag} ${n}`).join(" && ")
-      : closeTargets.map((n) => `gh issue close ${n}${repoFlag} --comment "Merged to ${targetBranch} via PR #<pr_number>"`).join(" && ");
-    nonDefaultBranchGuidance = [
-      `NON-DEFAULT TARGET BRANCH ISSUE CLOSE RULE (\`${targetBranch}\` != default branch \`${effDefault}\`):`,
-      `- GitHub/Gitea \`Closes #N\` keywords only auto-close issues when merged into the repository's default branch (\`${effDefault}\`).`,
-      `- Keep \`${issueCloses.replace(/\n/g, " / ")}\` in the PR description for timeline traceability AND future \`${targetBranch} -> ${effDefault}\` release tracking.`,
-      `- ONLY AFTER confirming the PR is actually MERGED into \`${targetBranch}\` (\`Merge-Status: MERGED\`, NEVER when held for \`PENDING_HUMAN_MERGE\`), explicitly close the completed issue(s) via CLI:`,
-      `  \`${closeCmds}\``,
-    ].join("\n");
+  if (closeOnPr && closeTargets.length && !isVerifiedDefaultTarget) {
+    const closeCmds = buildCloseCommands();
+    if (effDefault && targetBranch !== effDefault) {
+      nonDefaultBranchGuidance = [
+        `NON-DEFAULT TARGET BRANCH ISSUE CLOSE RULE (\`${targetBranch}\` != default branch \`${effDefault}\`):`,
+        `- GitHub/Gitea \`Closes #N\` keywords only auto-close issues when merged into the repository's default branch (\`${effDefault}\`).`,
+        `- Keep \`${issueCloses.replace(/\n/g, " / ")}\` in the PR description for timeline traceability AND future \`${targetBranch} -> ${effDefault}\` release tracking.`,
+        `- ONLY AFTER verifying on the forge that the PR is \`MERGED\` into base \`${targetBranch}\` containing the expected HEAD commit (\`Merge-Status: MERGED\`, NEVER when held for \`PENDING_HUMAN_MERGE\`), explicitly close the completed issue(s) via host-qualified CLI:`,
+        `  \`${closeCmds}\``,
+      ].join("\n");
+    } else {
+      nonDefaultBranchGuidance = [
+        `UNVERIFIED DEFAULT BRANCH ISSUE CLOSE RULE (target \`${targetBranch}\`, repository default branch unverified):`,
+        `- Repository default branch could not be verified locally via \`origin/HEAD\` or forge metadata; do NOT assume \`Closes #N\` auto-closed issues on \`${targetBranch}\`.`,
+        `- Keep \`${issueCloses.replace(/\n/g, " / ")}\` in the PR description. ONLY AFTER verifying on the forge that the PR is \`MERGED\` into base \`${targetBranch}\` (\`Merge-Status: MERGED\`, NEVER \`PENDING_HUMAN_MERGE\`), check whether the issue(s) remain open and close them explicitly if \`${targetBranch}\` is not the default branch:`,
+        `  \`${closeCmds}\``,
+      ].join("\n");
+    }
   }
 
   const lines = [
@@ -788,7 +973,7 @@ export function formatIssuePrBlock(state, {
     issueRefs,
     issueCloses,
     nonDefaultBranchGuidance,
-    targetsDefaultBranch: !isNonDefaultTarget,
+    targetsDefaultBranch: isVerifiedDefaultTarget,
     block: lines.join("\n"),
   };
 }
@@ -822,6 +1007,7 @@ if (isMain) {
     const planPath = getFlag("--plan", join(artDirAbs, "BACKLOG_DAG.md"));
     const objective = getFlag("--objective", "Orca-Pod Backlog Sync");
     const epicRaw = getFlag("--epic-issue", null);
+    const adoptLegacy = args.includes("--adopt-legacy");
     if (!prov.enabled) {
       console.error(`[orca-issues] cannot sync: ${prov.reason}`);
       process.exit(1);
@@ -834,6 +1020,7 @@ if (isMain) {
       objective,
       stepId: "manual-sync",
       artifactPath: resolve(repoDir, planPath),
+      adoptLegacy,
       log: (...a) => console.log(...a),
       warn: (...a) => console.warn(...a),
     });
@@ -841,6 +1028,6 @@ if (isMain) {
     process.exit(0);
   }
 
-  console.error("Usage: node .orca/issue-tracker.mjs [status|sync] [--repo <dir>] [--plan <file>] [--objective <text>] [--epic-issue <n>] [--json]");
+  console.error("Usage: node .orca/issue-tracker.mjs [status|sync] [--repo <dir>] [--plan <file>] [--objective <text>] [--epic-issue <n>] [--adopt-legacy] [--json]");
   process.exit(2);
 }

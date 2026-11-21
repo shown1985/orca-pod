@@ -321,15 +321,21 @@ export function createRunLedger({
       }
     },
 
-    recordIntent({ requestId, stepId, title, agent, model, effort = null, family = null, attempt = 1, worktree = null, branch = null }) {
+    recordIntent({ requestId, stepId, title, agent, model, requestedModel = null, requestedEffort = null, effort = null, family = null, attempt = 1, worktree = null, branch = null }) {
       const normModel = model && model !== "default" ? model : "default";
+      const prev = summary.steps[stepId] || {};
+      const prevFams = Array.isArray(prev.executedFamilies) ? prev.executedFamilies : [];
       summary.steps[stepId] = {
-        ...(summary.steps[stepId] || {}),
+        ...prev,
         title,
+        requestedAgent: agent,
+        requestedModel: requestedModel || normModel,
+        requestedEffort: requestedEffort || effort || null,
         agent,
         model: normModel,
-        effort: effort || null,
-        family: family || null,
+        effort: null, // Effective effort is populated by recordDispatchResult once actual CLI argv/receipt is confirmed!
+        family: family || prev.family || null,
+        executedFamilies: prevFams,
         attempt,
         worktree,
         branch,
@@ -338,20 +344,53 @@ export function createRunLedger({
         turnStart: "unobserved",
         health: "healthy",
       };
-      return append("intent", { requestId, stepId, title, agent, model: normModel, effort: effort || null, family: family || null, attempt, worktree, branch }, { critical: false });
+      return append("intent", {
+        requestId, stepId, title,
+        requestedAgent: agent,
+        requestedModel: requestedModel || normModel,
+        requestedEffort: requestedEffort || effort || null,
+        family: family || null,
+        attempt, worktree, branch,
+      }, { critical: false });
     },
 
-    recordDispatchResult({ requestId, stepId, dispatchId = null, terminal = null, turnStart = "unobserved", state = null }) {
+    recordStartAttempts({ requestId, stepId, attempts = [] }) {
+      const safeAttempts = sanitizeValue(attempts, { maxStringLen: 240 });
       const cur = summary.steps[stepId] || {};
       summary.steps[stepId] = {
         ...cur,
+        startAttempts: [...(Array.isArray(cur.startAttempts) ? cur.startAttempts : []), ...safeAttempts],
+      };
+      return append("start_attempts", { requestId, stepId, attempts: safeAttempts }, { critical: false });
+    },
+
+    recordDispatchResult({
+      requestId, stepId, dispatchId = null, terminal = null, turnStart = "unobserved", state = null,
+      effectiveAgent = null, effectiveModel = null, effectiveEffort = null, executedFamilies = null,
+    }) {
+      const cur = summary.steps[stepId] || {};
+      const mergedFams = Array.isArray(executedFamilies)
+        ? [...new Set([...(cur.executedFamilies || []), ...executedFamilies])]
+        : (cur.executedFamilies || []);
+      summary.steps[stepId] = {
+        ...cur,
+        agent: effectiveAgent || cur.agent,
+        model: effectiveModel || cur.model || "default",
+        effort: effectiveEffort !== undefined ? effectiveEffort : (cur.effort || null),
+        executedFamilies: mergedFams,
         dispatchId,
         terminal,
         turnStart,
         dispatchState: state,
         lifecycle: "dispatched",
       };
-      return append("result", { requestId, stepId, dispatchId, terminal, turnStart, state }, { critical: false });
+      return append("result", {
+        requestId, stepId, dispatchId, terminal, turnStart, state,
+        effectiveAgent: effectiveAgent || cur.agent,
+        effectiveModel: effectiveModel || cur.model || "default",
+        effectiveEffort: effectiveEffort ?? null,
+        executedFamilies: mergedFams,
+      }, { critical: false });
     },
 
     recordWorkerStopped({ stepId, dispatchId = null, terminal = null, agent = null, reason = null }) {
@@ -498,6 +537,9 @@ export function createRunLedger({
       if (closeout.pendingResolved && summary.pending) {
         summary.pending.resolvedAt = closeout.closedAt;
       }
+      if (closeout.issueVerification && summary.issues) {
+        summary.issues.closeoutVerification = closeout.issueVerification;
+      }
       append("closeout", closeout, { critical: false });
       return closeout;
     },
@@ -634,6 +676,30 @@ export function computeCloseout({ summary, wtDir, artDirRel = ".orca/artifacts",
   const pendingHumanMerge = Boolean(summary.pending && !summary.pending.resolvedAt && !headInTarget);
   const finalOverall = pendingHumanMerge && overall === "succeeded" ? "pending-human-merge" : overall;
 
+  // P1-08: Reconcile PR artifact <-> linked Issue traceability & merge state in closeout
+  let issueVerification = null;
+  if (summary.issues) {
+    const prCandidates = ["EPIC_RELEASE_GATE.md", "PR_SUMMARY.md", "HOTFIX_PR.md"];
+    let prText = "";
+    let prArtifact = null;
+    for (const f of prCandidates) {
+      const fp = join(dir, artDirRel, f);
+      if (existsSync(fp)) {
+        try { prText = readFileSync(fp, "utf8"); prArtifact = f; break; } catch {}
+      }
+    }
+    const prUrlMatch = prText.match(/https?:\/\/[^\s"'<>]+\/(?:pull|pulls)\/(\d+)/i);
+    const mergeStatusMatch = prText.match(/Merge-Status\s*:\s*(\S+)/i);
+    issueVerification = {
+      prArtifact,
+      prUrl: prUrlMatch ? sanitizeText(prUrlMatch[0], { maxLen: 180 }) : null,
+      prNumber: prUrlMatch ? Number(prUrlMatch[1]) : null,
+      mergeStatus: mergeStatusMatch ? mergeStatusMatch[1] : null,
+      targetBranchMerged: Boolean(headInTarget),
+      verifiedAt: new Date().toISOString(),
+    };
+  }
+
   const rows = [
     { row: 1, fact: "accepted_contract_sha", value: verifiedContractCommit, ok: verifiedContractCommit ? true : null },
     { row: 2, fact: "task_branches_integrated", value: taskBranches, ok: allTasksIntegrated },
@@ -652,6 +718,7 @@ export function computeCloseout({ summary, wtDir, artDirRel = ".orca/artifacts",
     pendingResolved: Boolean(summary.pending && headInTarget),
     protectedViolations,
     acceptance,
+    issueVerification,
     rows,
   };
 }

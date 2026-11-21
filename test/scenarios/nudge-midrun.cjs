@@ -10,8 +10,10 @@ module.exports = {
     // empty list (the stall) — and, crucially, DELIVERS the worker_done the
     // nudge handler pushes. An `messages: []` override here would swallow
     // that recovery done and the member would ride to the hard cap.
-    "orchestration dispatch-show": (c) =>
-      c.ok({ dispatch: { status: "dispatching", last_heartbeat_at: new Date(Date.now() - 30 * 60 * 1000).toISOString() } }),
+    "orchestration dispatch-show": (c) => {
+      const d = Object.values(c.state.dispatches).filter((x) => x.task === c.flags.task).pop();
+      c.ok({ dispatch: { id: d ? d.id : null, status: "dispatching", last_heartbeat_at: new Date(Date.now() - 30 * 60 * 1000).toISOString() } });
+    },
     "orchestration worker-start": (c) => {
       const id = "disp-" + c.id();
       c.state.dispatches[id] = { id, task: c.flags.task, status: "dispatching", created: Date.now() };

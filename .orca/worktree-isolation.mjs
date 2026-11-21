@@ -171,16 +171,28 @@ export function recordMergedAfterContract(artDir, wtDir) {
 /**
  * Remove stale output artifact before launching a step so a PASS written in an
  * earlier round can never survive a crash or skipped rewrite on retry.
+ * Throws if an existing stale artifact cannot be deleted cleanly.
  */
 export function clearStaleStepArtifact(step, wtDir, stepWtDir, artDirRel) {
-  if (!step || !step.writes) return;
+  if (!step || !step.writes) return { cleared: true, clearedAtMs: Date.now(), targets: [] };
   const targets = [join(wtDir, artDirRel, step.writes)];
   if (stepWtDir && !samePath(stepWtDir, wtDir)) {
     targets.push(join(stepWtDir, artDirRel, step.writes));
   }
   for (const p of targets) {
-    try { if (existsSync(p)) rmSync(p, { force: true }); } catch { /* best-effort */ }
+    if (!existsSync(p)) continue;
+    try {
+      rmSync(p, { force: false });
+    } catch (e) {
+      if (!e || e.code !== "ENOENT") {
+        throw new Error(`[worktree-isolation] failed to remove stale step artifact "${p}": ${e?.message || e}`);
+      }
+    }
+    if (existsSync(p)) {
+      throw new Error(`[worktree-isolation] stale step artifact "${p}" still exists after unlink — refusing unsafe dispatch`);
+    }
   }
+  return { cleared: true, clearedAtMs: Date.now(), targets };
 }
 
 /**

@@ -67,7 +67,8 @@ export function createNudgeController({
       settleMember(m, m.nudge.outcome || "succeeded", m.nudge.done);
       return;
     }
-    if (Date.now() - m.startedAt >= m.hardCapMs) {
+    const hitDeadline = m.deadlineAt ? (Date.now() >= m.deadlineAt) : (Date.now() - m.startedAt >= m.hardCapMs);
+    if (hitDeadline) {
       m.note = "artifact still missing after hard cap";
       settleMember(m, "failed", m.nudge.done);
       return;

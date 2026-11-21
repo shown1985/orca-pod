@@ -7,7 +7,8 @@ module.exports = {
       c.ok({ dispatchId: id, state: "ready" });
     },
     "orchestration dispatch-show": (c) => {
-      c.ok({ dispatch: { status: "lost", last_heartbeat_at: null } });
+      const d = Object.values(c.state.dispatches).filter((x) => x.task === c.flags.task).pop();
+      c.ok({ dispatch: { id: d ? d.id : null, status: "lost", last_heartbeat_at: null } });
     },
     "orchestration worker-show": (c) => {
       c.ok({ terminal: { lastOutputAt: 0, preview: null } });

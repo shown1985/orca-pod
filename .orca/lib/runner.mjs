@@ -1,7 +1,7 @@
 // Pipeline runner: spec rendering, dry-run plan printer, startup chooser,
 // readiness gate, parallel/serial group execution, approval gate, and
-// integration with isolated worktrees, hard gates, cross-family review
-// isolation, safe dispatch stop/fencing, health machine & ledger.
+// integration with isolated worktrees, hard gates, proven cross-family review
+// isolation, strict dispatch fencing, absolute deadlines, health machine & ledger.
 
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -26,6 +26,7 @@ import { initMemberHealth, evaluateMemberHealth } from "../health.mjs";
 import { createWatchdogTracker, evaluateWatchdog } from "../watchdog.mjs";
 import {
   classifyModelFamily,
+  resolveEffectiveCandidateModel,
   isCrossFamilyReviewStep,
   resolveAuthorStepIds,
   buildCandidateChain,
@@ -33,7 +34,7 @@ import {
   selectHealthyCandidate,
 } from "../preflight.mjs";
 import { formatIssuePrBlock } from "../issue-tracker.mjs";
-import { pick, res, sleepMs, parkedPromptOf, outcomeOf, promptChoice } from "./orca-cli.mjs";
+import { pick, res, sleepMs, parkedPromptOf, outcomeOf, promptChoice, verifyStopAndReleaseReceipt } from "./orca-cli.mjs";
 import { createNudgeController } from "./nudge.mjs";
 import { parseStatusJs } from "./status.mjs";
 import { sanitizeText } from "./sanitize.mjs";
@@ -50,27 +51,26 @@ const taskOfMsg = (m) => pick(m, ["taskId", "task_id", "task"]);
 export function dispatchOfMsg(m) {
   if (!m || typeof m !== "object") return null;
   const direct = pick(m, ["dispatchId", "dispatch_id", "dispatch", "fromDispatchId", "contextId", "ctxId"]);
-  if (direct) return String(direct);
+  if (direct && String(direct).trim()) return String(direct).trim();
   if (m.payload != null) {
     let p = m.payload;
     if (typeof p === "string") { try { p = JSON.parse(p); } catch { p = null; } }
     const nested = pick(p || {}, ["dispatchId", "dispatch_id", "dispatch", "contextId"]);
-    if (nested) return String(nested);
+    if (nested && String(nested).trim()) return String(nested).trim();
   }
   return null;
 }
 
 export function promptReadiness(question) {
-  return new Promise((resolve) => {
+  return new Promise((resolveAns) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     let settled = false;
-    const done = (v) => { if (settled) return; settled = true; try { rl.close(); } catch {} resolve(v); };
+    const done = (v) => { if (settled) return; settled = true; try { rl.close(); } catch {} resolveAns(v); };
     rl.on("close", () => done(false));
     rl.question(question, (answer) => done(/^(y|yes)$/i.test(String(answer ?? "").trim())));
   });
 }
 
-// Standalone pre-slice startup chooser (may set opt.from before pipeline slicing).
 export async function runEarlyChooser({ opt, cfg, artDir, getWtPath, archiveCurrentRun, copyRunFiles, listRuns, printRunList, log }) {
   if (opt.dryRun || opt.statusPreview || opt.from || opt.only || opt.newRun) return false;
   const entries = listRuns();
@@ -102,7 +102,7 @@ export function createRunner({
   turnStartWindowMs, turnStartEscalateMs, readinessRetries, readinessMinBytes,
   allSteps, steps, byId, enabledIds, groups, isParallel,
   agentOf, modelOf: modelOfArg = null, effectiveModel, timeoutOf, nudgeRetriesOf, nudgeTimeoutOf, outPath,
-  orcaClient, statusMgr, notifier, getLedger, getPreviousLedgerSteps = () => ({}), getWtDir,
+  orcaClient, statusMgr, notifier, getLedger, getBoundPreviousLedger = () => null, getWtDir,
   getIssueState = () => null, getIssueProvider = () => null, issueTrackingCfg = null,
   isolatedState, preStepTargetRefs, setLastMergeDanger, log, warn, die,
 }) {
@@ -114,55 +114,124 @@ export function createRunner({
   const { orca, resolveWorktree, resolveWorktreePath, startWorker, workerVitals, wtSource, getRunId, getWt, getWtPin, getOrcaBin } = orcaClient;
   const { statusOf, statusSet, statusBegin, statusEnd, writeStatus, refreshProgress, writeArtifactSnapshot, listRuns, printRunList } = statusMgr;
   const taskIds = {};
-  const executedStepInfo = {}; // stepId -> { agent, model, family }
+  // P0-03: Accumulate ALL model families & contributions per step across retries/fallbacks
+  const executedStepInfo = {}; // stepId -> { agent, model, family, executedFamilies: string[], contributions: Array<{agent,model,family}> }
   let attemptSeq = 0;
 
-  function recordExecutedStep(stepId, agent, model) {
-    const cleanModel = model && model !== "default" ? model : null;
-    const family = classifyModelFamily(agent, cleanModel);
-    executedStepInfo[stepId] = { agent, model: cleanModel || "default", family };
-    statusSet(stepId, { agent, model: cleanModel || "default", family });
+  // Synthetic mock bypass applies ONLY when every enabled step uses `stub` and no `crossFamilyWith` is configured (e.g. E31)
+  const isPureStubPipeline = allSteps.every((s) => agentOf(s) === "stub" && !modelOf(s) && !s.crossFamilyWith);
+
+  function recordExecutedStep(stepId, agent, model, worktreeDir = null) {
+    const cleanModel = (model && model !== "default")
+      ? model
+      : resolveEffectiveCandidateModel(agent, null, { projectDir: worktreeDir || getWtDir() || process.cwd() });
+    const family = classifyModelFamily(agent, cleanModel, { projectDir: worktreeDir || getWtDir() || process.cwd() });
+
+    // Seed from bound previous status if resuming so earlier attempts' families are never lost
+    const prevSt = statusOf ? statusOf(stepId) : null;
+    const prevFamilies = Array.isArray(prevSt?.executedFamilies) ? prevSt.executedFamilies : [];
+    const prevInfo = executedStepInfo[stepId] || {
+      executedFamilies: [...prevFamilies],
+      contributions: prevFamilies.map((f) => ({ agent: prevSt?.agent || agent, model: prevSt?.model || "default", family: f })),
+    };
+
+    const famList = [...new Set([...prevInfo.executedFamilies, family].filter(Boolean))];
+    const contributions = [...prevInfo.contributions, { agent, model: cleanModel || "default", family }];
+
+    executedStepInfo[stepId] = {
+      agent,
+      model: cleanModel || "default",
+      family,
+      executedFamilies: famList,
+      contributions,
+    };
+    statusSet(stepId, {
+      agent,
+      model: cleanModel || "default",
+      family,
+      executedFamilies: famList,
+    });
     return executedStepInfo[stepId];
   }
 
   /**
-   * Resolve the actual executed `{ agent, model, family }` of an upstream author step,
-   * checking: (1) current run in-memory record, (2) current/restored status.js (`--from` resume),
-   * (3) previous out-of-repo ledger summary for this repo, and (4) static step config fallback.
+   * Resolve ALL executed author families for `authorId`.
+   * During real execution (`!dryRun`), NEVER guesses from static step config — requires
+   * verified execution evidence from this run or the run-bound resumed `status.js` / `ledger`!
    */
-  function getAuthorExecutionInfo(authorId) {
-    if (executedStepInfo[authorId]?.family) return executedStepInfo[authorId];
-    const st = statusOf ? statusOf(authorId) : null;
-    if (st && st.status === "succeeded" && st.agent) {
-      const fam = st.family || classifyModelFamily(st.agent, st.model);
-      if (fam) return { agent: st.agent, model: st.model || "default", family: fam, source: "status" };
-    }
-    const prevLedgerSteps = getPreviousLedgerSteps ? getPreviousLedgerSteps() : {};
-    const ls = prevLedgerSteps?.[authorId];
-    if (ls && ls.agent) {
-      const fam = ls.family || classifyModelFamily(ls.agent, ls.model);
-      if (fam) return { agent: ls.agent, model: ls.model || "default", family: fam, source: "ledger" };
-    }
+  function getAuthorExecutionEvidence(authorId, { dryRun = false, projectDir = null } = {}) {
     const defStep = byId[authorId];
-    if (defStep) {
+    if (defStep && defStep.enabled === false) {
+      return { skippedDisabled: true, families: [], contributions: [] };
+    }
+
+    if (executedStepInfo[authorId]) {
+      const info = executedStepInfo[authorId];
+      const st = statusOf ? statusOf(authorId) : null;
+      const settledOk = !st || st.status === "succeeded";
+      const hasUnknown = info.executedFamilies.length === 0 || info.executedFamilies.includes("unknown");
+      if (!settledOk) {
+        return { ok: false, reason: `author step "${authorId}" has not succeeded (status=${st?.status || "pending"})` };
+      }
+      if (hasUnknown && !isPureStubPipeline) {
+        return { ok: false, reason: `author step "${authorId}" executed with unproven/unknown model family (${info.agent}:${info.model})` };
+      }
+      return { ok: true, families: info.executedFamilies, contributions: info.contributions };
+    }
+
+    // Check run-bound resumed status.js + run-bound ledger (strictly matched by ledgerRunKey/runId + objective!)
+    const st = statusOf ? statusOf(authorId) : null;
+    const boundLedger = getBoundPreviousLedger ? getBoundPreviousLedger() : null;
+    const ls = boundLedger?.steps?.[authorId] || null;
+
+    if (st && st.status === "succeeded") {
+      const fams = Array.isArray(st.executedFamilies) && st.executedFamilies.length
+        ? st.executedFamilies
+        : (Array.isArray(ls?.executedFamilies) && ls.executedFamilies.length
+          ? ls.executedFamilies
+          : (st.family ? [st.family] : (ls?.family ? [ls.family] : [])));
+      if (fams.length > 0 && (!fams.includes("unknown") || isPureStubPipeline)) {
+        return {
+          ok: true,
+          families: [...new Set(fams)],
+          contributions: fams.map((f) => ({ agent: st.agent || ls?.agent || "unknown", model: st.model || ls?.model || "default", family: f })),
+        };
+      }
+      return { ok: false, reason: `resumed author step "${authorId}" lacks proven model family in bound run state` };
+    }
+
+    if (dryRun && defStep) {
       const ag = agentOf(defStep);
       const md = modelOf(defStep);
-      const fam = classifyModelFamily(ag, md);
-      if (fam) return { agent: ag, model: md || "default", family: fam, source: "config" };
+      const fam = classifyModelFamily(ag, md, { projectDir: projectDir || process.cwd() });
+      if (fam && fam !== "unknown") {
+        return { ok: true, families: [fam], contributions: [{ agent: ag, model: md || "default", family: fam }] };
+      }
+      return { ok: true, families: [], contributions: [] };
     }
-    return null;
+
+    return { ok: false, reason: `no verified execution record for upstream author step "${authorId}" in current/resumed run` };
   }
 
-  function computeForbiddenReviewFamilies(step) {
-    const map = new Map(); // family -> Array<{ stepId, agent, model }>
-    if (!isCrossFamilyReviewStep(step)) return map;
+  function computeReviewIsolationContext(step, { dryRun = false, projectDir = null } = {}) {
+    const forbiddenByFamily = new Map(); // family -> Array<{ stepId, agent, model }>
+    const unprovenAuthors = [];
+    if (!isCrossFamilyReviewStep(step)) return { forbiddenByFamily, unprovenAuthors };
+
     for (const authorId of resolveAuthorStepIds(step, byId)) {
-      const info = getAuthorExecutionInfo(authorId);
-      if (!info?.family) continue;
-      if (!map.has(info.family)) map.set(info.family, []);
-      map.get(info.family).push({ stepId: authorId, agent: info.agent, model: info.model });
+      const ev = getAuthorExecutionEvidence(authorId, { dryRun, projectDir });
+      if (ev.skippedDisabled) continue;
+      if (!ev.ok) {
+        unprovenAuthors.push({ stepId: authorId, reason: ev.reason });
+        continue;
+      }
+      for (const c of ev.contributions) {
+        if (!c.family) continue;
+        if (!forbiddenByFamily.has(c.family)) forbiddenByFamily.set(c.family, []);
+        forbiddenByFamily.get(c.family).push({ stepId: authorId, agent: c.agent, model: c.model });
+      }
     }
-    return map;
+    return { forbiddenByFamily, unprovenAuthors };
   }
 
   function effectiveReads(step) {
@@ -198,18 +267,20 @@ export function createRunner({
     const hasPlaceholder = (step.spec || "").includes("{mergeDangerReport}");
     const mdSuffix = (!hasPlaceholder && mergeDangerBlock) ? `\n\nMERGE DANGER PRE-CHECK:\n${mergeDangerBlock}` : "";
 
-    // Strict --no-issues / mode===false isolation: never inject stale ISSUES.json into prompts when disabled
     const issuesDisabled = issueTrackingCfg?.mode === false || opt.noIssues;
     const issueState = issuesDisabled ? null : (getIssueState ? getIssueState() : null);
     const provInfo = issuesDisabled ? null : (getIssueProvider ? getIssueProvider() : null);
-    const effDefaultBranch = defaultBranch || provInfo?.defaultBranch || issueState?.defaultBranch || "main";
+    // P1-08: Never blindly guess "main" when defaultBranch is unknown; pass actual host & repo!
+    const effDefaultBranch = defaultBranch || provInfo?.defaultBranch || issueState?.defaultBranch || null;
     const closeOnPr = issueTrackingCfg?.closeOnPr ?? true;
     const issueFmt = formatIssuePrBlock(issueState, {
       closeOnPr,
       targetBranch,
       defaultBranch: effDefaultBranch,
       provider: provInfo?.provider || issueState?.provider || null,
+      host: provInfo?.host || issueState?.host || null,
       repo: provInfo?.repo || issueState?.repo || null,
+      teaLogin: provInfo?.teaLogin || issueState?.teaLogin || null,
     });
     const prStepIds = new Set(issueTrackingCfg?.prSteps || ["pr-submit", "pr-release-dev"]);
     const isPrStep = Boolean(step.linkIssues || prStepIds.has(step.id));
@@ -238,6 +309,7 @@ export function createRunner({
   }
 
   function printPlan() {
+    const previewDir = resolveWorktreePath(true) || process.cwd();
     log(`Config: ${configFile}${opt.config ? "" : " (default)"}`);
     log(`Worktree: ${getWt() || getWtPin() || "(auto-detect, unresolved in dry-run)"}  (${wtSource()})`);
     log(`Target branch: ${targetBranch} (protected: ${protectedBranches.join(", ")})`);
@@ -263,8 +335,8 @@ export function createRunner({
       if (s.isolatedWorktree) flags.push("isolated-wt");
       const vSum = formatVerifySummary(s.verify);
       if (vSum) flags.push(`verify=${vSum}`);
-      const forbiddenMap = computeForbiddenReviewFamilies(s);
-      const cands = buildCandidateChain(s, cfg, { agentOf, modelOf, forbiddenFamilies: new Set(forbiddenMap.keys()) });
+      const { forbiddenByFamily } = computeReviewIsolationContext(s, { dryRun: true, projectDir: previewDir });
+      const cands = buildCandidateChain(s, cfg, { agentOf, modelOf, forbiddenFamilies: new Set(forbiddenByFamily.keys()), projectDir: previewDir });
       if (isCrossFamilyReviewStep(s)) flags.push("cross-family");
       if (cands.length > 1) {
         flags.push(`fallback=${cands.slice(1).map((c) => c.model ? `${c.agent}(${c.model})` : c.agent).join("->")}`);
@@ -322,7 +394,10 @@ export function createRunner({
       if (!c.ok) warn(`terminal close '${m.step.title}' did not confirm: ${sanitizeText(c.stderr || c.raw, { maxLen: 200 })}`);
     } else if (m.dispatchId) {
       const rel = orca(["orchestration", "worker-release", "--dispatch", m.dispatchId]);
-      if (!rel.ok) warn(`worker-release '${m.step.title}' did not confirm: ${sanitizeText(rel.stderr || rel.raw, { maxLen: 200 })}`);
+      const relAction = pick(res(rel.json), ["action", "status", "releaseStatus"]);
+      if (!rel.ok || relAction === "release_unknown" || relAction === "release_pending") {
+        warn(`worker-release '${m.step.title}' (${m.dispatchId}) returned ${relAction || sanitizeText(rel.stderr || rel.raw, { maxLen: 200 })}`);
+      }
     }
   }
 
@@ -334,17 +409,18 @@ export function createRunner({
   });
 
   /**
-   * Explicitly fence & stop an active/broken worker dispatch BEFORE reusing its Task or Worktree.
-   * Never calls `worker-release` alone on a running worker; verifies `worker-stop` confirmation
-   * and refuses blind reuse if stop/release status is ambiguous (`stop_unknown` / `retained` / running helpers).
+   * P0-01: Require POSITIVE stop & release confirmation before reusing any Task or Worktree.
    */
   function stopAndIsolateWorker(m, reason = "watchdog") {
     const LEDGER = getLedger();
     if (m.terminal) {
       if (m.dispatchId) {
         const ws = orca(["orchestration", "worker-stop", "--dispatch", m.dispatchId]);
-        if (!ws.ok) {
-          return { ok: false, reason: `worker-stop (${m.dispatchId}) failed: ${sanitizeText(ws.stderr || ws.raw || "unconfirmed", { maxLen: 200 })}` };
+        const wsJson = res(ws.json);
+        const stopState = pick(wsJson, ["state", "status", "stopStatus"]);
+        const procAction = pick(wsJson, ["processAction"]);
+        if (!ws.ok || stopState === "stop_unknown" || procAction === "stop_unknown") {
+          return { ok: false, reason: `worker-stop (${m.dispatchId}) failed: ${sanitizeText(ws.stderr || ws.raw || stopState || "unconfirmed", { maxLen: 200 })}` };
         }
       }
       const tc = orca(["terminal", "close", "--terminal", m.terminal]);
@@ -362,27 +438,9 @@ export function createRunner({
     }
 
     if (m.dispatchId) {
-      const ws = orca(["orchestration", "worker-stop", "--dispatch", m.dispatchId]);
-      const wsJson = res(ws.json);
-      const stopState = pick(wsJson, ["state", "status", "stopStatus"]);
-      const procAction = pick(wsJson, ["processAction"]);
-      const helpers = Array.isArray(wsJson.helpers) ? wsJson.helpers : [];
-      const liveHelper = helpers.some((h) => h && (h.keptOpen === true || h.running === true || h.status === "running"));
-      if (!ws.ok || stopState === "stop_unknown" || procAction === "stop_unknown" || liveHelper) {
-        return {
-          ok: false,
-          reason: `worker-stop (${m.dispatchId}) did not confirm clean isolation (${liveHelper ? "kept-open helper still running" : sanitizeText(ws.stderr || ws.raw || stopState || "stop_unknown", { maxLen: 200 })})`,
-        };
-      }
-      const rel = orca(["orchestration", "worker-release", "--dispatch", m.dispatchId]);
-      const relJson = res(rel.json);
-      const relAction = pick(relJson, ["action", "status", "releaseStatus"]);
-      const stopClosedProcess = procAction === "closed_agent_terminal" || stopState === "stopped" || stopState === "fenced";
-      if (!rel.ok || relAction === "release_unknown" || ((relAction === "retained" || relAction === "release_pending") && !stopClosedProcess)) {
-        return {
-          ok: false,
-          reason: `worker-release (${m.dispatchId}) reported ${relAction || sanitizeText(rel.stderr || rel.raw || "unconfirmed", { maxLen: 200 })} without proven process stop`,
-        };
+      const sr = verifyStopAndReleaseReceipt(orca, m.dispatchId);
+      if (!sr.ok) {
+        return { ok: false, reason: sr.reason };
       }
       LEDGER?.recordWorkerStopped?.({
         stepId: m.step.id,
@@ -393,14 +451,24 @@ export function createRunner({
       });
       return { ok: true };
     }
-    return { ok: true };
+    return { ok: false, reason: "missing dispatchId and terminal handle — cannot prove worker stopped" };
   }
 
-  function matchesMemberDone(msg, m, openCount) {
+  /**
+   * P0-01: Strictly bind `worker_done` messages to the member's active `dispatchId`.
+   * Never accept bare taskId-only or sole-open-member `worker_done` when `m.dispatchId` is set!
+   */
+  function matchesMemberDone(msg, m) {
     if (pick(msg, ["type"]) !== "worker_done") return false;
     const msgDisp = dispatchOfMsg(msg);
     const msgTask = taskOfMsg(msg);
-    if (m.dispatchId && msgDisp) {
+    if (m.dispatchId) {
+      if (!msgDisp) {
+        if (msgTask === m.taskId) {
+          warn(`[stale-dispatch] ignoring unattributed worker_done missing dispatchId on "${m.step.title}" (active dispatch="${m.dispatchId}").`);
+        }
+        return false;
+      }
       if (msgDisp !== m.dispatchId) {
         if (msgTask === m.taskId || m.supersededDispatches?.has(msgDisp)) {
           warn(`[stale-dispatch] ignoring late worker_done from superseded dispatch "${msgDisp}" on "${m.step.title}" (active dispatch="${m.dispatchId}").`);
@@ -409,28 +477,30 @@ export function createRunner({
       }
       return true;
     }
-    // Once a step has superseded an earlier dispatch, an unattributed worker_done without dispatchId cannot be trusted
-    if (m.supersededDispatches && m.supersededDispatches.size > 0 && !msgDisp) {
-      if (msgTask === m.taskId) {
-        warn(`[stale-dispatch] ignoring worker_done without dispatchId on "${m.step.title}" after fallback.`);
-      }
-      return false;
-    }
-    return msgTask === m.taskId || (msgTask == null && !msgDisp && openCount === 1);
+    return false;
   }
 
   function rematerializeForCandidate(step, activeAgent, worktreeDir, sharedPrepared, materializedDirs) {
     const hasRefs = Boolean((step.skills || []).length || (step.mcp || []).length);
     if (!hasRefs && !sharedPrepared?.some((p) => (p.step.skills || []).length || (p.step.mcp || []).length)) return;
-    if (!materializedDirs.includes(worktreeDir)) materializedDirs.push(worktreeDir);
+    const mountDie = (msg) => { throw new FlowFatalError(msg); };
     if (sharedPrepared && sharedPrepared.length > 0) {
       const membersSpec = sharedPrepared.map((p) => ({
         ...p.step,
         agent: p.step.id === step.id ? activeAgent : (executedStepInfo[p.step.id]?.agent || agentOf(p.step)),
       }));
-      materializeAgentConfig({ worktree: worktreeDir, members: membersSpec, cfg, configDir: here, die, warn, quietRestore: true });
+      materializeAgentConfig({ worktree: worktreeDir, members: membersSpec, cfg, configDir: here, die: mountDie, warn, quietRestore: true });
     } else {
-      materializeAgentConfig({ worktree: worktreeDir, members: [{ ...step, agent: activeAgent }], cfg, configDir: here, die, warn, quietRestore: true });
+      materializeAgentConfig({ worktree: worktreeDir, members: [{ ...step, agent: activeAgent }], cfg, configDir: here, die: mountDie, warn, quietRestore: true });
+    }
+    if (!materializedDirs.includes(worktreeDir)) materializedDirs.push(worktreeDir);
+  }
+
+  function clearStepArtifactStrict(step, wtRootDir, worktreeDir) {
+    try {
+      return clearStaleStepArtifact(step, wtRootDir, worktreeDir, artDir);
+    } catch (e) {
+      throw new FlowFatalError(e.message || String(e));
     }
   }
 
@@ -444,6 +514,9 @@ export function createRunner({
     sharedWorktree = false,
     sharedPrepared = null,
     materializedDirs = [],
+    slotStartedAt = null,
+    slotDeadlineAt = null,
+    slotMaxDeadlineAt = null,
   } = {}) {
     if (step.verify?.mergeDangerCheck && !preStepTargetRefs[step.id]) {
       preStepTargetRefs[step.id] = snapshotTargetRefs(stepCtx?.isolated ? stepCtx.dir : (getWtDir() || "."), targetBranch);
@@ -453,12 +526,16 @@ export function createRunner({
     const wtRootDir = getWtDir() || ".";
     const LEDGER = getLedger();
 
-    // Cross-Family Review hard enforcement: filter out any candidate matching upstream author family
+    // P0-03: Proven Cross-Family Review enforcement against ALL accumulated upstream author families
     const isReview = isCrossFamilyReviewStep(step);
-    const forbiddenMap = computeForbiddenReviewFamilies(step);
-    const rawChain = buildCandidateChain(step, cfg, { agentOf, modelOf });
+    const { forbiddenByFamily, unprovenAuthors } = computeReviewIsolationContext(step, { dryRun: false, projectDir: worktreeDir });
+    const rawChain = buildCandidateChain(step, cfg, { agentOf, modelOf, projectDir: worktreeDir });
     const { allowed: fullChain, rejected: crossRejected } = isReview
-      ? filterCrossFamilyCandidates(rawChain, forbiddenMap)
+      ? filterCrossFamilyCandidates(rawChain, forbiddenByFamily, {
+        unprovenAuthors,
+        projectDir: worktreeDir,
+        allowSyntheticStub: isPureStubPipeline,
+      })
       : { allowed: rawChain, rejected: [] };
 
     for (const rej of crossRejected) {
@@ -498,7 +575,6 @@ export function createRunner({
     let candIndex = startCandidateIndex + Math.max(0, preflightRes.index);
     let activeCand = fullChain[candIndex] || fullChain[startCandidateIndex];
 
-    // Record runtime/watchdog fallback hop AND any subsequent preflight hops separately in ledger (P2-01)
     if (fallbackReason && prevCandidate) {
       const firstRemaining = remainingChain[0] || activeCand;
       warn(`[fallback] "${step.title}" downgrading from "${prevCandidate.agent}" to "${firstRemaining.agent}"${firstRemaining.model ? ` (model=${firstRemaining.model}${firstRemaining.effort ? `, effort=${firstRemaining.effort}` : ""})` : ""} (${fallbackPhase || "runtime"}: ${sanitizeText(fallbackReason, { maxLen: 220 })}).`);
@@ -537,34 +613,42 @@ export function createRunner({
 
     let started = null;
     let launchedAt = Date.now();
+    let clearedInfo = { cleared: true, clearedAtMs: launchedAt };
     let requestId = null;
     let currentRetryOf = retryOfDispatchId;
     const superseded = new Set(supersededDispatches || []);
     if (retryOfDispatchId) superseded.add(retryOfDispatchId);
 
     while (candIndex < fullChain.length) {
+      // P1-02: Respect absolute slot deadline before launching another candidate!
+      if (slotMaxDeadlineAt && Date.now() >= slotMaxDeadlineAt) {
+        throw new FlowFatalError(`"${step.title}" reached strict maxRuntimeMs ceiling before fallback launch.`);
+      }
       activeCand = fullChain[candIndex];
-      const hasNextCandidate = candIndex + 1 < fullChain.length;
       if (activeCand.agent !== agentOf(step)) {
         rematerializeForCandidate(step, activeCand.agent, worktreeDir, sharedPrepared, materializedDirs);
       }
+      clearedInfo = clearStepArtifactStrict(step, wtRootDir, worktreeDir);
+
       const wtTag = stepCtx?.isolated ? `, worktree=${stepCtx.wtName}, branch=${stepCtx.branch}` : "";
       const modelTag = activeCand.model ? `, model=${activeCand.model}` : "";
       const effortTag = activeCand.effort ? `, effort=${activeCand.effort}` : "";
       log(`> ${step.title}  (agent=${activeCand.agent}${modelTag}${effortTag}, task=${taskId}${wtTag})`);
       requestId = `req-${++attemptSeq}-${step.id}`;
-      // P2-01: Never substitute the primary step's model when a fallback candidate uses "default" (null)
-      const recordedModel = activeCand.isPrimary ? (activeCand.model || effectiveModel(step)) : activeCand.model;
-      const recordedEffort = activeCand.effort || (activeCand.isPrimary ? (step.effort || null) : null);
-      const recordedFamily = classifyModelFamily(activeCand.agent, recordedModel);
+      const requestedModel = activeCand.isPrimary ? (activeCand.model || effectiveModel(step)) : activeCand.model;
+      const requestedEffort = activeCand.effort || (activeCand.isPrimary ? (step.effort || null) : null);
+      const resolvedModel = requestedModel || activeCand.resolvedModel || null;
+      const recordedFamily = classifyModelFamily(activeCand.agent, resolvedModel, { projectDir: worktreeDir });
       if (LEDGER) {
         LEDGER.recordIntent({
           requestId,
           stepId: step.id,
           title: step.title,
           agent: activeCand.agent,
-          model: recordedModel,
-          effort: recordedEffort,
+          model: resolvedModel || requestedModel,
+          requestedModel: requestedModel || "default",
+          requestedEffort: requestedEffort || null,
+          effort: requestedEffort,
           family: recordedFamily,
           attempt: attemptSeq,
           worktree: stepCtx?.isolated ? stepCtx.wtName : (getWt() || "integration"),
@@ -585,12 +669,21 @@ export function createRunner({
           return u.ok;
         } : null,
       });
+
+      if (started?.attempts?.length && LEDGER?.recordStartAttempts) {
+        LEDGER.recordStartAttempts({ requestId, stepId: step.id, attempts: started.attempts });
+      }
+
+      // If startWorker actually created a dispatch (even if it later failed), record its family contribution!
+      if (started?.dispatchId) {
+        recordExecutedStep(step.id, activeCand.agent, resolvedModel || requestedModel, worktreeDir);
+      }
+
       if (started && started.ok !== false) break;
 
       const errReason = sanitizeText(started?.error || "worker-start failed", { maxLen: 240 });
       if (started?.dispatchId) superseded.add(started.dispatchId);
 
-      // Ambiguous partial start: refuse to double-dispatch another candidate onto the same worktree!
       if (started?.ambiguous) {
         const ambMsg = `worker-start '${step.title}' left an unconfirmed/ambiguous state (${errReason}) — refusing blind fallback on the same worktree.`;
         statusSet(step.id, { status: "unknown", health: "unknown", note: ambMsg });
@@ -618,7 +711,6 @@ export function createRunner({
         reason: errReason,
         phase: "worker_start",
       });
-      clearStaleStepArtifact(step, wtRootDir, worktreeDir, artDir);
       if (started?.dispatchId) {
         const tu = orca(["orchestration", "task-update", "--id", taskId, "--status", "failed", "--result", `worker-start failed: ${errReason}`]);
         if (!tu.ok) {
@@ -635,8 +727,9 @@ export function createRunner({
       candIndex = nextIdx;
     }
 
-    const finalModel = activeCand.isPrimary ? (activeCand.model || effectiveModel(step)) : activeCand.model;
-    recordExecutedStep(step.id, activeCand.agent, finalModel);
+    const finalRequestedModel = activeCand.isPrimary ? (activeCand.model || effectiveModel(step)) : activeCand.model;
+    const finalModel = started.effectiveModel || finalRequestedModel || activeCand.resolvedModel || null;
+    const execRec = recordExecutedStep(step.id, activeCand.agent, finalModel, worktreeDir);
 
     const dispatchedAt = Date.now();
     const { dispatchId, terminal } = started;
@@ -649,36 +742,53 @@ export function createRunner({
     const artDirPath = join(worktreeDir, artDir);
     const artifactPath = step.writes ? join(artDirPath, step.writes) : null;
     const progressPath = step.progress ? join(artDirPath, step.progress) : null;
+
+    // P1-02: Preserve single absolute `stepStartedAt`, `deadlineAt`, and `maxDeadlineAt` across fallbacks!
+    const effectiveStepStart = slotStartedAt ?? launchedAt;
     const watchdog = createWatchdogTracker({
-      step, cfg, startedAt: launchedAt, worktreeDir, artifactPath, progressPath, artDirPath, sharedWorktree,
+      step, cfg, startedAt: effectiveStepStart, worktreeDir, artifactPath, progressPath, artDirPath, sharedWorktree,
     });
     if (LEDGER) {
       LEDGER.recordDispatchResult({
-        requestId, stepId: step.id, dispatchId, terminal,
-        turnStart: health.turnStart, state: started.dispatchState || (terminal ? "manual" : "ready"),
+        requestId,
+        stepId: step.id,
+        dispatchId,
+        terminal,
+        turnStart: health.turnStart,
+        state: started.dispatchState || (terminal ? "manual" : "ready"),
+        effectiveAgent: started.effectiveAgent || activeCand.agent,
+        effectiveModel: started.effectiveModel || finalModel || "default",
+        effectiveEffort: started.effectiveEffort ?? null,
+        executedFamilies: execRec.executedFamilies,
       });
     }
     statusSet(step.id, {
       agent: activeCand.agent,
       model: finalModel || "default",
-      family: classifyModelFamily(activeCand.agent, finalModel),
+      family: execRec.family,
+      executedFamilies: execRec.executedFamilies,
       health: health.state,
       turnStart: health.turnStart,
       ...(candIndex > 0 ? { note: `fallback active: ${activeCand.agent}${activeCand.model ? ` (${activeCand.model})` : ""}` } : {}),
     });
+
     const interactiveNow = !autoRun && step.interactive;
     const baseIdleMs = timeoutOf(step);
     const baseHardMs = step.hardTimeoutMs ?? cfg.defaults?.hardTimeoutMs ?? 4 * baseIdleMs;
     const maxIdleMs = interactiveNow ? Math.max(baseIdleMs, 3600000) : baseIdleMs;
     const rawHardCapMs = interactiveNow ? Math.max(baseHardMs, 14400000) : baseHardMs;
     const maxRtMs = watchdog.config.maxRuntimeMs > 0 ? watchdog.config.maxRuntimeMs : 0;
+    const maxDeadlineAt = slotMaxDeadlineAt ?? (maxRtMs > 0 ? effectiveStepStart + maxRtMs : Infinity);
     const hardCapMs = maxRtMs > 0 ? Math.min(rawHardCapMs, maxRtMs) : rawHardCapMs;
+    const deadlineAt = slotDeadlineAt ? Math.min(slotDeadlineAt, maxDeadlineAt) : Math.min(effectiveStepStart + hardCapMs, maxDeadlineAt);
     const wdSliceCap = watchdog.config.stallTimeoutMs > 0 ? Math.max(1000, Math.floor(watchdog.config.stallTimeoutMs / 2)) : 120000;
     const sliceCandidates = [120000, maxIdleMs, hardCapMs, health.turnStartWindowMs, health.turnStartEscalateMs, wdSliceCap];
     if (maxRtMs > 0) sliceCandidates.push(maxRtMs);
 
     return {
       step, ctx: stepCtx, taskId, dispatchId, terminal, requestId,
+      clearedAtMs: clearedInfo.clearedAtMs,
+      clearedBeforeDispatch: Boolean(clearedInfo.cleared),
       supersededDispatches: superseded,
       crossRejected,
       sharedWorktree,
@@ -687,9 +797,14 @@ export function createRunner({
       preStepRemoteTargetSha: preRefs.remoteSha, preStepRemoteError: preRefs.remoteError,
       preStepHasOrigin: preRefs.hasOrigin, preStepHeadSha: preRefs.headSha, health, watchdog,
       maxIdleMs,
-      hardCapMs,
+      hardCapMs: Math.max(0, deadlineAt - effectiveStepStart),
+      deadlineAt,
+      maxDeadlineAt,
       sliceMs: Math.max(250, Math.min(...sliceCandidates)),
-      startedAt: launchedAt, lastBusy: launchedAt, lastPreview: undefined,
+      stepStartedAt: effectiveStepStart,
+      startedAt: launchedAt,
+      lastBusy: launchedAt,
+      lastPreview: undefined,
       quietWarned: false, parkedSeen: new Set(), parkedLabel: null, settled: false, done: null, note: "", outcome: null,
       nudge: { left: nudgeRetriesOf(step), phase: null, sentAt: 0, count: 0, outcome: null, done: null },
     };
@@ -712,17 +827,20 @@ export function createRunner({
         }),
       }));
       for (const p of prepared) {
-        if (p.step.verify || p.ctx.isolated) clearStaleStepArtifact(p.step, wtDir, p.ctx.dir, artDir);
+        clearStepArtifactStrict(p.step, wtDir, p.ctx.dir);
       }
       const sharedPrepared = prepared.filter((p) => !p.ctx.isolated);
       const sharedMembers = sharedPrepared.map((p) => ({ ...p.step, agent: agentOf(p.step) }));
+      const mountDie = (msg) => { throw new FlowFatalError(msg); };
       if (sharedMembers.length) {
+        // Push to materializedDirs ONLY AFTER materializeAgentConfig completes so S1c abort-window
+        // keeps `.orca-agent-config.json` flushed on disk for startup self-heal!
         materializeAgentConfig({
           worktree: wtDir,
           members: sharedMembers,
           cfg,
           configDir: here,
-          die,
+          die: mountDie,
           warn,
         });
         materializedDirs.push(wtDir);
@@ -733,7 +851,7 @@ export function createRunner({
           members: [{ ...p.step, agent: agentOf(p.step) }],
           cfg,
           configDir: here,
-          die,
+          die: mountDie,
           warn,
         });
         materializedDirs.push(p.ctx.dir);
@@ -746,13 +864,18 @@ export function createRunner({
           sharedWorktree: !p.ctx.isolated && isSharedGroup,
           sharedPrepared: !p.ctx.isolated ? sharedPrepared : null,
           materializedDirs,
+          slotStartedAt: Date.now(),
         }));
       }
       while (true) {
         const open = M.filter((m) => !m.settled);
         if (!open.length) break;
-        const openSharedCount = open.filter((m) => !m.ctx?.isolated).length;
-        const slice = Math.min(...open.map((m) => m.sliceMs));
+        // P1-02: Include left-open `still-running` members when determining if shared worktree has concurrent writers!
+        const activeSharedCount = M.filter((m) => !m.ctx?.isolated && (!m.settled || m.outcome === "still-running")).length;
+        // P1-02: Bound check --wait timeout strictly by each member's remaining absolute deadline budget!
+        const nowBeforeWait = Date.now();
+        const slice = Math.max(50, Math.min(...open.map((m) => Math.min(m.sliceMs, Math.max(50, m.deadlineAt - nowBeforeWait)))));
+
         for (const m of open) {
           if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir, artDirRel: artDir });
           refreshProgress(m.step); writeArtifactSnapshot(m.step);
@@ -768,8 +891,22 @@ export function createRunner({
           if (ty === "question" || ty === "escalation") log(`  [${ty}] ${sanitizeText(pick(msg, ["subject"]) || "", { maxLen: 200 })}`);
         }
         for (const m of open) {
+          // P1-02: Enforce strict absolute maxDeadlineAt ceiling BEFORE processing post-done nudges or vitals!
+          const nowSlice = Date.now();
+          if (m.maxDeadlineAt < Infinity && nowSlice >= m.maxDeadlineAt) {
+            const elapsedTotalMs = nowSlice - m.stepStartedAt;
+            const mins = Math.round(elapsedTotalMs / 60000);
+            const secs = Math.round(elapsedTotalMs / 1000);
+            log(`[warn] "${m.step.title}" not settled after ${mins}min; leaving its terminal open and stopping the pipeline. [reached maxRuntimeMs ceiling at ${secs}s]`);
+            m.note = m.parkedLabel
+              ? `parked on ${m.parkedLabel} — not settled after ${mins}min`
+              : `reached maxRuntimeMs ceiling (${secs}s) — not settled after ${mins}min`;
+            settleMember(m, "still-running", null);
+            continue;
+          }
+
           if (m.nudge.phase === "post-done") { nudgeCtrl.nudgePoll(m); continue; }
-          const wd = msgs.find((msg) => matchesMemberDone(msg, m, open.length));
+          const wd = msgs.find((msg) => matchesMemberDone(msg, m));
           if (wd) {
             if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir, artDirRel: artDir });
             if (m.health) {
@@ -785,11 +922,11 @@ export function createRunner({
             const drain = orca(["orchestration", "check", "--run", runId, "--types", "worker_done"]);
             const dr = res(drain.json);
             const drid = pick(dr, ["deliveryId", "delivery_id"]) ?? pick(dr.delivery || {}, ["id"]);
-            const drained = (pick(dr, ["messages", "msgs"]) || []).find((msg) => matchesMemberDone(msg, m, open.length)) || null;
+            const drained = (pick(dr, ["messages", "msgs"]) || []).find((msg) => matchesMemberDone(msg, m)) || null;
             if (drid) orca(["orchestration", "check", "--run", runId, "--ack", drid]);
             if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir, artDirRel: artDir });
             const vout = (drained && outcomeOf(drained)) || v.outcome || "unknown";
-            const vdone = drained || { dispatchId: m.dispatchId, payload: JSON.stringify({ outcome: v.outcome, dispatchId: m.dispatchId }) };
+            const vdone = drained || { dispatchId: m.dispatchId, payload: JSON.stringify({ outcome: vout, dispatchId: m.dispatchId }) };
             if (!nudgeCtrl.holdForNudge(m, vout, vdone)) settleMember(m, m.outcome || vout, vdone);
             continue;
           }
@@ -802,8 +939,7 @@ export function createRunner({
             m.lastBusy = Date.now();
           }
 
-          // Watchdog evaluation: monitor git/file/artifact/preview activity + detect loops, hangs, trust prompts, gateway errors
-          const sharedNow = !m.ctx?.isolated && openSharedCount > 1;
+          const sharedNow = !m.ctx?.isolated && activeSharedCount > 1;
           const hasFallback = (m.candidateIndex + 1) < (m.candidateChain?.length || 1);
           const wres = m.watchdog ? evaluateWatchdog(m.watchdog, {
             preview: v.preview,
@@ -837,8 +973,6 @@ export function createRunner({
                 settleMember(m, "still-running", null);
                 continue;
               }
-              const stepWorktreeDir = m.ctx?.isolated ? m.ctx.dir : wtDir;
-              clearStaleStepArtifact(m.step, wtDir, stepWorktreeDir, artDir);
               if (m.dispatchId) {
                 const tu = orca(["orchestration", "task-update", "--id", m.taskId, "--status", "failed", "--result", `stopped for fallback: ${wres.kind}`]);
                 if (!tu.ok) {
@@ -870,6 +1004,9 @@ export function createRunner({
                 sharedWorktree: sharedNow,
                 sharedPrepared: !m.ctx?.isolated ? sharedPrepared : null,
                 materializedDirs,
+                slotStartedAt: m.stepStartedAt,
+                slotDeadlineAt: m.deadlineAt,
+                slotMaxDeadlineAt: m.maxDeadlineAt,
               });
               const idx = M.indexOf(m);
               if (idx >= 0) M[idx] = replacement;
@@ -880,9 +1017,18 @@ export function createRunner({
                 ? ` [cross-family isolation blocked fallback into author family: ${m.crossRejected.map((r) => r.reason).join("; ")}]`
                 : "";
               warn(`[watchdog:${wres.kind}] "${m.step.title}" — ${wres.diagnosis}${crossBlockHint}`);
+              const stopCheck = stopAndIsolateWorker(m, `watchdog:${wres.kind}`);
+              if (!stopCheck.ok) {
+                // P0-01: NEVER settle as ordinary "failed" (which triggers onFailGoto) when stop failed!
+                const ambNote = `[watchdog:${wres.kind}] ${wres.diagnosis}; could not confirm worker stop (${stopCheck.reason}) — refusing retry/onFailGoto`;
+                warn(`"${m.step.title}" ${ambNote}`);
+                m.note = ambNote;
+                statusSet(m.step.id, { health: "unknown", note: m.note });
+                settleMember(m, "still-running", null);
+                continue;
+              }
               m.note = `[watchdog:${wres.kind}] ${wres.diagnosis}${crossBlockHint}`;
               statusSet(m.step.id, { health: "blocked", note: m.note });
-              stopAndIsolateWorker(m, `watchdog:${wres.kind}`);
               settleMember(m, m.crossRejected?.length ? "blocked" : "failed", null);
               continue;
             }
@@ -893,7 +1039,6 @@ export function createRunner({
               settleMember(m, "still-running", null);
               continue;
             }
-            // wres.kind === "prompt_blocked" && action === "block": fall through to parked-prompt handling below
           }
 
           if (!previewChanged && v.preview != null) {
@@ -912,7 +1057,6 @@ export function createRunner({
             statusSet(m.step.id, { note: `waiting on ${m.parkedLabel}` });
           }
 
-          nudgeCtrl.maybeNudgeMidRun(m, v);
           const silenceMs = Date.now() - m.lastBusy;
           if (m.health) {
             const stepArtPath = join(m.ctx?.isolated ? m.ctx.dir : wtDir, artDir, m.step.writes || "");
@@ -922,7 +1066,6 @@ export function createRunner({
               startedAt: m.startedAt, dispatchStatus: v.status, heartbeatMs: v.heartbeatMs,
               previewChanged, previewSeenBefore, parkedLabel: m.parkedLabel, agentWait: v.agentWait,
               artifactSize: artSize,
-              // Never attribute shared-worktree git edits as turnStart proof for an individual shared member
               gitChanged: !sharedNow && Boolean(wres?.gitChanged),
               silenceMs, maxIdleMs: m.maxIdleMs,
             });
@@ -939,7 +1082,7 @@ export function createRunner({
               const dl = res(drainLost.json);
               const dlid = pick(dl, ["deliveryId", "delivery_id"]) ?? pick(dl.delivery || {}, ["id"]);
               const dlMsgs = pick(dl, ["messages", "msgs"]) || [];
-              const lostDone = dlMsgs.find((msg) => matchesMemberDone(msg, m, open.length)) || null;
+              const lostDone = dlMsgs.find((msg) => matchesMemberDone(msg, m)) || null;
               const hasSiblingMsg = dlMsgs.some((msg) => taskOfMsg(msg) && taskOfMsg(msg) !== m.taskId);
               if (dlid && !hasSiblingMsg) orca(["orchestration", "check", "--run", runId, "--ack", dlid]);
               if (lostDone) {
@@ -962,18 +1105,21 @@ export function createRunner({
             }
           }
 
-          const elapsedMs = Date.now() - m.startedAt;
-          const maxRtMs = m.watchdog?.config?.maxRuntimeMs > 0 ? m.watchdog.config.maxRuntimeMs : 0;
-          if (elapsedMs >= m.hardCapMs || (maxRtMs > 0 && elapsedMs >= maxRtMs)) {
-            if (wres?.extendDeadline && (maxRtMs <= 0 || (elapsedMs < maxRtMs && m.hardCapMs < maxRtMs))) {
+          // P1-02: Check absolute `deadlineAt` BEFORE sending mid-run nudges!
+          const nowAfterHealth = Date.now();
+          const elapsedMs = nowAfterHealth - m.stepStartedAt;
+          if (nowAfterHealth >= m.deadlineAt) {
+            if (wres?.extendDeadline && m.deadlineAt < m.maxDeadlineAt && nowAfterHealth < m.maxDeadlineAt) {
               const stepExt = Math.max(m.watchdog?.config?.extendStepMs || 300000, m.maxIdleMs || 60000);
-              const nextCap = maxRtMs > 0 ? Math.min(m.hardCapMs + stepExt, maxRtMs) : (m.hardCapMs + stepExt);
-              const actualExt = nextCap - m.hardCapMs;
+              const nextDeadline = Math.min(m.deadlineAt + stepExt, m.maxDeadlineAt);
+              const actualExt = nextDeadline - m.deadlineAt;
               if (actualExt > 0) {
-                m.hardCapMs = nextCap;
-                if (maxRtMs > 0) m.sliceMs = Math.max(250, Math.min(m.sliceMs, maxRtMs - elapsedMs));
+                m.deadlineAt = nextDeadline;
+                m.hardCapMs = m.deadlineAt - m.stepStartedAt;
+                if (m.maxDeadlineAt < Infinity) m.sliceMs = Math.max(250, Math.min(m.sliceMs, m.maxDeadlineAt - nowAfterHealth));
                 m.watchdog.extensionsCount += 1;
                 const elapsedSec = Math.round(elapsedMs / 1000);
+                const maxRtMs = m.watchdog?.config?.maxRuntimeMs || 0;
                 log(`[watchdog] "${m.step.title}" is actively progressing after ${elapsedSec}s — extending deadline by ${Math.round(actualExt / 1000)}s (extension #${m.watchdog.extensionsCount}${maxRtMs > 0 ? `, ceiling=${Math.round(maxRtMs / 1000)}s` : ""}) instead of fixed-timeout kill.`);
                 LEDGER?.recordWatchdogEvent({
                   stepId: m.step.id,
@@ -987,14 +1133,18 @@ export function createRunner({
             }
             const mins = Math.round(elapsedMs / 60000);
             const secs = Math.round(elapsedMs / 1000);
-            const ceilSuffix = maxRtMs > 0 && elapsedMs >= maxRtMs ? ` [reached maxRuntimeMs ceiling at ${secs}s]` : "";
+            const hitCeiling = m.maxDeadlineAt < Infinity && nowAfterHealth >= m.maxDeadlineAt;
+            const ceilSuffix = hitCeiling ? ` [reached maxRuntimeMs ceiling at ${secs}s]` : "";
             log(`[warn] "${m.step.title}" not settled after ${mins}min; leaving its terminal open and stopping the pipeline.${ceilSuffix}`);
             m.note = m.parkedLabel
               ? `parked on ${m.parkedLabel} — not settled after ${mins}min`
-              : (maxRtMs > 0 && elapsedMs >= maxRtMs ? `reached maxRuntimeMs ceiling (${secs}s) — not settled after ${mins}min` : `not settled after ${mins}min`);
+              : (hitCeiling ? `reached maxRuntimeMs ceiling (${secs}s) — not settled after ${mins}min` : `not settled after ${mins}min`);
             settleMember(m, "still-running", null);
             continue;
           }
+
+          nudgeCtrl.maybeNudgeMidRun(m, v);
+
           if (silenceMs >= m.maxIdleMs && !m.quietWarned) {
             m.quietWarned = true;
             warn(`"${m.step.title}" quiet for ${Math.round(silenceMs / 60000)}min but its dispatch is alive (status=${v.status}) — waiting up to the ${Math.round(m.hardCapMs / 60000)}min hard cap before giving up.`);
@@ -1005,12 +1155,12 @@ export function createRunner({
       writeStatus();
       return M;
     } catch (err) {
+      // P1-04: Stop ALL live unsettled sibling workers on ANY exception before finally cleanup!
+      for (const live of M.filter((x) => !x.settled)) {
+        try { stopAndIsolateWorker(live, "group_exception_abort"); } catch {}
+      }
       if (err instanceof FlowFatalError) {
         fatalErr = err;
-        // Stop any already-launched sibling workers before exiting so no orphan workers keep mutating worktrees
-        for (const live of M.filter((x) => !x.settled)) {
-          try { stopAndIsolateWorker(live, "fatal_group_abort"); } catch {}
-        }
       } else {
         throw err;
       }
@@ -1103,7 +1253,11 @@ export function createRunner({
           writeStatus();
           die(`"${step.title}" ${r.note}. Its terminal ${r.terminal || "(dispatch-owned)"} was left OPEN to finish. Watch it; once it writes ${outPath(step.writes)}, continue with:\n  node .orca/flow.mjs --from ${members[0].id} "${objective}"`);
         }
-        const repairedCheck = verifyStepArtifact(step, join(wtDir, artDir), wtDir, readinessMinBytes, { mode: "settlement" });
+        const repairedCheck = verifyStepArtifact(step, join(wtDir, artDir), wtDir, readinessMinBytes, {
+          mode: "settlement",
+          minMtimeMs: r.clearedAtMs,
+          clearedBeforeDispatch: r.clearedBeforeDispatch,
+        });
         if (repairedCheck.ok) {
           if (step.verify?.requireContractCommit && repairedCheck.contractCommit)
             recordVerifiedContractCommit(join(wtDir, artDir), repairedCheck.contractCommit, wtDir);

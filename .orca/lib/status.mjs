@@ -45,12 +45,19 @@ export function writeArtifactSnapshotTo(dir, step) {
   writeFileSync(join(dir, step.writes + ".js"), artifactJsOf(step.writes, payload));
 }
 
+export function shouldOpenStatusPage({ cfg = {}, opt = {} } = {}) {
+  if (opt?.noOpenStatus) return false;
+  if (opt?.openStatus === true) return true;
+  return Boolean(cfg?.defaults?.openStatus ?? false);
+}
+
 export function createStatusManager({
   artDir, objective, configFile, cfg, opt, allSteps, getSteps, enabledIds, isParallel, agentOf,
   getWt, getWtPin, getWtPath, getRunId, outPath, notifyRun, log, warn,
 }) {
+  let resumedLedgerRunKey = null;
   const STATUS = {
-    meta: { runId: null, objective, config: configFile, worktree: null, startedAt: null, updatedAt: null },
+    meta: { runId: null, ledgerRunKey: null, objective, config: configFile, worktree: null, startedAt: null, updatedAt: null },
     overall: "running",
     steps: allSteps.map((s) => ({
       id: s.id, title: s.title, agent: agentOf(s), writes: s.writes || null, progress: s.progress || null,
@@ -182,6 +189,9 @@ export function createStatusManager({
     try {
       const prev = parseStatusJs(join(dir, "status.js"));
       if (!prev || !Array.isArray(prev.steps) || prev.meta?.config !== STATUS.meta.config) return;
+      // Only adopt previous step execution records when objective matches (same run lineage)
+      if (prev.meta?.objective && STATUS.meta.objective && prev.meta.objective !== STATUS.meta.objective) return;
+      if (prev.meta?.ledgerRunKey) resumedLedgerRunKey = prev.meta.ledgerRunKey;
       for (const ps of prev.steps) {
         const cur = statusOf(ps.id);
         if (!cur) continue;
@@ -191,6 +201,7 @@ export function createStatusManager({
             agent: ps.agent || cur.agent,
             model: ps.model || cur.model || null,
             family: ps.family || cur.family || null,
+            executedFamilies: Array.isArray(ps.executedFamilies) ? ps.executedFamilies : (ps.family ? [ps.family] : []),
             attempt: Math.max(cur.attempt, ps.attempt || 0),
             startedAt: ps.startedAt ?? null,
             endedAt: ps.endedAt ?? null,
@@ -199,14 +210,21 @@ export function createStatusManager({
           });
         } else if (cur.status === "pending" && prev.overall !== "succeeded") {
           cur.attempt = Math.max(cur.attempt, ps.attempt || 0);
+          if (Array.isArray(ps.executedFamilies) && ps.executedFamilies.length) {
+            cur.executedFamilies = [...ps.executedFamilies];
+          }
         }
       }
     } catch {}
   }
 
   function openStatusPage() {
-    if (statusFailed || opt.noOpenStatus || !(cfg.defaults?.openStatus ?? true)) return;
+    if (statusFailed || !shouldOpenStatusPage({ cfg, opt })) return;
     const file = join(statusDir(), "status.html");
+    if (process.env.ORCA_STATUS_OPEN_LOG) {
+      try { writeFileSync(process.env.ORCA_STATUS_OPEN_LOG, `${file}\n`, { flag: "a" }); } catch {}
+      return;
+    }
     const r = IS_WIN ? spawnSync("explorer.exe", [file], { timeout: 10000, stdio: "ignore" })
       : process.platform === "darwin" ? spawnSync("open", [file], { timeout: 10000, stdio: "ignore" })
       : spawnSync("xdg-open", [file], { timeout: 10000, stdio: "ignore" });
@@ -280,5 +298,7 @@ export function createStatusManager({
     STATUS, statusDir, statusOf, statusSet, writeStatus, writeArtifactSnapshot,
     copyRunFiles, archiveCurrentRun, listRuns, printRunList,
     statusBegin, statusEnd, finishStatus, refreshProgress, loadPreviousStatus, initStatus, runPreviewAndExit,
+    setLedgerRunKey: (rk) => { STATUS.meta.ledgerRunKey = rk; },
+    getResumedLedgerRunKey: () => resumedLedgerRunKey,
   };
 }

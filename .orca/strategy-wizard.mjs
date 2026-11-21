@@ -85,13 +85,19 @@ export function applyStrategyToProject(projectDir, strategy) {
         const revFb = typeof strategy.reviewerFallbackAgent === "string"
           ? { agent: strategy.reviewerFallbackAgent }
           : strategy.reviewerFallbackAgent;
-        const revFbFam = classifyModelFamily(revFb.agent, revFb.model);
-        const authorFams = new Set([
-          classifyModelFamily(coderAg, null),
-          classifyModelFamily(coderAltAg, null),
-          classifyModelFamily(coordAg, null),
-        ].filter(Boolean));
-        if (reviewerAg && revFb.agent !== reviewerAg && (!revFbFam || !authorFams.has(revFbFam))) {
+        const revFbFam = classifyModelFamily(revFb.agent, revFb.model, { projectDir });
+        const authorAgents = [coderAg, coderAltAg, coordAg].filter(Boolean);
+        const authorFamList = authorAgents.map((a) => classifyModelFamily(a, null, { projectDir }));
+        const hasUnprovenAuthor = authorFamList.some((f) => !f || f === "unknown");
+        const authorFams = new Set(authorFamList.filter((f) => f && f !== "unknown"));
+        if (
+          reviewerAg &&
+          revFb.agent !== reviewerAg &&
+          revFbFam &&
+          revFbFam !== "unknown" &&
+          !hasUnprovenAuthor &&
+          !authorFams.has(revFbFam)
+        ) {
           agentFallbacks[reviewerAg] = [revFb];
         }
       }

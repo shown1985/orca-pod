@@ -34,6 +34,7 @@ import {
 } from "./ledger.mjs";
 import { scanLocalAgents, recommendStrategy, formatScanReport } from "./agent-scanner.mjs";
 import { runStrategyWizard } from "./strategy-wizard.mjs";
+import { validateCrossFamilyConfig } from "./preflight.mjs";
 import {
   resolveIssueTrackingConfig,
   detectIssueProvider,
@@ -106,7 +107,7 @@ const argv = process.argv.slice(2);
 const opt = {
   from: null, only: null, dryRun: false, config: null, agentOverrides: {},
   grillMe: undefined, worktree: null, createWorktree: false,
-  noOpenStatus: false, statusPreview: false, newRun: false,
+  openStatus: false, noOpenStatus: false, statusPreview: false, newRun: false,
   allowOneWayMerge: false, dedupKey: null, ledgerHome: null,
   scan: false, setup: false, json: false, yes: false, noOrca: false,
   issues: false, noIssues: false, epicIssue: null, defaultBranch: null,
@@ -125,6 +126,7 @@ for (let i = 0; i < argv.length; i++) {
   } else if (a === "--config") opt.config = argv[++i];
   else if (a === "--worktree") opt.worktree = argv[++i];
   else if (a === "--create-worktree") opt.createWorktree = true;
+  else if (a === "--open-status") opt.openStatus = true;
   else if (a === "--no-open-status") opt.noOpenStatus = true;
   else if (a === "--status-preview") opt.statusPreview = true;
   else if (a === "--new") opt.newRun = true;
@@ -331,6 +333,7 @@ for (const g of groups) if (g.length > 1) for (const m of g) isParallel.add(m.id
 }
 
 validateAgentConfig({ cfg, configDir: HERE, steps, die });
+validateCrossFamilyConfig(allSteps, byId, die);
 for (const s of allSteps) { validateVerifyConfig(s, die); validateIsolationConfig(s, die); }
 const tb = cfg.defaults?.targetBranch;
 if (tb != null && (typeof tb !== "string" || !tb.trim() || /\s/.test(tb))) die(`defaults: targetBranch must be a non-empty branch name with no whitespace (got ${JSON.stringify(tb)}).`);
@@ -370,11 +373,11 @@ statusMgr = createStatusManager({
 });
 
 if (opt.statusPreview && (objective || opt.only || opt.from || Object.keys(opt.agentOverrides).length))
-  die("--status-preview renders a SAMPLE status page and exits WITHOUT calling agents, but this command looks like a real run (objective/--only/--from/--agent present). Remove --status-preview to run the pipeline for real — the status page opens automatically — or drop the objective and selectors to see the sample page.");
+  die("--status-preview renders a SAMPLE status page and exits WITHOUT calling agents, but this command looks like a real run (objective/--only/--from/--agent present). Remove --status-preview to run the pipeline for real (pass --open-status to auto-open status.html), or drop the objective and selectors to see the sample page.");
 if (opt.statusPreview) statusMgr.runPreviewAndExit(HERE);
 
 let WT_DIR = null;
-let PREV_LEDGER_STEPS = {};
+let BOUND_PREV_LEDGER = null;
 const ISSUE_CFG = resolveIssueTrackingConfig(cfg, opt);
 let ISSUE_PROVIDER = null;
 let ISSUE_STATE = null;
@@ -388,7 +391,7 @@ const runner = createRunner({
   agentOf, modelOf, effectiveModel, timeoutOf, nudgeRetriesOf, nudgeTimeoutOf, outPath,
   orcaClient, statusMgr, notifier,
   getLedger: () => LEDGER,
-  getPreviousLedgerSteps: () => PREV_LEDGER_STEPS,
+  getBoundPreviousLedger: () => BOUND_PREV_LEDGER,
   getWtDir: () => WT_DIR,
   getIssueState: () => ISSUE_STATE,
   getIssueProvider: () => ISSUE_PROVIDER,
@@ -417,14 +420,6 @@ process.on("SIGTERM", () => cleanupOnSignal("SIGTERM"));
 process.on("exit", () => { if (LOCK_CTX) { try { releaseRunLock(LOCK_CTX); } catch {} LOCK_CTX = null; } });
 
 const initialProtectedShas = snapshotBranchShas(WT_DIR || ".", PROTECTED_BRANCHES);
-if (opt.from || opt.only) {
-  try {
-    const priorSummaries = listLedgerSummaries({ ledgerHome: LEDGER_HOME_CFG, repoDir: WT_DIR || "." });
-    if (priorSummaries.length && priorSummaries[0]?.steps) {
-      PREV_LEDGER_STEPS = priorSummaries[0].steps;
-    }
-  } catch {}
-}
 try {
   LEDGER = createRunLedger({
     runKey: EARLY_RUN_KEY, repoDir: WT_DIR || ".", ledgerHome: LEDGER_HOME_CFG,
@@ -451,6 +446,16 @@ orcaClient.setRunId(runId);
 log(`Run: ${runId}`);
 LEDGER.setOrcaRunId(runId);
 statusMgr.initStatus();
+const resumedLedgerRunKey = statusMgr.getResumedLedgerRunKey();
+if ((opt.from || opt.only) && resumedLedgerRunKey) {
+  try {
+    const priorSummaries = listLedgerSummaries({ ledgerHome: LEDGER_HOME_CFG, repoDir: WT_DIR || "." });
+    const matched = priorSummaries.find((s) => s && s.runKey === resumedLedgerRunKey && (!s.objective || !objective || s.objective === objective));
+    if (matched) BOUND_PREV_LEDGER = matched;
+  } catch {}
+}
+statusMgr.setLedgerRunKey(LEDGER.runKey);
+statusMgr.writeStatus();
 
 // Initialize GitHub/Gitea Issue traceability (auto-enabled when gh/tea & remote available; strictly isolated on --no-issues)
 const artDirAbs = join(WT_DIR || ".", ART_DIR);
@@ -470,12 +475,16 @@ if (ISSUE_CFG.mode === false) {
     repo: ISSUE_PROVIDER.repo,
     objective,
     epicIssue: ISSUE_CFG.epicIssue,
+    runScopeId: opt.from ? resumedLedgerRunKey : LEDGER.runKey,
+    requireRunScope: Boolean(opt.from),
   });
   log(`[issues] enabled (provider=${ISSUE_PROVIDER.provider}${ISSUE_PROVIDER.repo ? `, repo=${ISSUE_PROVIDER.repo}` : ""}${ISSUE_CFG.epicIssue ? `, epic=#${ISSUE_CFG.epicIssue}` : ""})`);
   if (ISSUE_CFG.epicIssue && ISSUE_STATE?.epic?.number !== ISSUE_CFG.epicIssue) {
     ISSUE_STATE = syncPlanIssues({
       providerInfo: ISSUE_PROVIDER, config: ISSUE_CFG, repoDir: WT_DIR || ".", artDirAbs,
-      objective, stepId: "init", artifactPath: null, log, warn,
+      objective, stepId: "init", artifactPath: null,
+      runScopeId: LEDGER.runKey, priorRunScopeId: opt.from ? resumedLedgerRunKey : null, requireRunScope: Boolean(opt.from),
+      log, warn,
     });
     if (ISSUE_STATE) LEDGER?.recordIssueLinks(ISSUE_STATE);
   }
@@ -499,6 +508,7 @@ while (gi < groups.length) {
       const checkDir = r.ctx?.isolated ? r.ctx.dir : (WT_DIR || ".");
       vres = verifyStepArtifact(r.step, join(WT_DIR || ".", ART_DIR), checkDir, READINESS_MIN_BYTES, {
         mode: "settlement", targetBranch: TARGET_BRANCH, allowOneWayMerge: opt.allowOneWayMerge,
+        minMtimeMs: r.clearedAtMs, clearedBeforeDispatch: r.clearedBeforeDispatch,
         preStepTargetSha: r.preStepTargetSha, preStepOriginTargetSha: r.preStepOriginTargetSha,
         preStepRemoteTargetSha: r.preStepRemoteTargetSha, preStepRemoteError: r.preStepRemoteError,
         preStepHasOrigin: r.preStepHasOrigin, preStepHeadSha: r.preStepHeadSha,
@@ -567,7 +577,9 @@ while (gi < groups.length) {
           const planArt = r.step.writes ? join(WT_DIR || ".", ART_DIR, r.step.writes) : null;
           ISSUE_STATE = syncPlanIssues({
             providerInfo: ISSUE_PROVIDER, config: ISSUE_CFG, repoDir: WT_DIR || ".", artDirAbs,
-            objective, stepId: r.step.id, artifactPath: planArt, log, warn,
+            objective, stepId: r.step.id, artifactPath: planArt,
+            runScopeId: LEDGER.runKey, priorRunScopeId: opt.from ? resumedLedgerRunKey : null, requireRunScope: Boolean(opt.from),
+            log, warn,
           });
           if (ISSUE_STATE) LEDGER?.recordIssueLinks(ISSUE_STATE);
         } catch (e) {

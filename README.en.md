@@ -29,7 +29,7 @@ A lightweight, governance-hardened multi-agent SDLC orchestrator for **Orca ADE*
    - **GitHub / Gitea Issue-to-PR Traceability (`.orca/issue-tracker.mjs`)**: Run/repo-scoped `ISSUES.json` with atomic per-issue persistence, strict `--no-issues` isolation, and explicit post-merge close guidance when targeting non-default branches like `dev`.
    - **Stack-Aware CI & PII-Safe Intranet Self-Hosted CD Generator (`.orca/ci-generator.mjs`)**: Detects Python, Node/Vue/Vite, Go, Rust, and `docker-compose.prod.yml` with strict exit codes, least-privilege permissions, Gitea PR comment support, zero container-log PII dumps, and preservation of existing `cd-selfhosted.yml` unless `--force` is passed.
 5. **Full Observability & Extensibility**
-   - Offline live status dashboard (`status.html` + JSONP artifact viewer, `--status-preview`), run history archiving/resume, Claude/Codex token usage reporting (`USAGE.md`), webhook notifications (`.orca/notify.json`), and per-step Skills/MCP materialization (`.orca/agent-config.mjs`).
+   - Offline live status dashboard (`status.html` + JSONP artifact viewer, `--status-preview`; `openStatus: false` by default so runs never pop open a browser unless `--open-status` or `defaults.openStatus: true` is set), run history archiving/resume, Claude/Codex token usage reporting (`USAGE.md`), webhook notifications (`.orca/notify.json`), and per-step Skills/MCP materialization (`.orca/agent-config.mjs`).
 
 ---
 

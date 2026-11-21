@@ -4,7 +4,10 @@
 module.exports = {
   handlers: {
     "orchestration check": (c) => c.ok({ messages: [] }),
-    "orchestration dispatch-show": (c) => c.ok({ dispatch: { status: "dispatching", last_heartbeat_at: new Date(Date.now() - 3600000).toISOString() } }),
+    "orchestration dispatch-show": (c) => {
+      const d = Object.values(c.state.dispatches).filter((x) => x.task === c.flags.task).pop();
+      c.ok({ dispatch: { id: d ? d.id : null, status: "dispatching", last_heartbeat_at: new Date(Date.now() - 3600000).toISOString() } });
+    },
     "orchestration worker-show": (c) => c.ok({ terminal: { lastOutputAt: Date.now() - 3600000 } }),
   },
 };

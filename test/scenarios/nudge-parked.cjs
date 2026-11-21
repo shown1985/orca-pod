@@ -8,8 +8,10 @@ module.exports = {
     // stylistic override — nothing here ever pushes a done (the default check
     // handler returns empty anyway); do not assume it is load-bearing.
     "orchestration check": (c) => c.ok({ messages: [] }),
-    "orchestration dispatch-show": (c) =>
-      c.ok({ dispatch: { status: "dispatching", last_heartbeat_at: new Date(Date.now() - 30 * 60 * 1000).toISOString() } }),
+    "orchestration dispatch-show": (c) => {
+      const d = Object.values(c.state.dispatches).filter((x) => x.task === c.flags.task).pop();
+      c.ok({ dispatch: { id: d ? d.id : null, status: "dispatching", last_heartbeat_at: new Date(Date.now() - 30 * 60 * 1000).toISOString() } });
+    },
     "orchestration worker-start": (c) => {
       const id = "disp-" + c.id();
       c.state.dispatches[id] = { id, task: c.flags.task, status: "dispatching", created: Date.now() };

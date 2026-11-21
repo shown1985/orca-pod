@@ -1,16 +1,14 @@
 // Activity-aware Watchdog supervisor for Orca-Pod workers.
 // Replaces blind fixed-timeout killing with continuous liveness & progress monitoring:
-//   - Distinguishes healthy long-running progress (git/file/artifact/output deltas) from real hangs
-//   - Detects output dead-loops (repeating error/cycle patterns with zero file/git progress)
-//   - Detects stalled/hung workers (long silence + zero file/git/artifact progress)
-//   - Distinguishes unattended workspace-trust CLI blocks from normal human approval waits
-//   - Scans newly appended terminal deltas for gateway disconnects (ignoring recovered historic lines)
-//   - Deduplicates repeated anomaly events and redacts secrets/PII from snippets
+//   - Prioritizes structured human approval waits (`user_approval`) over transient errors
+//   - Restricts output dead-loop detection strictly to lines appended AFTER last real progress
+//   - Stream-hashes full content of modified & untracked files (marking truncated probes unknown)
+//   - Separates own vs shared-worktree signals cleanly across shared<->solo transitions
 // Zero external dependencies (Node >= 18).
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { sanitizeText } from "./lib/sanitize.mjs";
 
@@ -56,6 +54,8 @@ export const DEFAULT_WATCHDOG_CONFIG = {
 const ANSI_RE = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 const VOLATILE_RE = /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b|\b\d{1,2}:\d{2}:\d{2}\b|\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|min|mins)\b|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g;
 const TRUST_WAIT_KIND_RE = /^(?:workspace_trust|folder_trust|trust|agent_prompt_blocked)$/i;
+const MAX_HASHED_GIT_FILES = 2000;
+const MAX_STREAM_FILE_BYTES = 16 * 1024 * 1024; // 16 MB streaming content hash cap per file
 
 export function stripAnsi(text) {
   return typeof text === "string" ? text.replace(ANSI_RE, "") : "";
@@ -72,11 +72,7 @@ export function normalizePreviewTail(preview, maxLines = 24) {
   return { tail: lines.join("\n"), lines };
 }
 
-/**
- * Extract only newly appended lines from `curPreview` compared to `prevPreview`
- * so historical errors that scrolled by before recovery do not re-trigger fallback.
- */
-export function extractPreviewDelta(prevPreview, curPreview, maxTailLines = 12) {
+export function extractPreviewDelta(prevPreview, curPreview, maxTailLines = 16) {
   const curClean = stripAnsi(curPreview || "");
   if (!curClean.trim()) return "";
   const prevClean = stripAnsi(prevPreview || "");
@@ -93,7 +89,6 @@ export function extractPreviewDelta(prevPreview, curPreview, maxTailLines = 12) 
   const curLines = curClean.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   if (!prevLines.length) return curLines.slice(-maxTailLines).join("\n");
 
-  // Find longest suffix of prevLines matching a contiguous slice in curLines
   const anchorLen = Math.min(3, prevLines.length);
   const anchor = prevLines.slice(-anchorLen);
   for (let i = curLines.length - anchorLen; i >= 0; i--) {
@@ -105,7 +100,6 @@ export function extractPreviewDelta(prevPreview, curPreview, maxTailLines = 12) 
       return curLines.slice(i + anchorLen).slice(-maxTailLines).join("\n");
     }
   }
-  // Fallback: match the single last line of prevLines
   const lastPrev = prevLines[prevLines.length - 1];
   const lastIdx = curLines.lastIndexOf(lastPrev);
   if (lastIdx >= 0) {
@@ -115,8 +109,6 @@ export function extractPreviewDelta(prevPreview, curPreview, maxTailLines = 12) 
 }
 
 export function detectPromptBlocked(preview, agentWait = null) {
-  // Check structured Orca agentWait first: distinguish normal human approval (`user_approval`)
-  // from workspace-trust / startup prompt blocks (`trustBlock`).
   if (agentWait && typeof agentWait === "object" && !Array.isArray(agentWait) && Object.keys(agentWait).length > 0) {
     const rawReason = String(agentWait.kind || agentWait.reason || "external approval");
     const safeReason = sanitizeText(rawReason, { maxLen: 80 });
@@ -135,7 +127,6 @@ export function detectPromptBlocked(preview, agentWait = null) {
   }
 
   if (typeof preview === "string" && preview.length > 0) {
-    // Inspect only the active bottom tail (last 12 non-empty lines) so answered prompts higher up don't re-match
     const tailText = stripAnsi(preview).split(/\r?\n/).filter((l) => l.trim()).slice(-12).join("\n");
     const hit = WATCHDOG_PARKED_PROMPTS.find((p) => tailText.includes(p.sig));
     if (hit) {
@@ -177,7 +168,7 @@ export function detectGatewayDisconnect(text) {
 export function detectOutputLoop(history, latestLines = [], { threshold = 4 } = {}) {
   const th = Math.max(3, Number(threshold) || 4);
 
-  // 1) Intra-preview repetition: `th` identical consecutive non-trivial lines in latest tail
+  // 1) Intra-delta / post-progress consecutive line repetition
   if (Array.isArray(latestLines) && latestLines.length >= th) {
     let run = 1;
     for (let i = 1; i < latestLines.length; i++) {
@@ -201,13 +192,12 @@ export function detectOutputLoop(history, latestLines = [], { threshold = 4 } = 
     }
   }
 
-  // 2) Cross-slice repetition across changed snapshots (identical tail or A-B-A-B cycle)
+  // 2) Cross-slice repetition across changed snapshots since last real progress
   if (!Array.isArray(history) || history.length < th) return null;
   const recent = history.slice(-th);
   const nonEmpty = recent.filter((x) => x && x.length >= 16);
   if (nonEmpty.length < th) return null;
 
-  // 2a) Same normalized tail repeating across `th` changed slices (e.g. timestamps/spinners moving, content stuck)
   if (nonEmpty.every((x) => x === nonEmpty[0])) {
     const rawSample = nonEmpty[0].split("\n").slice(-1)[0] || nonEmpty[0].slice(0, 120);
     const sample = sanitizeText(rawSample, { maxLen: 140 });
@@ -221,7 +211,6 @@ export function detectOutputLoop(history, latestLines = [], { threshold = 4 } = 
     };
   }
 
-  // 2b) Period-2 oscillation (A, B, A, B, ...) across at least max(4, th) slices
   const cycLen = Math.max(4, th);
   if (history.length >= cycLen) {
     const seg = history.slice(-cycLen);
@@ -245,18 +234,35 @@ export function detectOutputLoop(history, latestLines = [], { threshold = 4 } = 
   return null;
 }
 
-function hashFileQuick(filePath, maxBytes = 512 * 1024) {
+/**
+ * Stream-hash file content in 64KB chunks so large files (>512KB) are content-hashed
+ * without heap spikes; marks `partial: true` if file exceeds `maxBytes` or cannot be read.
+ */
+function hashFileStreaming(filePath, maxBytes = MAX_STREAM_FILE_BYTES) {
+  let fd = null;
   try {
     const s = statSync(filePath);
-    if (!s.isFile()) return null;
-    const h = createHash("sha256");
-    h.update(`${s.size}:${Math.floor(s.mtimeMs)}:`);
-    if (s.size <= maxBytes) {
-      h.update(readFileSync(filePath));
+    if (!s.isFile()) return { exists: false, partial: false, size: 0, digest: null };
+    if (s.size > maxBytes) {
+      return { exists: true, partial: true, size: s.size, digest: null };
     }
-    return { size: s.size, mtime: Math.floor(s.mtimeMs), digest: h.digest("hex").slice(0, 20) };
-  } catch {
-    return null;
+    const h = createHash("sha256");
+    h.update(`${s.size}:`);
+    fd = openSync(filePath, "r");
+    const buf = Buffer.allocUnsafe(65536);
+    let offset = 0;
+    while (offset < s.size) {
+      const n = readSync(fd, buf, 0, Math.min(buf.length, s.size - offset), offset);
+      if (n <= 0) break;
+      h.update(buf.subarray(0, n));
+      offset += n;
+    }
+    return { exists: true, partial: false, size: s.size, digest: h.digest("hex").slice(0, 24) };
+  } catch (e) {
+    if (e && e.code === "ENOENT") return { exists: false, partial: false, size: 0, digest: null };
+    return { exists: false, partial: true, size: 0, digest: null };
+  } finally {
+    if (fd !== null) { try { closeSync(fd); } catch {} }
   }
 }
 
@@ -265,22 +271,22 @@ export function probeWorktreeActivity(worktreeDir, {
   progressPath = null,
   artDirPath = null,
   sharedWorktree = false,
+  maxGitFiles = MAX_HASHED_GIT_FILES,
 } = {}) {
   let gitFingerprint = null;
   let gitOk = false;
+  let gitPartial = false;
 
   if (worktreeDir && existsSync(worktreeDir)) {
     const st = spawnSync("git", ["--no-optional-locks", "-C", worktreeDir, "status", "--porcelain", "-uall", "-z"], {
       encoding: "utf8",
-      timeout: 2500,
+      timeout: 3000,
     });
     const head = spawnSync("git", ["--no-optional-locks", "-C", worktreeDir, "rev-parse", "--verify", "--quiet", "HEAD"], {
       encoding: "utf8",
       timeout: 2000,
     });
-    // Treat git command failure/timeout as unknown (null), never as an empty string that fakes progress later
     if (!st.error && st.status === 0) {
-      gitOk = true;
       const headSha = (!head.error && head.status === 0) ? (head.stdout || "").trim() : "NO_HEAD";
       const entries = (st.stdout || "").split("\0").filter(Boolean);
       const fileDigests = [];
@@ -290,43 +296,54 @@ export function probeWorktreeActivity(worktreeDir, {
         if (entry.length < 4) continue;
         const xy = entry.slice(0, 2);
         const relPath = entry.slice(3);
-        // In porcelain -z, rename/copy has an extra NUL-terminated source path entry following
         if (xy.includes("R") || xy.includes("C")) i++;
         if (relPath.startsWith(".orca/artifacts/") || relPath === ".orca-agent-config.json") continue;
-        if (inspected < 200) {
-          inspected++;
-          const info = hashFileQuick(join(worktreeDir, relPath));
-          fileDigests.push(info ? `${xy}:${relPath}:${info.digest}` : `${xy}:${relPath}:gone`);
-        } else {
-          fileDigests.push(`${xy}:${relPath}`);
+        if (inspected >= maxGitFiles) {
+          gitPartial = true;
+          break;
         }
+        inspected++;
+        const info = hashFileStreaming(join(worktreeDir, relPath));
+        if (info.partial) {
+          gitPartial = true;
+          break;
+        }
+        fileDigests.push(info.exists ? `${xy}:${relPath}:${info.digest}` : `${xy}:${relPath}:gone`);
       }
-      fileDigests.sort();
-      const gh = createHash("sha256");
-      gh.update(`${headSha}\n${fileDigests.join("\n")}`);
-      gitFingerprint = gh.digest("hex").slice(0, 32);
+      // If file count exceeded maxGitFiles or a file exceeded streaming content hash limits,
+      // explicitly mark gitFingerprint as null (unknown/partial) rather than claiming false certainty!
+      if (!gitPartial) {
+        gitOk = true;
+        fileDigests.sort();
+        const gh = createHash("sha256");
+        gh.update(`${headSha}\n${fileDigests.join("\n")}`);
+        gitFingerprint = gh.digest("hex").slice(0, 32);
+      }
     }
   }
 
   let artifactSize = 0;
   const ownParts = [];
   if (artifactPath) {
-    const info = hashFileQuick(artifactPath);
-    if (info) {
+    const info = hashFileStreaming(artifactPath);
+    if (info.exists && info.digest) {
       artifactSize = info.size;
       ownParts.push(`writes:${info.size}:${info.digest}`);
     }
   }
   if (progressPath) {
-    const pInfo = hashFileQuick(progressPath);
-    if (pInfo) {
+    const pInfo = hashFileStreaming(progressPath);
+    if (pInfo.exists && pInfo.digest) {
       ownParts.push(`progress:${pInfo.size}:${pInfo.digest}`);
     }
   }
+  const ownArtifactFingerprint = ownParts.join("|");
 
+  // Always compute directory-wide extra artifact fingerprint separately from `ownArtifactFingerprint`
+  // so transitions between sharedWorktree=true and sharedWorktree=false never treat pre-existing
+  // untouched sibling files as newly written progress!
   const artEntries = [];
-  // Only scan sibling files in artDirPath when this worker exclusively owns the worktree
-  if (!sharedWorktree && artDirPath && existsSync(artDirPath)) {
+  if (artDirPath && existsSync(artDirPath)) {
     try {
       for (const name of readdirSync(artDirPath)) {
         if (
@@ -335,14 +352,29 @@ export function probeWorktreeActivity(worktreeDir, {
           name.endsWith(".md.js") || name.endsWith(".json.js") || name.endsWith(".tmp") ||
           name.includes(".tmp.")
         ) continue;
-        const info = hashFileQuick(join(artDirPath, name), 256 * 1024);
-        if (info) artEntries.push(`${name}:${info.size}:${info.digest}`);
+        const full = join(artDirPath, name);
+        if (artifactPath && full === artifactPath) continue;
+        if (progressPath && full === progressPath) continue;
+        const info = hashFileStreaming(full, 2 * 1024 * 1024);
+        if (info.exists && info.digest) artEntries.push(`${name}:${info.size}:${info.digest}`);
       }
     } catch {}
   }
   artEntries.sort();
-  const artifactFingerprint = `${ownParts.join("|")}||${artEntries.join(",")}`;
-  return { gitFingerprint, gitOk, artifactFingerprint, artifactSize };
+  const dirArtifactFingerprint = artEntries.join(",");
+  const artifactFingerprint = sharedWorktree
+    ? ownArtifactFingerprint
+    : `${ownArtifactFingerprint}||${dirArtifactFingerprint}`;
+
+  return {
+    gitFingerprint,
+    gitOk,
+    gitPartial,
+    ownArtifactFingerprint,
+    dirArtifactFingerprint,
+    artifactFingerprint,
+    artifactSize,
+  };
 }
 
 export function resolveWatchdogConfig(step = {}, cfg = {}) {
@@ -376,11 +408,15 @@ export function createWatchdogTracker({
     progressPath,
     artDirPath,
     sharedWorktree: Boolean(sharedWorktree),
+    lastSharedWorktree: Boolean(sharedWorktree),
     probeFn,
     lastGitFingerprint: initial.gitFingerprint ?? null,
-    lastArtifactFingerprint: initial.artifactFingerprint,
-    lastArtifactSize: initial.artifactSize,
+    lastOwnArtifactFingerprint: initial.ownArtifactFingerprint ?? initial.artifactFingerprint ?? "",
+    lastDirArtifactFingerprint: initial.dirArtifactFingerprint ?? "",
+    lastArtifactFingerprint: initial.artifactFingerprint ?? "",
+    lastArtifactSize: initial.artifactSize ?? 0,
     lastRawPreview: "",
+    postProgressLines: [],
     lastProgressAt: startedAt,
     lastRealCodeProgressAt: 0,
     previewHistory: [],
@@ -397,6 +433,8 @@ export function evaluateWatchdog(w, obs = {}) {
   const cfg = w.config;
   const fallbackAvailable = Boolean(obs.fallbackAvailable);
   const sharedWorktree = obs.sharedWorktree !== undefined ? Boolean(obs.sharedWorktree) : Boolean(w.sharedWorktree);
+  const switchedToSolo = w.lastSharedWorktree === true && sharedWorktree === false;
+  w.lastSharedWorktree = sharedWorktree;
 
   if (!cfg.enabled) {
     return {
@@ -421,43 +459,57 @@ export function evaluateWatchdog(w, obs = {}) {
     sharedWorktree,
   });
 
-  // Treat null gitFingerprint (probe error/not-a-git-repo) as unknown, never as fake progress.
-  // In a shared worktree with multiple concurrent members, do NOT attribute shared git diffs to solo progress.
-  let rawGitChanged = false;
+  // Compute git change: when transitioning from shared->solo worktree, re-baseline git & sibling dir
+  // fingerprints without treating pre-existing sibling edits as new progress!
+  let gitChanged = false;
   if (probe.gitFingerprint != null) {
-    if (w.lastGitFingerprint == null) {
+    if (w.lastGitFingerprint == null || switchedToSolo || sharedWorktree) {
       w.lastGitFingerprint = probe.gitFingerprint;
     } else if (probe.gitFingerprint !== w.lastGitFingerprint) {
       w.lastGitFingerprint = probe.gitFingerprint;
-      rawGitChanged = true;
+      gitChanged = true;
     }
   }
-  const gitChanged = sharedWorktree ? false : rawGitChanged;
 
-  const artifactChanged = Boolean(
-    probe.artifactFingerprint != null && probe.artifactFingerprint !== w.lastArtifactFingerprint
-  );
-  if (gitChanged) {
-    w.lastRealCodeProgressAt = now;
-  }
-  if (artifactChanged) {
+  let artifactChanged = false;
+  if (probe.ownArtifactFingerprint !== undefined && probe.dirArtifactFingerprint !== undefined) {
+    const ownChanged = probe.ownArtifactFingerprint !== w.lastOwnArtifactFingerprint;
+    w.lastOwnArtifactFingerprint = probe.ownArtifactFingerprint;
+    let dirChanged = false;
+    if (switchedToSolo || sharedWorktree) {
+      w.lastDirArtifactFingerprint = probe.dirArtifactFingerprint;
+    } else if (probe.dirArtifactFingerprint !== w.lastDirArtifactFingerprint) {
+      w.lastDirArtifactFingerprint = probe.dirArtifactFingerprint;
+      dirChanged = true;
+    }
+    artifactChanged = ownChanged || dirChanged;
     w.lastArtifactFingerprint = probe.artifactFingerprint;
     w.lastArtifactSize = probe.artifactSize;
+  } else if (probe.artifactFingerprint != null && probe.artifactFingerprint !== w.lastArtifactFingerprint) {
+    // Support lightweight unit-test probeOverride objects `{ gitFingerprint, artifactFingerprint, artifactSize }`
+    w.lastArtifactFingerprint = probe.artifactFingerprint;
+    w.lastArtifactSize = probe.artifactSize ?? w.lastArtifactSize;
+    artifactChanged = !switchedToSolo;
+  }
+
+  if (gitChanged || artifactChanged) {
     w.lastRealCodeProgressAt = now;
   }
 
   const realProgressNow = gitChanged || artifactChanged;
   if (realProgressNow) {
-    // Real code/artifact progress clears prior anomaly dedup latches & loop history
+    // Real code/artifact progress clears anomaly dedup latches AND wipes pre-progress loop buffers!
     w.emittedAnomalyKeys.clear();
+    w.postProgressLines = [];
+    w.previewHistory = [];
   }
 
   const preview = typeof obs.preview === "string" ? obs.preview : null;
-  const freshDelta = preview != null ? extractPreviewDelta(w.lastRawPreview, preview, 12) : "";
+  const freshDelta = preview != null ? extractPreviewDelta(w.lastRawPreview, preview, 16) : "";
   if (preview != null) {
     w.lastRawPreview = preview;
   }
-  const { tail, lines } = normalizePreviewTail(preview);
+  const deltaNorm = normalizePreviewTail(freshDelta, 16);
 
   const emitAnomaly = ({ kind, dedupSig, action, diagnosis, evidence, parked = null }) => {
     const key = `${kind}:${action}:${dedupSig}`;
@@ -481,11 +533,24 @@ export function evaluateWatchdog(w, obs = {}) {
     };
   };
 
-  // 1) Gateway disconnect check: ONLY scan newly appended preview delta, and skip if worker just made real git/artifact progress
+  // 1) Structured Human Approval (`user_approval`) check FIRST:
+  //    Never preempt an active human-approval wait with fallback on transient terminal error text!
+  const pb = detectPromptBlocked(preview, obs.agentWait);
+  if (pb && pb.humanApproval) {
+    return emitAnomaly({
+      kind: pb.kind,
+      dedupSig: pb.sig,
+      action: "block",
+      diagnosis: pb.diagnosis,
+      evidence: { sig: pb.sig, label: pb.label, trustBlock: false, humanApproval: true },
+      parked: { sig: pb.sig, label: pb.label },
+    });
+  }
+
+  // 2) Gateway disconnect check: ONLY scan newly appended preview delta when no real git/artifact progress occurred
   if (!realProgressNow && freshDelta) {
     const gw = detectGatewayDisconnect(freshDelta);
     if (gw) {
-      // Check if subsequent lines in the same delta already recovered (last 2 lines have no error while >3 lines followed)
       const deltaLines = freshDelta.split(/\r?\n/).filter((l) => l.trim());
       const lastErrorLineIdx = deltaLines.reduce((acc, l, idx) => (detectGatewayDisconnect(l) ? idx : acc), -1);
       const trailingHealthyLines = lastErrorLineIdx >= 0 ? (deltaLines.length - 1 - lastErrorLineIdx) : 0;
@@ -502,11 +567,9 @@ export function evaluateWatchdog(w, obs = {}) {
     }
   }
 
-  // 2) Interactive / Workspace trust vs Human approval prompt check
-  const pb = detectPromptBlocked(preview, obs.agentWait);
+  // 3) Unattended workspace-trust / startup prompt block (`trustBlock === true`)
   if (pb) {
-    // Human approval (`user_approval` / permission prompt) MUST block & notify, NEVER blindly fallback!
-    const canFallback = Boolean(pb.trustBlock && !pb.humanApproval && cfg.fallbackOnPromptBlocked && fallbackAvailable);
+    const canFallback = Boolean(pb.trustBlock && cfg.fallbackOnPromptBlocked && fallbackAvailable);
     const action = canFallback ? "fallback" : "block";
     return emitAnomaly({
       kind: pb.kind,
@@ -518,16 +581,20 @@ export function evaluateWatchdog(w, obs = {}) {
     });
   }
 
-  // 3) Output dead-loop detection (only when output actually changed and no real git/artifact progress occurred)
+  // 4) Output dead-loop detection: strictly restricted to lines appended AFTER last real progress!
   const previewDidAdvance = obs.previewChanged !== false;
-  if (obs.previewChanged && obs.previewSeenBefore && tail) {
-    w.previewHistory.push(tail);
-    if (w.previewHistory.length > (cfg.loopWindowSize || 10)) {
-      w.previewHistory.shift();
+  if (!realProgressNow && previewDidAdvance && deltaNorm.lines.length > 0) {
+    w.postProgressLines.push(...deltaNorm.lines);
+    if (w.postProgressLines.length > 36) {
+      w.postProgressLines = w.postProgressLines.slice(-36);
     }
-  }
-  if (!realProgressNow && previewDidAdvance) {
-    const loop = detectOutputLoop(w.previewHistory, lines, { threshold: cfg.loopThreshold });
+    if (obs.previewSeenBefore && deltaNorm.tail) {
+      w.previewHistory.push(deltaNorm.tail);
+      if (w.previewHistory.length > (cfg.loopWindowSize || 10)) {
+        w.previewHistory.shift();
+      }
+    }
+    const loop = detectOutputLoop(w.previewHistory, w.postProgressLines, { threshold: cfg.loopThreshold });
     if (loop) {
       const action = (cfg.fallbackOnLoop && fallbackAvailable) ? "fallback" : "escalate";
       return emitAnomaly({
@@ -538,18 +605,16 @@ export function evaluateWatchdog(w, obs = {}) {
         evidence: { pattern: loop.pattern, repeats: loop.repeats, sample: loop.sample },
       });
     }
-  } else if (realProgressNow) {
-    w.previewHistory = tail ? [tail] : [];
   }
 
-  // 4) Update effective progress clock
+  // 5) Update effective progress clock
   const nonLoopPreviewProgress = Boolean(obs.previewChanged && obs.previewSeenBefore);
   const activeProgress = gitChanged || artifactChanged || nonLoopPreviewProgress;
   if (activeProgress) {
     w.lastProgressAt = now;
   }
 
-  // 5) Stalled/hang detection (only when stallTimeoutMs > 0 is configured)
+  // 6) Stalled/hang detection
   const noProgressMs = Math.max(0, now - w.lastProgressAt);
   if (cfg.stallTimeoutMs > 0 && noProgressMs >= cfg.stallTimeoutMs && !activeProgress) {
     const action = (cfg.fallbackOnStall && fallbackAvailable) ? "fallback" : "escalate";
@@ -565,8 +630,7 @@ export function evaluateWatchdog(w, obs = {}) {
     });
   }
 
-  // 6) Activity-aware deadline extension: never blind-kill a healthy worker making real progress,
-  //    while strictly respecting maxRuntimeMs ceiling when configured.
+  // 7) Activity-aware deadline extension
   const runtimeMs = Math.max(0, now - w.startedAt);
   const underMaxRuntime = !cfg.maxRuntimeMs || cfg.maxRuntimeMs <= 0 || runtimeMs < cfg.maxRuntimeMs;
   const recentlyProgressed = (w.lastProgressAt > w.startedAt) && (noProgressMs < (cfg.activityFreshMs || 180000));

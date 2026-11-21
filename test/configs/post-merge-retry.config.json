@@ -31,6 +31,7 @@
       "title": "Worker Backend",
       "enabled": true,
       "agent": "opencode",
+      "model": "deepseek-v4.1-flash",
       "isolatedWorktree": true,
       "writes": "BACKEND_CHANGES.md",
       "reads": [
@@ -59,6 +60,7 @@
       "title": "Serial Integration",
       "enabled": true,
       "agent": "opencode",
+      "model": "deepseek-v4.1-flash",
       "writes": "INTEGRATION_REPORT.md",
       "reads": [
         "task-review-merge"

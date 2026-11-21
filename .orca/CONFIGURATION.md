@@ -33,7 +33,7 @@ All pipeline behavior lives in `.orca/flow.config.json` (or any `--config <file>
 | `readinessMinBytes` | `200` | Minimum byte size for a valid artifact |
 | `nudgeRetries` | `0` | Automated nudge attempts for missing artifacts (`0` = disabled) |
 | `nudgeTimeoutMs` | `120000` | Idle/post-done wait before sending a nudge (ms) |
-| `openStatus` | `true` | Auto-open `status.html` in default browser on run start |
+| `openStatus` | `false` | Auto-open `status.html` in default browser on run start (opt in via `openStatus: true` or `--open-status`; `--no-open-status` always disables) |
 | `turnStartWindowMs` | `120000` | Window before warning on `turnStart=unobserved` |
 | `turnStartEscalateMs` | `600000` | Window before cleanly stopping an unobserved dispatch |
 | `ledgerHome` | OS data dir | Custom out-of-repo ledger root (must be outside any git repo) |

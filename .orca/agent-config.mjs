@@ -241,24 +241,36 @@ export function materializeAgentConfig({ worktree, members, cfg, configDir, die,
 
   const plan = newPlan(worktree, die);
 
-  // MCP JSON files, one per harness that has refs.
-  const warned = new Set();   // env-warn dedupe shared across servers
+  // MCP JSON files, merged PER TARGET FILE (e.g. agy + antigravity share .agents/mcp_config.json,
+  // opencode + opencode2 share opencode.json) so parallel aliases never overwrite each other!
+  const mcpByFile = new Map(); // mcpFile -> { mcpKey, harnesses: [], names: Set }
   for (const [h, names] of mcpRefs) {
     const a = ADAPTERS[h];
-    const orig = plan.rememberFile(a.mcpFile);
+    if (!mcpByFile.has(a.mcpFile)) {
+      mcpByFile.set(a.mcpFile, { mcpKey: a.mcpKey, harnesses: [], names: new Set() });
+    }
+    const bucket = mcpByFile.get(a.mcpFile);
+    bucket.harnesses.push(h);
+    for (const n of names) bucket.names.add(n);
+  }
+  const warned = new Set();   // env-warn dedupe shared across servers
+  for (const [mcpFile, bucket] of mcpByFile) {
+    const orig = plan.rememberFile(mcpFile);
     let doc = {};
     if (orig != null) {
-      try { doc = JSON.parse(orig); } catch (e) { die(`${a.mcpFile} already exists in the worktree and is not valid JSON: ${e.message}`); }
+      try { doc = JSON.parse(orig); } catch (e) { die(`${mcpFile} already exists in the worktree and is not valid JSON: ${e.message}`); }
     }
-    doc[a.mcpKey] = { ...(doc[a.mcpKey] || {}) };
-    for (const name of names)
-      doc[a.mcpKey][name] = expandEnvDeep(mcp[name], warn, `mcp server "${name}"`, warned);
-    plan.write(a.mcpFile, JSON.stringify(doc, null, 2) + "\n");
-    warn(`[agent-config] ${h}: ${names.size} mcp server(s) -> ${a.mcpFile}`);
+    doc[bucket.mcpKey] = { ...(doc[bucket.mcpKey] || {}) };
+    for (const name of bucket.names)
+      doc[bucket.mcpKey][name] = expandEnvDeep(mcp[name], warn, `mcp server "${name}"`, warned);
+    plan.write(mcpFile, JSON.stringify(doc, null, 2) + "\n");
+    warn(`[agent-config] ${bucket.harnesses.join("+")}: ${bucket.names.size} mcp server(s) -> ${mcpFile}`);
   }
 
-  // Section-channel skills, merged PER FILE (codex + opencode share AGENTS.md).
+  // Skills: deduplicate shared skillDir entries (e.g. agy + antigravity -> .agents/skills/<name>)
+  // and merge section-channel skills PER FILE (codex + opencode share AGENTS.md).
   const sectionSkills = new Map();   // file -> Map(name -> def)
+  const writtenSkillDirs = new Set(); // `${skillDir}/${name}` written in this plan
   for (const [h, names] of skillRefs) {
     const a = ADAPTERS[h];
     let wrote = 0;
@@ -266,10 +278,12 @@ export function materializeAgentConfig({ worktree, members, cfg, configDir, die,
       const def = skills[name];
       if (a.skillDir) {
         const rel = `${a.skillDir}/${name}`;
+        if (writtenSkillDirs.has(rel)) continue;
         if (existsSync(join(worktree, rel))) {
           warn(`[agent-config] ${rel} already exists in the worktree — keeping yours, skipping skill "${name}".`);
           continue;
         }
+        writtenSkillDirs.add(rel);
         plan.trackDir(rel);
         mkdirSync(join(worktree, rel), { recursive: true });
         if (def.path != null) {

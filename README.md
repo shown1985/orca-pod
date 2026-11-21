@@ -86,6 +86,7 @@ node .orca/flow.mjs --config flow-epic.json "#epic 构建报表中心"
 | `--allow-one-way-merge` | 经人工审批后放行单向门变更的自动合并 |
 | `--dedup-key <key>` | 启用跨进程防重复触发运行锁 |
 | `--ledger-home <dir>` | 指定仓库外账本目录（严禁位于 git 仓库内） |
+| `--open-status` / `--no-open-status` | 显式自动在浏览器打开 `status.html`（默认 `openStatus: false` 不自动弹窗，终端始终输出路径） |
 | `--status-preview` | 渲染样例状态看板（不启动 Agent） |
 | `--new` | 跳过历史恢复选择，直接开始新 Run |
 

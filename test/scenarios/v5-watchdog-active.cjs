@@ -24,7 +24,7 @@ module.exports = {
         c.materialize(task, "succeeded");
         return c.ok({
           deliveryId: "dlv-" + c.id(),
-          messages: [{ type: "worker_done", taskId: disp.task, payload: JSON.stringify({ outcome: "succeeded" }) }],
+          messages: [{ type: "worker_done", taskId: disp.task, dispatchId: disp.id, payload: JSON.stringify({ outcome: "succeeded" }) }],
         });
       }
       return c.ok({ messages: [] });

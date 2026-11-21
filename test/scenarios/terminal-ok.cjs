@@ -40,14 +40,16 @@ module.exports = {
         // the nudge engine correctly holds the step post-done for the missing
         // file and E2 would grind to the hard cap instead of settling green.
         c.materialize(c.state.tasks[task] || {}, "succeeded");
+        const disp = Object.values(c.state.dispatches).filter((d) => d.task === task).pop();
         return c.ok({ deliveryId: "dlv-" + c.id(),
-          messages: [{ type: "worker_done", taskId: task, payload: JSON.stringify({ outcome: "succeeded" }) }] });
+          messages: [{ type: "worker_done", taskId: task, ...(disp ? { dispatchId: disp.id } : {}), payload: JSON.stringify({ outcome: "succeeded" }) }] });
       }
       // No task= pasted (manual path never reached the paste — e.g. a degraded run fell back to cold-start): drain the default pendingDone queue so fallback failures stay crisp instead of hard-capping.
       const done = c.state.pendingDone.shift();
       if (!done) return c.ok({ messages: [] });
       c.ok({ deliveryId: "dlv-" + c.id(),
         messages: [{ type: "worker_done", taskId: done.task,
+          ...(done.dispatchId ? { dispatchId: done.dispatchId } : {}),
           payload: JSON.stringify(done.outcome == null ? {} : { outcome: done.outcome }) }] });
     },
   },

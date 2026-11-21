@@ -42,7 +42,9 @@ function main(argv) {
 
   let saved = false;
   const save = (code, j) => {
-    fs.writeFileSync(env.ORCA_FAKE_STATE, JSON.stringify(state));
+    const tmpState = `${env.ORCA_FAKE_STATE}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmpState, JSON.stringify(state));
+    fs.renameSync(tmpState, env.ORCA_FAKE_STATE);
     console.log(JSON.stringify(j));
     saved = true;
     process.exit(code);

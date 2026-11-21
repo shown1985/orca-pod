@@ -7455,6 +7455,373 @@ return out(0, { result: {} });
 });
 
 // ---------------------------------------------------------------------------
+// V18 — Round 10 Final Hardening Regression Suite (P0-01a outer kept_open & P0-01b recursive screenshots + exclusive no-follow temp files)
+// ---------------------------------------------------------------------------
+scenario("V18: Round 10 P0-01a outer kept_open on manual stop/release + P0-01b no-follow screenshots copy & exclusive O_CREAT|O_EXCL|O_NOFOLLOW temp writes", async () => {
+  const { lstatSync, symlinkSync } = await import("node:fs");
+  const {
+    collectAllReleaseStatuses,
+    collectAllStopStates,
+    createOrcaClient,
+    verifyManualStopAndReleaseReceipt,
+  } = await import("../.orca/lib/orca-cli.mjs");
+  const {
+    bindStepArtifactDispatchClaim,
+    syncInputsToIsolatedWorktree,
+    syncOutputsFromIsolatedWorktree,
+  } = await import("../.orca/worktree-isolation.mjs");
+  const {
+    verifyStepArtifact,
+    writeFileAtomicNoFollow,
+  } = await import("../.orca/gate-verify.mjs");
+
+  const tmpV18 = mkdtempSync(join(tmpdir(), "orca-v18-"));
+  dirsOfCurrentScenario.push(tmpV18);
+
+  // =========================================================================
+  // 1) P0-01a: Warm manual start where `worker-release` (or `worker-stop`) returns
+  //    outer `{ kept_open: true, result: { dispatchId: "disp-manual", status: "retained" } }`
+  //    MUST be rejected (`ok: false, ambiguous: true`, ZERO cold `worker-start` calls)!
+  //    Pure `retained` without `keptOpen`/`kept_open` MUST still succeed (`1` cold `worker-start`).
+  // =========================================================================
+  const mockLog18 = join(tmpV18, "orca-v18.jsonl");
+  const mockCli18 = join(tmpV18, "mock-orca-v18.cjs");
+  writeFileSync(mockCli18, `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const logFile = process.env.MOCK_V18_LOG;
+if (logFile) fs.appendFileSync(logFile, JSON.stringify({ args }) + "\\n");
+if (args.includes("--version")) { console.log("orca 1.0.0"); process.exit(0); }
+const key = args.slice(0, 2).join(" ");
+const mode = process.env.MOCK_V18_MODE || "rel_outer_kept_open";
+const out = (code, obj) => { console.log(JSON.stringify(obj)); process.exit(code); };
+if (key === "worktree current") return out(0, { result: { worktree: { path: process.env.MOCK_V18_WT } } });
+if (key === "terminal create") return out(0, { result: { terminal: { handle: "term-m18" } } });
+if (key === "terminal wait") return out(0, { result: { ready: true, terminal: { handle: "term-m18", preview: "claude > " } } });
+if (key === "terminal show") {
+  const closed = fs.existsSync(process.env.MOCK_V18_CLOSED_FLAG);
+  return out(0, { result: { terminal: { handle: "term-m18", status: closed ? "closed" : "running", closed, preview: "claude > " } } });
+}
+if (key === "terminal close") {
+  fs.writeFileSync(process.env.MOCK_V18_CLOSED_FLAG, "1");
+  return out(0, { result: { handle: "term-m18", closed: true, status: "closed" } });
+}
+if (key === "orchestration dispatch") {
+  if (args.includes("--dry-run")) return out(1, { error: "preamble fetch failed" });
+  return out(0, { result: { dispatchId: "disp-manual" } });
+}
+if (key === "orchestration worker-stop") {
+  if (mode === "stop_outer_kept_open") {
+    return out(0, { kept_open: true, result: { dispatchId: "disp-manual", state: "fenced" } });
+  }
+  return out(0, { result: { dispatchId: "disp-manual", state: "fenced" } });
+}
+if (key === "orchestration worker-release") {
+  if (mode === "rel_outer_kept_open") {
+    return out(0, { kept_open: true, result: { dispatchId: "disp-manual", status: "retained" } });
+  }
+  if (mode === "rel_dispatch_kept_open") {
+    return out(0, { result: { dispatchId: "disp-manual", status: "retained", dispatch: { kept_open: true } } });
+  }
+  return out(0, { result: { dispatchId: "disp-manual", status: "retained" } });
+}
+if (key === "orchestration worker-start") {
+  return out(0, { result: { dispatchId: "dc-18", state: "ready" } });
+}
+return out(0, { result: {} });
+`, { mode: 0o755 });
+
+  const wt18 = join(tmpV18, "wt-manual-18");
+  mkdirSync(join(wt18, ".orca", "artifacts"), { recursive: true });
+  const closedFlag18 = join(tmpV18, "term-closed-18.flag");
+  const prevOrca18 = process.env.ORCA_CLI_COMMAND;
+  const prevLog18 = process.env.MOCK_V18_LOG;
+  const prevMode18 = process.env.MOCK_V18_MODE;
+  const prevWt18 = process.env.MOCK_V18_WT;
+  const prevFlag18 = process.env.MOCK_V18_CLOSED_FLAG;
+  try {
+    process.env.ORCA_CLI_COMMAND = mockCli18;
+    process.env.MOCK_V18_LOG = mockLog18;
+    process.env.MOCK_V18_WT = wt18;
+    process.env.MOCK_V18_CLOSED_FLAG = closedFlag18;
+
+    const cli18 = createOrcaClient({
+      cfg: { defaults: { startRetries: 0, warmTerminal: true } },
+      opt: {},
+      objective: "v18-outer-kept-open",
+      autoRun: true,
+      agentOf: (s) => s.agent,
+      modelOf: (s) => s.model,
+      writeStatus: () => {},
+      log: () => {},
+      warn: () => {},
+      die: (m) => { throw new Error(m); },
+    });
+    cli18.setRunId("run-v18");
+
+    // (a) Exact Round-9 reproducer: outer `{ kept_open: true, result: { dispatchId: "disp-manual", status: "retained" } }` -> REJECTED!
+    process.env.MOCK_V18_MODE = "rel_outer_kept_open";
+    rmSync(mockLog18, { force: true });
+    rmSync(closedFlag18, { force: true });
+    const rRelOuter = cli18.startWorker(
+      { id: "s18a", title: "S18a", agent: "claude", model: "claude-sonnet-4-5" },
+      "task-18a",
+      `path:${wt18}`,
+      { worktreePath: wt18 }
+    );
+    const relOuterCalls = readFileSync(mockLog18, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    eq("V18 P0-01a warm manual release with outer kept_open=true + status=retained blocks coldStart (ok=false, ambiguous=true, 0 worker-start)",
+      [
+        collectAllReleaseStatuses({ kept_open: true, result: { dispatchId: "disp-manual", status: "retained" } }).hasExplicitKeptOpen,
+        rRelOuter.ok,
+        rRelOuter.ambiguous,
+        relOuterCalls.filter((c) => c.args[1] === "worker-start").length,
+      ],
+      [true, false, true, 0]);
+
+    // (b) Outer `kept_open: true` on manual `worker-stop` -> REJECTED!
+    process.env.MOCK_V18_MODE = "stop_outer_kept_open";
+    rmSync(mockLog18, { force: true });
+    rmSync(closedFlag18, { force: true });
+    const rStopOuter = cli18.startWorker(
+      { id: "s18b", title: "S18b", agent: "claude", model: "claude-sonnet-4-5" },
+      "task-18b",
+      `path:${wt18}`,
+      { worktreePath: wt18 }
+    );
+    const stopOuterCalls = readFileSync(mockLog18, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    eq("V18 P0-01a warm manual stop with outer kept_open=true + state=fenced blocks coldStart (ok=false, ambiguous=true, 0 worker-start)",
+      [
+        collectAllStopStates({ kept_open: true, result: { dispatchId: "disp-manual", state: "fenced" } }).hasExplicitKeptOpen,
+        rStopOuter.ok,
+        rStopOuter.ambiguous,
+        stopOuterCalls.filter((c) => c.args[1] === "worker-start").length,
+      ],
+      [true, false, true, 0]);
+
+    // (c) Nested `dispatch.kept_open: true` on manual `worker-release` -> REJECTED!
+    process.env.MOCK_V18_MODE = "rel_dispatch_kept_open";
+    rmSync(mockLog18, { force: true });
+    rmSync(closedFlag18, { force: true });
+    const rDispKept = cli18.startWorker(
+      { id: "s18c", title: "S18c", agent: "claude", model: "claude-sonnet-4-5" },
+      "task-18c",
+      `path:${wt18}`,
+      { worktreePath: wt18 }
+    );
+    const dispKeptCalls = readFileSync(mockLog18, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    const unitOuterKept = verifyManualStopAndReleaseReceipt((args) => {
+      if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "dm-u", state: "fenced" } } };
+      if (args[0] === "terminal" && args[1] === "close") return { ok: true, json: { result: { handle: "t-u", closed: true } } };
+      if (args[0] === "terminal" && args[1] === "show") return { ok: true, json: { result: { terminal: { handle: "t-u", status: "closed", closed: true } } } };
+      if (args[1] === "worker-release") return { ok: true, json: { kept_open: true, result: { dispatchId: "dm-u", status: "retained" } } };
+      return { ok: true, json: {} };
+    }, "dm-u", "t-u");
+    eq("V18 P0-01a nested dispatch.kept_open=true and unit outer kept_open=true are BOTH rejected with 0 cold worker-start",
+      [unitOuterKept.ok, rDispKept.ok, rDispKept.ambiguous, dispKeptCalls.filter((c) => c.args[1] === "worker-start").length],
+      [false, false, true, 0]);
+
+    // (d) Positive control: pure `retained` without `keptOpen`/`kept_open` after confirmed terminal close STILL enters `coldStart`!
+    process.env.MOCK_V18_MODE = "pure_retained";
+    rmSync(mockLog18, { force: true });
+    rmSync(closedFlag18, { force: true });
+    const rPure18 = cli18.startWorker(
+      { id: "s18d", title: "S18d", agent: "claude", model: "claude-sonnet-4-5" },
+      "task-18d",
+      `path:${wt18}`,
+      { worktreePath: wt18 }
+    );
+    const pure18Calls = readFileSync(mockLog18, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    eq("V18 P0-01a positive control: pure status=retained without keptOpen/kept_open proceeds to coldStart (ok=true, 1 worker-start)",
+      [rPure18.ok, rPure18.startMode, pure18Calls.filter((c) => c.args[1] === "worker-start").length],
+      [true, "cold", 1]);
+  } finally {
+    if (prevOrca18 === undefined) delete process.env.ORCA_CLI_COMMAND; else process.env.ORCA_CLI_COMMAND = prevOrca18;
+    if (prevLog18 === undefined) delete process.env.MOCK_V18_LOG; else process.env.MOCK_V18_LOG = prevLog18;
+    if (prevMode18 === undefined) delete process.env.MOCK_V18_MODE; else process.env.MOCK_V18_MODE = prevMode18;
+    if (prevWt18 === undefined) delete process.env.MOCK_V18_WT; else process.env.MOCK_V18_WT = prevWt18;
+    if (prevFlag18 === undefined) delete process.env.MOCK_V18_CLOSED_FLAG; else process.env.MOCK_V18_CLOSED_FLAG = prevFlag18;
+  }
+
+  // =========================================================================
+  // 2) P0-01b Probe 1: `screenshots` recursive copy MUST NEVER traverse a symlinked
+  //    destination subdirectory (`dst/screenshots/nested -> external`) AND MUST NEVER
+  //    copy a leaf or directory symlink from `src/screenshots`!
+  // =========================================================================
+  const extShotsVictim = join(tmpV18, "ext-shots-victim");
+  mkdirSync(extShotsVictim, { recursive: true });
+  const extShotSentinelPath = join(extShotsVictim, "shot.png");
+  const extShotSentinel = "EXTERNAL_SHOT_SENTINEL_DO_NOT_OVERWRITE";
+  writeFileSync(extShotSentinelPath, extShotSentinel);
+  const extSecretPath = join(tmpV18, "ext-secret.png");
+  writeFileSync(extSecretPath, "SECRET_DO_NOT_COPY");
+
+  const shotSrcWt = join(tmpV18, "shot-src-wt");
+  const shotDstWt = join(tmpV18, "shot-dst-wt");
+  mkdirSync(join(shotSrcWt, ".orca", "artifacts", "screenshots", "nested"), { recursive: true });
+  mkdirSync(join(shotSrcWt, ".orca", "artifacts", "screenshots", "clean-sub"), { recursive: true });
+  mkdirSync(join(shotDstWt, ".orca", "artifacts", "screenshots"), { recursive: true });
+
+  // Normal nested source file whose corresponding destination subdir is a symlink outside `shotDstWt`!
+  writeFileSync(join(shotSrcWt, ".orca", "artifacts", "screenshots", "nested", "shot.png"), "ATTACKER_OVERWRITE_PAYLOAD");
+  symlinkSync(extShotsVictim, join(shotDstWt, ".orca", "artifacts", "screenshots", "nested"));
+  // Leaf symlink inside `src/screenshots`!
+  symlinkSync(extSecretPath, join(shotSrcWt, ".orca", "artifacts", "screenshots", "leak.png"));
+  // Clean regular files at root and clean nested subdir that SHOULD copy normally!
+  writeFileSync(join(shotSrcWt, ".orca", "artifacts", "screenshots", "safe.png"), "SAFE_ROOT_PNG");
+  writeFileSync(join(shotSrcWt, ".orca", "artifacts", "screenshots", "clean-sub", "mobile.png"), "SAFE_MOBILE_PNG");
+
+  syncInputsToIsolatedWorktree({
+    step: { id: "ui-fix" },
+    wtDir: shotSrcWt,
+    stepWtDir: shotDstWt,
+    artDirRel: ".orca/artifacts",
+    byId: {},
+    effectiveReads: () => [],
+    allSteps: [],
+  });
+
+  eq("V18 P0-01b recursive screenshots copy preserves external sentinel under symlinked dst/screenshots/nested, skips src leaf symlink, and copies safe files",
+    [
+      readFileSync(extShotSentinelPath, "utf8") === extShotSentinel,
+      existsSync(join(shotDstWt, ".orca", "artifacts", "screenshots", "leak.png")),
+      readFileSync(join(shotDstWt, ".orca", "artifacts", "screenshots", "safe.png"), "utf8"),
+      readFileSync(join(shotDstWt, ".orca", "artifacts", "screenshots", "clean-sub", "mobile.png"), "utf8"),
+    ],
+    [true, false, "SAFE_ROOT_PNG", "SAFE_MOBILE_PNG"]);
+
+  // =========================================================================
+  // 3) P0-01b Probe 2: Exclusive `O_CREAT | O_EXCL | O_NOFOLLOW` temp files!
+  //    (a) Direct `writeFileAtomicNoFollow` with pre-occupied symlink `tempName`
+  //        throws `EEXIST` without modifying external sentinel or unlinking the symlink!
+  //    (b) With `Date.now` pinned, pre-existing leaf symlinks at all 3 legacy predictable
+  //        temp names (claim write, isolated output sync, gate promotion) NEVER overwrite
+  //        external sentinels and NEVER turn final targets into symlinks!
+  // =========================================================================
+  const atomicWt = join(tmpV18, "atomic-wt");
+  const atomicArt = join(atomicWt, ".orca", "artifacts");
+  mkdirSync(atomicArt, { recursive: true });
+  const extDirectSentinel = join(tmpV18, "ext-direct-sentinel.txt");
+  writeFileSync(extDirectSentinel, "DIRECT_SENTINEL_UNTOUCHED");
+  const occupiedTmpPath = join(atomicArt, ".tmp-collide-fixed");
+  symlinkSync(extDirectSentinel, occupiedTmpPath);
+
+  let directErrCode = null;
+  try {
+    writeFileAtomicNoFollow(atomicWt, atomicArt, join(atomicArt, "TARGET.md"), "NEW_DATA", {
+      tempName: ".tmp-collide-fixed",
+    });
+  } catch (e) {
+    directErrCode = e?.code || "THREW";
+  }
+  const occupiedRegTmp = join(atomicArt, ".tmp-collide-reg");
+  writeFileSync(occupiedRegTmp, "PREEXISTING_REGULAR_TMP");
+  let regErrCode = null;
+  try {
+    writeFileAtomicNoFollow(atomicWt, atomicArt, join(atomicArt, "TARGET.md"), "NEW_DATA", {
+      tempName: ".tmp-collide-reg",
+    });
+  } catch (e) {
+    regErrCode = e?.code || "THREW";
+  }
+  eq("V18 P0-01b writeFileAtomicNoFollow rejects pre-existing symlink or regular tempName via kernel EEXIST without touching external sentinel or unlinking occupant",
+    [
+      directErrCode,
+      regErrCode,
+      readFileSync(extDirectSentinel, "utf8"),
+      readFileSync(occupiedRegTmp, "utf8"),
+      lstatSync(occupiedTmpPath).isSymbolicLink(),
+      existsSync(join(atomicArt, "TARGET.md")),
+    ],
+    ["EEXIST", "EEXIST", "DIRECT_SENTINEL_UNTOUCHED", "PREEXISTING_REGULAR_TMP", true, false]);
+
+  // Now pin `Date.now` and plant pre-existing leaf symlinks at ALL 3 legacy predictable temp paths!
+  const pinnedNow = 1790000000123;
+  const origDateNow = Date.now;
+  const extClaimSentinel = join(tmpV18, "ext-claim-sentinel.txt");
+  const extSyncSentinel = join(tmpV18, "ext-sync-sentinel.txt");
+  const extPromoteSentinel = join(tmpV18, "ext-promote-sentinel.txt");
+  writeFileSync(extClaimSentinel, "CLAIM_SENTINEL_INTACT");
+  writeFileSync(extSyncSentinel, "SYNC_SENTINEL_INTACT");
+  writeFileSync(extPromoteSentinel, "PROMOTE_SENTINEL_INTACT");
+
+  const mainWt18 = join(tmpV18, "main-wt-18");
+  const mainArt18 = join(mainWt18, ".orca", "artifacts");
+  const isoWt18 = join(tmpV18, "iso-wt-18");
+  const isoArt18 = join(isoWt18, ".orca", "artifacts");
+  mkdirSync(join(mainArt18, ".dispatch-disp-18"), { recursive: true });
+  mkdirSync(join(isoArt18, ".dispatch-disp-18"), { recursive: true });
+
+  // Plant pre-existing symlinks at ALL 3 legacy predictable temp filenames!
+  symlinkSync(extClaimSentinel, join(mainArt18, `.dispatch-gate-claims.json.tmp.${process.pid}.${pinnedNow}`));
+  symlinkSync(extSyncSentinel, join(mainArt18, ".dispatch-disp-18", `.tmp-REVIEW.md-sync-${process.pid}-${pinnedNow}`));
+  symlinkSync(extPromoteSentinel, join(mainArt18, `.tmp-REVIEW.md-${process.pid}-${pinnedNow}`));
+
+  const validReview18 = [
+    "<!-- orca-dispatch: disp-18 -->",
+    "# Round 10 Gate Review",
+    "",
+    "All checks verified cleanly.",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\n");
+  writeFileSync(join(isoArt18, ".dispatch-disp-18", "REVIEW.md"), validReview18);
+
+  let promoRes18;
+  Date.now = () => pinnedNow;
+  try {
+    bindStepArtifactDispatchClaim(
+      mainWt18,
+      ".orca/artifacts",
+      { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+      { dispatchId: "disp-18", fsEpochMtimeMs: 0, clearedAtMs: 0 }
+    );
+    syncOutputsFromIsolatedWorktree({
+      step: { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+      stepWtDir: isoWt18,
+      wtDir: mainWt18,
+      artDirRel: ".orca/artifacts",
+      dispatchId: "disp-18",
+    });
+    promoRes18 = verifyStepArtifact(
+      { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+      mainArt18,
+      mainWt18,
+      20,
+      { mode: "settlement", dispatchId: "disp-18", clearedBeforeDispatch: true }
+    );
+  } finally {
+    Date.now = origDateNow;
+  }
+
+  const claimPath18 = join(mainArt18, ".dispatch-gate-claims.json");
+  const stagedPath18 = join(mainArt18, ".dispatch-disp-18", "REVIEW.md");
+  const canonPath18 = join(mainArt18, "REVIEW.md");
+  eq("V18 P0-01b pinned-clock claim write, isolated output staging, and gate promotion NEVER touch external symlink sentinels and produce regular files",
+    [
+      promoRes18.ok,
+      readFileSync(extClaimSentinel, "utf8"),
+      readFileSync(extSyncSentinel, "utf8"),
+      readFileSync(extPromoteSentinel, "utf8"),
+      !lstatSync(claimPath18).isSymbolicLink() && lstatSync(claimPath18).isFile(),
+      !lstatSync(stagedPath18).isSymbolicLink() && lstatSync(stagedPath18).isFile(),
+      !lstatSync(canonPath18).isSymbolicLink() && lstatSync(canonPath18).isFile(),
+      readFileSync(canonPath18, "utf8").includes("VERDICT: PASS"),
+    ],
+    [
+      true,
+      "CLAIM_SENTINEL_INTACT",
+      "SYNC_SENTINEL_INTACT",
+      "PROMOTE_SENTINEL_INTACT",
+      true,
+      true,
+      true,
+      true,
+    ]);
+});
+
+// ---------------------------------------------------------------------------
 (async () => {
   const t0 = Date.now();
   for (const s of scenarios) {

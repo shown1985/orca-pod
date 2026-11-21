@@ -385,13 +385,21 @@ export function collectAllStopStates(rawJson, resJson = null) {
   ]
     .filter((v) => typeof v === "string" && v.trim())
     .map((v) => v.trim().toLowerCase());
+  const hasExplicitKeptOpen = Boolean(
+    rj?.keptOpen === true || rj?.kept_open === true ||
+    rawJson?.keptOpen === true || rawJson?.kept_open === true ||
+    rj?.dispatch?.keptOpen === true || rj?.dispatch?.kept_open === true ||
+    rawJson?.dispatch?.keptOpen === true || rawJson?.dispatch?.kept_open === true
+  );
   const hasBooleanRetained = Boolean(
-    rj?.keptOpen === true || rj?.kept_open === true || rj?.retained === true ||
-    rawJson?.keptOpen === true || rawJson?.kept_open === true || rawJson?.retained === true
+    hasExplicitKeptOpen ||
+    rj?.retained === true || rawJson?.retained === true ||
+    rj?.dispatch?.retained === true || rawJson?.dispatch?.retained === true
   );
   return {
     states: [...new Set(rawStates)],
     procActions: [...new Set(rawProcActions)],
+    hasExplicitKeptOpen,
     hasBooleanRetained,
   };
 }
@@ -406,12 +414,20 @@ export function collectAllReleaseStatuses(rawJson, resJson = null) {
   ]
     .filter((v) => typeof v === "string" && v.trim())
     .map((v) => v.trim().toLowerCase());
+  const hasExplicitKeptOpen = Boolean(
+    rj?.keptOpen === true || rj?.kept_open === true ||
+    rawJson?.keptOpen === true || rawJson?.kept_open === true ||
+    rj?.dispatch?.keptOpen === true || rj?.dispatch?.kept_open === true ||
+    rawJson?.dispatch?.keptOpen === true || rawJson?.dispatch?.kept_open === true
+  );
   const hasBooleanRetained = Boolean(
-    rj?.keptOpen === true || rj?.kept_open === true || rj?.retained === true ||
-    rawJson?.keptOpen === true || rawJson?.kept_open === true || rawJson?.retained === true
+    hasExplicitKeptOpen ||
+    rj?.retained === true || rawJson?.retained === true ||
+    rj?.dispatch?.retained === true || rawJson?.dispatch?.retained === true
   );
   return {
     statuses: [...new Set(rawStatuses)],
+    hasExplicitKeptOpen,
     hasBooleanRetained,
   };
 }
@@ -456,9 +472,9 @@ export function hasUnconfirmedHelper(rawJson, resJson = null) {
  *   Per `orca orchestration worker-stop --help` & `worker-release --help`, a dispatch created by
  *   `orchestration dispatch` reports `fenced` on `worker-stop` and `retained` on `worker-release`.
  *   Therefore:
- *     1) Fence via `worker-stop` (mutually exclusive unanimous `fenced` OR confirmed stop states across ALL fields, zero unconfirmed helpers);
+ *     1) Fence via `worker-stop` (mutually exclusive unanimous `fenced` OR confirmed stop states across ALL fields, zero `keptOpen`/`kept_open` at outer/inner/dispatch levels, zero unconfirmed helpers);
  *     2) Explicitly close the manual terminal via `verifyManualTerminalClosed` (requiring positive close confirmation!);
- *     3) Release via `worker-release` (mutually exclusive unanimous `retained` OR unanimous `released`/`already_released`/`closed`/`not_found` across ALL fields ONLY AFTER step 2 proved terminal closure — contradictory mixes like `action=released, releaseStatus=retained` are REJECTED!).
+ *     3) Release via `worker-release` (mutually exclusive unanimous `retained` OR unanimous `released`/`already_released`/`closed`/`not_found` across ALL fields, zero `keptOpen`/`kept_open` at outer/inner/dispatch levels ONLY AFTER step 2 proved terminal closure!).
  */
 export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle) {
   if (!termHandle || !String(termHandle).trim()) {
@@ -468,10 +484,15 @@ export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle
     const stopRes = orcaFn(["orchestration", "worker-stop", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
     const stopJson = res(stopRes.json);
     const stopDispIds = collectReceiptDispatchIds(stopRes.json, stopJson);
-    const { states: stopStates, procActions, hasBooleanRetained: stopRetained } = collectAllStopStates(stopRes.json, stopJson);
+    const {
+      states: stopStates,
+      procActions,
+      hasExplicitKeptOpen: stopKeptOpen,
+      hasBooleanRetained: stopRetained,
+    } = collectAllStopStates(stopRes.json, stopJson);
     const liveHelper = hasUnconfirmedHelper(stopRes.json, stopJson);
     const idMatchedStop = stopDispIds.length > 0 && stopDispIds.every((id) => id === dispatchId);
-    const pureFenced = stopStates.length > 0 ? stopStates.every((s) => s === "fenced") : stopJson.fenced === true;
+    const pureFenced = !stopKeptOpen && (stopStates.length > 0 ? stopStates.every((s) => s === "fenced") : stopJson.fenced === true);
     const pureStopped = !stopRetained && stopStates.length > 0 && stopStates.every((s) => CONFIRMED_STOP_STATES.has(s));
     const unanimousFence = (pureFenced || pureStopped) &&
       procActions.every((a) => a !== "stop_unknown" && a !== "failed" && a !== "kept_open");
@@ -480,10 +501,8 @@ export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle
       stopRes.json &&
       idMatchedStop &&
       !liveHelper &&
-      unanimousFence &&
-      stopJson.keptOpen !== true &&
-      stopJson.kept_open !== true &&
-      stopRes.json?.keptOpen !== true
+      !stopKeptOpen &&
+      unanimousFence
     );
     if (!fencedOk) {
       return {
@@ -504,19 +523,21 @@ export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle
     const relRes = orcaFn(["orchestration", "worker-release", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
     const relJson = res(relRes.json);
     const relDispIds = collectReceiptDispatchIds(relRes.json, relJson);
-    const { statuses: relStatuses, hasBooleanRetained: relRetained } = collectAllReleaseStatuses(relRes.json, relJson);
+    const {
+      statuses: relStatuses,
+      hasExplicitKeptOpen: relKeptOpen,
+      hasBooleanRetained: relRetained,
+    } = collectAllReleaseStatuses(relRes.json, relJson);
     const idMatchedRel = relDispIds.length > 0 && relDispIds.every((id) => id === dispatchId);
-    const pureRetained = relStatuses.length > 0 && relStatuses.every((s) => s === "retained");
+    const pureRetained = !relKeptOpen && relStatuses.length > 0 && relStatuses.every((s) => s === "retained");
     const pureReleased = !relRetained && relStatuses.length > 0 && relStatuses.every((s) => CONFIRMED_RELEASE_STATES.has(s));
     const unanimousManualRel = pureRetained || pureReleased;
     const relOk = Boolean(
       relRes.ok &&
       relRes.json &&
       idMatchedRel &&
-      unanimousManualRel &&
-      relJson.keptOpen !== true &&
-      relJson.kept_open !== true &&
-      relRes.json?.keptOpen !== true
+      !relKeptOpen &&
+      unanimousManualRel
     );
     if (!relOk) {
       return {

@@ -15,7 +15,23 @@
 //
 // Zero external dependencies (Node builtins only).
 
-import { existsSync, readFileSync, statSync, lstatSync, realpathSync, copyFileSync, renameSync, rmSync, utimesSync, mkdirSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  futimesSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
+import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -592,6 +608,143 @@ export function assertSafePathFromRoot(trustedRootDir, containerDir, targetPath,
   }
 }
 
+const O_NOFOLLOW_FLAG = constants.O_NOFOLLOW ?? 0;
+
+/**
+ * P0-01b: Read a regular file inside `containerDir` (anchored at `walkRoot`) using
+ * `O_RDONLY | O_NOFOLLOW` + `fstatSync(fd).isFile()`, rejecting symlinks, directories,
+ * FIFOs, sockets, and devices without ever following links.
+ */
+export function readFileNoFollow(walkRoot, containerDir, srcPath, { encoding = null, label = "[gate-verify]" } = {}) {
+  assertSafePathFromRoot(walkRoot, containerDir, srcPath, label);
+  const lst = lstatSafe(srcPath);
+  if (!lst) {
+    const err = new Error(`ENOENT: no such file "${srcPath}"`);
+    err.code = "ENOENT";
+    throw err;
+  }
+  if (lst.isSymbolicLink() || !lst.isFile()) {
+    const err = new Error(`${label} symlink or non-regular file rejected: "${srcPath}"`);
+    err.code = "ELOOP";
+    throw err;
+  }
+  let fd = null;
+  try {
+    fd = openSync(srcPath, constants.O_RDONLY | O_NOFOLLOW_FLAG);
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      const err = new Error(`${label} non-regular file rejected: "${srcPath}"`);
+      err.code = "EINVAL";
+      throw err;
+    }
+    const buf = readFileSync(fd);
+    return { buf, text: encoding ? buf.toString(encoding) : null, stat: st };
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch {}
+    }
+  }
+}
+
+/**
+ * P0-01b: Atomically write `targetPath` inside `containerDir` (anchored at `walkRoot`) via
+ * an unpredictable sibling temp file opened exclusively with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`.
+ * Refuses pre-occupied temp names (`EEXIST` — NEVER follows or unlinks an existing path!),
+ * refuses symlink/directory targets, and re-verifies full root containment before `renameSync`.
+ */
+export function writeFileAtomicNoFollow(
+  walkRoot,
+  containerDir,
+  targetPath,
+  data,
+  { mode = 0o644, atime = null, mtime = null, label = "[gate-verify]", tempName = null } = {}
+) {
+  assertSafePathFromRoot(walkRoot, containerDir, targetPath, label);
+  const parentDir = dirname(resolve(targetPath));
+  mkdirSync(parentDir, { recursive: true });
+  assertSafePathFromRoot(walkRoot, containerDir, targetPath, label);
+  const existingDstLst = lstatSafe(targetPath);
+  if (existingDstLst && (existingDstLst.isSymbolicLink() || existingDstLst.isDirectory())) {
+    throw new Error(`${label} refusing to overwrite symlink or directory at "${targetPath}"`);
+  }
+
+  const leafTmp = tempName
+    ? basename(String(tempName))
+    : `.tmp-${basename(targetPath)}-${process.pid}-${Date.now()}-${randomBytes(12).toString("hex")}`;
+  const tmpPath = join(parentDir, leafTmp);
+  if (!leafTmp || leafTmp === "." || leafTmp === ".." || dirname(resolve(tmpPath)) !== parentDir || !isStrictlyInsideDir(containerDir, tmpPath)) {
+    throw new Error(`${label} invalid temporary path "${tmpPath}" outside container "${containerDir}"`);
+  }
+
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data), "utf8");
+  let fd = null;
+  let createdTmp = false;
+  try {
+    // Kernel-atomic exclusive creation: fails with `EEXIST` if ANY regular file, directory,
+    // live symlink, or dangling symlink already occupies `tmpPath`, without ever following it!
+    fd = openSync(tmpPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW_FLAG, mode);
+    createdTmp = true;
+    const tmpFdStat = fstatSync(fd);
+    if (!tmpFdStat.isFile()) {
+      throw new Error(`${label} temporary fd is not a regular file at "${tmpPath}"`);
+    }
+    let offset = 0;
+    while (offset < buf.length) {
+      offset += writeSync(fd, buf, offset, buf.length - offset);
+    }
+    if (atime != null && mtime != null) {
+      futimesSync(fd, atime, mtime);
+    }
+    closeSync(fd);
+    fd = null;
+
+    assertSafePathFromRoot(walkRoot, containerDir, targetPath, label);
+    assertSafePathFromRoot(walkRoot, containerDir, tmpPath, label);
+    const postDstLst = lstatSafe(targetPath);
+    if (postDstLst && (postDstLst.isSymbolicLink() || postDstLst.isDirectory())) {
+      throw new Error(`${label} refusing to replace symlink or directory at "${targetPath}"`);
+    }
+    const postTmpLst = lstatSafe(tmpPath);
+    if (!postTmpLst || postTmpLst.isSymbolicLink() || !postTmpLst.isFile()) {
+      throw new Error(`${label} temporary file changed unexpectedly before rename at "${tmpPath}"`);
+    }
+    renameSync(tmpPath, targetPath);
+    createdTmp = false;
+  } catch (e) {
+    if (fd !== null) {
+      try { closeSync(fd); } catch {}
+    }
+    if (createdTmp) {
+      try {
+        const curLst = lstatSafe(tmpPath);
+        if (curLst && !curLst.isSymbolicLink() && curLst.isFile()) {
+          unlinkSync(tmpPath);
+        }
+      } catch {}
+    }
+    throw e;
+  }
+}
+
+export function copyFileAtomicNoFollow(
+  srcWalkRoot,
+  srcContainerDir,
+  srcPath,
+  dstWalkRoot,
+  dstContainerDir,
+  dstPath,
+  { preserveMtime = false, label = "[worktree-isolation]", tempName = null } = {}
+) {
+  const { buf, stat } = readFileNoFollow(srcWalkRoot, srcContainerDir, srcPath, { label });
+  writeFileAtomicNoFollow(dstWalkRoot, dstContainerDir, dstPath, buf, {
+    mode: (stat.mode & 0o777) || 0o644,
+    atime: preserveMtime ? stat.atime : null,
+    mtime: preserveMtime ? stat.mtime : null,
+    label,
+    tempName,
+  });
+}
+
 /**
  * Full artifact check for a pipeline step: strict directory containment (`artDir` & `.dispatch-<id>`),
  * symlink rejection from trusted worktree root, existence, minBytes, writer-attested per-dispatch
@@ -637,7 +790,7 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
   const verifyDispatchClaimRecord = (stMtimeMs) => {
     if (!opts.dispatchId) return { ok: true };
     const claimFile = join(artDir, ".dispatch-gate-claims.json");
-    if (hasSymlinkInPath(walkRoot, claimFile).bad) {
+    if (!verifySafePathFromRoot(walkRoot, artDir, claimFile).ok) {
       return {
         ok: false,
         reason: `symlink rejected on dispatch provenance claim file for ${step.writes}`,
@@ -652,7 +805,8 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
     }
     let claim = null;
     try {
-      const claims = JSON.parse(readFileSync(claimFile, "utf8"));
+      const { text: claimRaw } = readFileNoFollow(walkRoot, artDir, claimFile, { encoding: "utf8", label: "[gate-verify]" });
+      const claims = JSON.parse(claimRaw);
       claim = claims?.[step.writes] || null;
     } catch {
       claim = null;
@@ -674,10 +828,10 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
 
   // P0-01: Inspect dispatch-scoped candidate IN-PLACE FIRST (rejecting symlinks along the
   // entire path chain and wrong-ID/invalid content BEFORE touching canonical `<writes>`!),
-  // then atomically promote via basename temp + rename!
+  // then atomically promote via exclusive `O_CREAT | O_EXCL | O_NOFOLLOW` temp + rename!
   if (isSettlement && dispatchScopedPath) {
-    const scopedChain = hasSymlinkInPath(walkRoot, dispatchScopedPath);
-    if (scopedChain.bad) {
+    const scopedChain = verifySafePathFromRoot(walkRoot, dispatchScopedDir, dispatchScopedPath);
+    if (!scopedChain.ok) {
       return { ok: false, reason: scopedChain.reason };
     }
     const scopedLst = lstatSafe(dispatchScopedPath);
@@ -698,7 +852,11 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
       if (!claimRes.ok) return claimRes;
 
       let scopedText = "";
-      try { scopedText = readFileSync(dispatchScopedPath, "utf8"); } catch (e) { return { ok: false, reason: `read failed: ${e.message}` }; }
+      try {
+        ({ text: scopedText } = readFileNoFollow(walkRoot, dispatchScopedDir, dispatchScopedPath, { encoding: "utf8", label: "[gate-verify]" }));
+      } catch (e) {
+        return { ok: false, reason: `read failed: ${e.message}` };
+      }
       const writerIds = extractWriterAttestedDispatchIds(scopedText);
       if (writerIds.some((id) => id !== opts.dispatchId)) {
         const bad = writerIds.find((id) => id !== opts.dispatchId);
@@ -719,27 +877,21 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
         if (!contentRes.ok) return contentRes;
       }
 
-      // All checks passed in-place: verify entire canonical destination path from `walkRoot` has zero symlinks, then atomically promote!
-      const canonChain = hasSymlinkInPath(walkRoot, canonicalPath);
-      if (canonChain.bad) {
-        return { ok: false, reason: canonChain.reason };
-      }
-      mkdirSync(dirname(canonicalPath), { recursive: true });
-      const promoteTmp = join(dirname(canonicalPath), `.tmp-${basename(canonicalPath)}-${process.pid}-${Date.now()}`);
+      // All checks passed in-place: atomically promote via exclusive no-follow temp file!
       try {
-        copyFileSync(dispatchScopedPath, promoteTmp);
-        try { utimesSync(promoteTmp, scopedLst.atime, scopedLst.mtime); } catch {}
-        renameSync(promoteTmp, canonicalPath);
+        copyFileAtomicNoFollow(walkRoot, dispatchScopedDir, dispatchScopedPath, walkRoot, artDir, canonicalPath, {
+          preserveMtime: true,
+          label: "[gate-verify]",
+        });
       } catch (e) {
-        try { rmSync(promoteTmp, { force: true }); } catch {}
         return { ok: false, reason: `atomic promotion of ${step.writes} failed: ${e.message}` };
       }
       return contentRes;
     }
   }
 
-  const canonPathCheck = hasSymlinkInPath(walkRoot, canonicalPath);
-  if (canonPathCheck.bad) {
+  const canonPathCheck = verifySafePathFromRoot(walkRoot, artDir, canonicalPath);
+  if (!canonPathCheck.ok) {
     return { ok: false, reason: canonPathCheck.reason };
   }
   const filePath = canonicalPath;
@@ -770,7 +922,11 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
     return { ok: true, reason: null };
   }
   let text = "";
-  try { text = readFileSync(filePath, "utf8"); } catch (e) { return { ok: false, reason: `read failed: ${e.message}` }; }
+  try {
+    ({ text } = readFileNoFollow(walkRoot, artDir, filePath, { encoding: "utf8", label: "[gate-verify]" }));
+  } catch (e) {
+    return { ok: false, reason: `read failed: ${e.message}` };
+  }
   if (isSettlement && opts.dispatchId) {
     const writerIds = extractWriterAttestedDispatchIds(text);
     if (writerIds.some((id) => id !== opts.dispatchId)) {

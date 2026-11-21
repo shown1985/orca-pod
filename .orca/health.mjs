@@ -99,6 +99,10 @@ export function evaluateMemberHealth(h, obs) {
     markTurnStart(`artifact:bytes=${obs.artifactSize}`);
     effectiveProgress = true;
   }
+  if (obs.gitChanged) {
+    markTurnStart("git:worktree_changed");
+    effectiveProgress = true;
+  }
   if (obs.dispatchStatus && SETTLED_DISPATCH_RE.test(String(obs.dispatchStatus))) {
     markTurnStart(`dispatch:settled=${obs.dispatchStatus}`);
   }

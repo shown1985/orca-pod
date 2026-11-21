@@ -38,6 +38,10 @@ All pipeline behavior lives in `.orca/flow.config.json` (or any `--config <file>
 | `turnStartEscalateMs` | `600000` | Window before cleanly stopping an unobserved dispatch |
 | `ledgerHome` | OS data dir | Custom out-of-repo ledger root (must be outside any git repo) |
 | `mergeDanger` | built-in | Threshold overrides (`maxFiles`, `maxLines`, `extraOneWayPatterns`) |
+| `watchdog` | enabled | Activity-aware supervisor: `extendOnActivity`, `stallTimeoutMs`, `loopThreshold`, `maxRuntimeMs`, `fallbackOnGatewayError`, `fallbackOnLoop`, `fallbackOnStall`, `fallbackOnPromptBlocked` |
+| `preflight` | enabled | Pre-dispatch endpoint check: `timeoutMs`, `autoDetectOpencodeEndpoints` (auto-probes localhost `opencode.json` providers like Magpie `127.0.0.1:3425`) |
+| `fallback` / `agentFallbacks` | `null` | Default or per-agent fallback candidate(s) `{ agent, model, effort }` used on preflight failure or Watchdog anomaly |
+| `issueTracking` | `"auto"` | GitHub/Gitea Issue traceability: `mode` (`"auto" \| true \| false`), `provider` (`"auto" \| "gh" \| "tea"`), `epicIssue`, `closeOnPr` |
 
 ---
 
@@ -54,7 +58,9 @@ All pipeline behavior lives in `.orca/flow.config.json` (or any `--config <file>
 | `gate` / `interactive` | Manual-mode approval gate / interview protocol (when `autoRun: false`) |
 | `skills` / `mcp` | Arrays of registry names materialized into the step's worktree and restored afterward |
 | `verify` | Hard gate checks: `{ requireVerdict: "PASS", requireContractCommit: true, requireMergedTasks: true, mergeDangerCheck: true }` |
-| `spec` | Prompt template supporting `{out}`, `{reads}`, `{tasks}`, `{targetBranch}`, `{protectedBranches}`, `{worktreesManifest}`, `{mergeDangerReport}` |
+| `fallback` / `fallbacks` / `preflight` | Per-step fallback worker chain (`{ agent, model, effort }`) and preflight endpoint check (`{ tcp, url, timeoutMs }`) |
+| `watchdog` | Per-step Watchdog overrides (e.g. `stallTimeoutMs`, `loopThreshold`, `maxRuntimeMs`) |
+| `spec` | Prompt template supporting `{out}`, `{reads}`, `{tasks}`, `{targetBranch}`, `{protectedBranches}`, `{worktreesManifest}`, `{mergeDangerReport}`, `{epicIssue}`, `{issueRefs}`, `{issueCloses}`, `{issueTraceability}` |
 
 ---
 
@@ -93,6 +99,25 @@ node .orca/ledger.mjs pending
 # Check or release a --dedup-key lock
 node .orca/ledger.mjs check-lock --dedup-key <key> --repo .
 ```
+
+---
+
+## 5.5 Watchdog, Fallback, `agy` Trust, Issue Sync & CI/CD Generator (v0.5.0)
+
+- **Watchdog**: Active workers making git, file, artifact, or non-looping terminal progress automatically extend their runtime deadline instead of being killed by a fixed 600s cap. Dead-loops, true stalls, interactive/trust prompt blocks (`agent_prompt_blocked`), and gateway disconnects (`ECONNREFUSED`) are diagnosed, recorded in the ledger, and trigger automatic fallback when configured.
+- **Pre-flight & Fallback + `agy` Isolated Worktree Compatibility**: Before dispatching, `preflight.mjs` probes configured TCP/HTTP endpoints (and auto-discovered localhost `opencode.json` gateways such as Magpie `127.0.0.1:3425`) and seamlessly downgrades to the configured fallback worker (e.g. `agy` with `claude-sonnet-5-5` + `medium`), recording the downgrade in the out-of-repo ledger. When launching `agy` / `antigravity` in an isolated worktree, `orca-cli.mjs` automatically injects session-scoped `--settings '{"trustedWorkspaces":["<worktreeDir>"]}'` without mutating global `~/.gemini/antigravity-cli/settings.json`.
+- **GitHub/Gitea Issue + PR Traceability**:
+  ```bash
+  node .orca/issue-tracker.mjs status
+  node .orca/flow.mjs --epic-issue 42 "#feat Continue Epic"
+  node .orca/flow.mjs --no-issues "#hotfix Quick local fix"
+  ```
+- **Stack-Aware CI & Intranet Self-Hosted Runner CD**:
+  ```bash
+  node .orca/ci-generator.mjs --detect
+  node .orca/ci-generator.mjs --write --self-hosted-cd --health-url http://127.0.0.1:8000/health
+  node .orca/flow.mjs --generate-ci --self-hosted-cd
+  ```
 
 ---
 

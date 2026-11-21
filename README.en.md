@@ -23,7 +23,12 @@ A lightweight, governance-hardened multi-agent SDLC orchestrator for **Orca ADE*
    - **One-Way Door Merge Danger Guard** (`.orca/merge-danger.mjs`)
    - **`turnStart` Health State Machine** (`.orca/health.mjs`)
    - **Out-of-Repo Durable Run Ledger & Anti-Collision Lock** (`.orca/ledger.mjs`)
-4. **Full Observability & Extensibility**
+4. **v0.5 Production Resilience & Full Traceability**
+   - **Activity-Aware Watchdog (`.orca/watchdog.mjs`)**: Replaces fixed 600s hard kills. Monitors terminal output, worktree git/file diffs, and artifact growth — extending active workers while catching **output dead-loops**, **stalls**, **prompt/trust blocks (`agent_prompt_blocked`)**, and **gateway disconnects (`ECONNREFUSED`)** with clear diagnostics and automatic fallback.
+   - **Primary/Fallback Pre-Flight + `agy` Isolated Worktree Trust (`.orca/preflight.mjs`)**: Probes local gateways (including auto-discovered localhost `opencode.json` endpoints like Magpie `127.0.0.1:3425`) prior to dispatch, downgrades seamlessly to configured fallbacks (recording to ledger), and injects session-scoped `--settings '{"trustedWorkspaces":["<worktreeDir>"]}'` for `agy` without mutating global settings.
+   - **GitHub / Gitea Issue-to-PR Traceability (`.orca/issue-tracker.mjs`)**: Auto-enabled when `gh`/`tea` + remote exist; creates/links Epic & sub-task Issues from planning outputs, records them in `ISSUES.json` + ledger, and injects `Closes #N` / `Refs #N` into PR steps.
+   - **Stack-Aware CI & Intranet Self-Hosted CD Generator (`.orca/ci-generator.mjs`)**: Detects Python, Node/Vue/Vite, Go, Rust, and Docker Compose (including hybrid multi-dir repos) to emit executable CI plus optional outbound-HTTPS Self-Hosted Runner CD with automated post-deploy health checks.
+5. **Full Observability & Extensibility**
    - Offline live status dashboard (`status.html` + JSONP artifact viewer, `--status-preview`), run history archiving/resume, Claude/Codex token usage reporting (`USAGE.md`), webhook notifications (`.orca/notify.json`), and per-step Skills/MCP materialization (`.orca/agent-config.mjs`).
 
 ---

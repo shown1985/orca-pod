@@ -3,10 +3,52 @@
 
 import { spawnSync } from "node:child_process";
 import readline from "node:readline";
+import { WATCHDOG_PARKED_PROMPTS, detectGatewayDisconnect, detectPromptBlocked } from "../watchdog.mjs";
 
 export const IS_WIN = process.platform === "win32";
 export const MODEL_FLAG_RE = /(^|\s)(--model|-m)(\s|=|$)/;
+export const EFFORT_FLAG_RE = /(^|\s)--effort(\s|=|$)/;
 export const isKiroCmd = (a) => a === "kiro-cli" || a.startsWith("kiro-cli ");
+export const isAgyCmd = (a) => /^(?:agy|antigravity)(?:\s|$)/.test(String(a || "").trim());
+
+/**
+ * Build a session-scoped `--settings '{"trustedWorkspaces":[...]}'` CLI argument
+ * for Antigravity (`agy`) so isolated worktrees bypass the workspace-trust modal
+ * ("Do you trust the contents of this project?") without mutating global settings.json.
+ */
+export function buildAgySettingsArg(trustedDirs, { isWin = IS_WIN } = {}) {
+  const dirs = [...new Set((Array.isArray(trustedDirs) ? trustedDirs : [trustedDirs]).map((d) => String(d || "").trim()).filter(Boolean))];
+  if (!dirs.length) return "";
+  const json = JSON.stringify({ trustedWorkspaces: dirs });
+  if (isWin) return `--settings "${json.replace(/"/g, '\\"')}"`;
+  return `--settings '${json.replace(/'/g, "'\\''")}'`;
+}
+
+export function buildAgentCommand(agent, model = null, { autoRun = true, effort = null, worktreePath = null, extraTrustedDirs = [], warn = () => {}, isWin = IS_WIN } = {}) {
+  let cmd = String(agent || "").trim();
+  if (model && !MODEL_FLAG_RE.test(cmd) && !isKiroCmd(cmd)) cmd += ` --model ${model}`;
+  else if (model && isKiroCmd(cmd) && !MODEL_FLAG_RE.test(cmd)) warn(`step model "${model}" ignored: kiro-cli has no model selection.`);
+
+  if (isAgyCmd(cmd)) {
+    if (effort && !EFFORT_FLAG_RE.test(cmd)) cmd += ` --effort ${effort}`;
+    if (autoRun && !cmd.includes("--dangerously-skip-permissions") && !/(^|\s)--mode(\s|=|$)/.test(cmd)) {
+      cmd += " --dangerously-skip-permissions";
+    }
+    const trustDirs = [worktreePath, ...(extraTrustedDirs || [])].filter(Boolean);
+    if (trustDirs.length && !cmd.includes("--settings")) {
+      const settingsArg = buildAgySettingsArg(trustDirs, { isWin });
+      if (settingsArg) cmd += ` ${settingsArg}`;
+    }
+    return cmd;
+  }
+
+  const isClaude = cmd === "claude" || cmd.startsWith("claude ");
+  if (!isClaude) return cmd;
+  if (autoRun && !cmd.includes("--permission-mode") && !cmd.includes("--dangerously-skip-permissions"))
+    cmd += " --permission-mode bypassPermissions";
+  if (!autoRun) return cmd;
+  return isWin ? `cmd /c "set CLAUDE_AFK_TIMEOUT_MS=60000&& ${cmd}"` : `env CLAUDE_AFK_TIMEOUT_MS=60000 ${cmd}`;
+}
 
 export const pick = (o, keys) => { for (const k of keys) if (o && o[k] != null) return o[k]; };
 export const res = (j) => (j && j.result) ? j.result : (j || {});
@@ -48,15 +90,8 @@ export function promptChoice(question) {
   });
 }
 
-const PARKED_PROMPTS = [
-  { sig: "requires confirmation for this command", label: "a permission-rule confirmation" },
-  { sig: "Do you want to proceed?", label: "a permission confirmation" },
-  { sig: "Quick safety check", label: "the folder-trust check" },
-  { sig: "Yes, I trust this folder", label: "the folder-trust check" },
-  { sig: "Update available", label: "a CLI update prompt" },
-];
 export const parkedPromptOf = (preview) =>
-  typeof preview === "string" ? PARKED_PROMPTS.find((p) => preview.includes(p.sig)) || null : null;
+  typeof preview === "string" ? WATCHDOG_PARKED_PROMPTS.find((p) => preview.includes(p.sig)) || null : null;
 
 export function outcomeOf(done) {
   if (!done) return null;
@@ -195,21 +230,21 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     return wtPath;
   }
 
-  function agentCommand(agent, model = null) {
-    if (model && !MODEL_FLAG_RE.test(agent) && !isKiroCmd(agent)) agent += ` --model ${model}`;
-    else if (model && isKiroCmd(agent) && !MODEL_FLAG_RE.test(agent)) warn(`step model "${model}" ignored: kiro-cli has no model selection.`);
-    const isClaude = agent === "claude" || agent.startsWith("claude ");
-    if (!isClaude) return agent;
-    let cmd = agent;
-    if (autoRun && !cmd.includes("--permission-mode") && !cmd.includes("--dangerously-skip-permissions"))
-      cmd += " --permission-mode bypassPermissions";
-    if (!autoRun) return cmd;
-    return IS_WIN ? `cmd /c "set CLAUDE_AFK_TIMEOUT_MS=60000&& ${cmd}"` : `env CLAUDE_AFK_TIMEOUT_MS=60000 ${cmd}`;
+  function agentCommand(agent, model = null, { effort = null, worktreePath = null } = {}) {
+    return buildAgentCommand(agent, model, { autoRun, effort, worktreePath, warn, isWin: IS_WIN });
   }
 
-  function warmTerminal(agent, model = null, wtSelector = null) {
+  function resolveEffectiveWtPath(wtSelector, explicitPath) {
+    if (explicitPath) return explicitPath;
+    if (wtSelector && wtSelector.startsWith("path:")) return wtSelector.slice("path:".length);
+    return resolveWorktreePath(true);
+  }
+
+  function warmTerminal(agent, model = null, wtSelector = null, { effort = null, worktreePath = null } = {}) {
     const startedAt = Date.now();
-    const c = orca(["terminal", "create", "--worktree", wtSelector || resolveWorktree(), "--command", agentCommand(agent, model)]);
+    const effWtPath = resolveEffectiveWtPath(wtSelector, worktreePath);
+    const cmd = agentCommand(agent, model, { effort, worktreePath: effWtPath });
+    const c = orca(["terminal", "create", "--worktree", wtSelector || resolveWorktree(), "--command", cmd]);
     const cr = res(c.json);
     const handle = pick(cr, ["handle", "terminalHandle"]) || pick(cr.terminal || {}, ["handle"]);
     if (!c.ok || !handle) { warn(`terminal create ('${agent}') failed: ${c.stderr || c.raw || "no handle"}; cold-starting instead.`); return null; }
@@ -232,8 +267,11 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     return null;
   }
 
-  function manualStart(step, taskId, wtSelector = null) {
-    const term = warmTerminal(agentOf(step), modelOf(step), wtSelector);
+  function manualStart(step, taskId, wtSelector = null, launchOpts = {}) {
+    const effAgent = launchOpts.agentOverride ?? agentOf(step);
+    const effModel = launchOpts.modelOverride !== undefined ? launchOpts.modelOverride : modelOf(step);
+    const effEffort = launchOpts.effortOverride !== undefined ? launchOpts.effortOverride : (step.effort || null);
+    const term = warmTerminal(effAgent, effModel, wtSelector, { effort: effEffort, worktreePath: launchOpts.worktreePath || null });
     if (!term) return null;
     const d = orca(["orchestration", "dispatch", "--task", taskId, "--to", term, "--run", runId]);
     const dr = res(d.json);
@@ -256,7 +294,7 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
         sleepMs(4000);
         writeStatus();
         const pv = previewOf(term);
-        if (pv == null || before == null || pv !== before) return { dispatchId, terminal: term };
+        if (pv == null || before == null || pv !== before) return { ok: true, dispatchId, terminal: term };
       }
       if (attempt < SEND_ATTEMPTS) {
         const nudge = attempt === 1;
@@ -272,13 +310,15 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     return null;
   }
 
-  function coldStart(step, taskId, wtSelector = null) {
+  function coldStart(step, taskId, wtSelector = null, launchOpts = {}) {
     let retryOf = null;
-    const model = modelOf(step);
+    const effAgent = launchOpts.agentOverride ?? agentOf(step);
+    const model = launchOpts.modelOverride !== undefined ? launchOpts.modelOverride : modelOf(step);
+    const effort = launchOpts.effortOverride !== undefined ? launchOpts.effortOverride : (step.effort || null);
     for (let attempt = 0; attempt <= START_RETRIES; attempt++) {
-      const args = ["orchestration", "worker-start", "--task", taskId, "--run", runId, "--worktree", wtSelector || resolveWorktree(), "--agent", agentOf(step)];
+      const args = ["orchestration", "worker-start", "--task", taskId, "--run", runId, "--worktree", wtSelector || resolveWorktree(), "--agent", effAgent];
       if (model) args.push("--model", model);
-      if (step.effort) args.push("--effort", step.effort);
+      if (effort) args.push("--effort", effort);
       if (step.startTimeoutMs) args.push("--timeout-ms", String(step.startTimeoutMs));
       if (retryOf) args.push("--retry-of", retryOf);
       const r = orca(args);
@@ -286,22 +326,27 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       const dispatchId = pick(result, ["dispatchId", "dispatch_id"]);
       const state = pick(result, ["state"]);
       const receiptTurnStart = pick(result, ["turnStart", "turn_start"]) || null;
-      if (r.ok && (state === "ready" || !state)) return { dispatchId, terminal: null, dispatchState: state || null, receiptTurnStart };
+      if (r.ok && (state === "ready" || !state)) return { ok: true, dispatchId, terminal: null, dispatchState: state || null, receiptTurnStart };
       const lastError = pick(result, ["lastError"]) || r.stderr || "unknown error";
       const failedStage = pick(result, ["failedStage", "stage"]);
       if (dispatchId && state === "failed") orca(["orchestration", "worker-release", "--dispatch", dispatchId]);
-      if (attempt < START_RETRIES) {
+      const gwErr = Boolean(detectGatewayDisconnect(String(lastError) + " " + String(r.raw || "")));
+      const pbErr = Boolean(detectPromptBlocked(String(lastError) + " " + String(r.raw || "")));
+      if (attempt < START_RETRIES && !gwErr) {
         warn(`worker-start '${step.title}' not ready (stage=${failedStage}, error=${lastError}). Retrying via --retry-of (attempt ${attempt + 1}/${START_RETRIES})...`);
         retryOf = dispatchId || retryOf;
         sleepMs(START_RETRY_DELAY_MS);
         continue;
       }
+      if (launchOpts.allowError) {
+        return { ok: false, dispatchId: dispatchId || null, terminal: null, error: lastError, failedStage, gatewayError: gwErr, promptBlocked: pbErr, raw: r.raw || r.stderr };
+      }
       die(`worker-start '${step.title}' failed after ${attempt + 1} attempt(s): stage=${failedStage} error=${lastError}. Raw: ${r.raw || r.stderr}`);
     }
   }
 
-  function startWorker(step, taskId, wtSelector = null) {
-    return manualStart(step, taskId, wtSelector) || coldStart(step, taskId, wtSelector);
+  function startWorker(step, taskId, wtSelector = null, launchOpts = {}) {
+    return manualStart(step, taskId, wtSelector, launchOpts) || coldStart(step, taskId, wtSelector, launchOpts);
   }
 
   function workerVitals(taskId, terminal, dispatchId) {

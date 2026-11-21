@@ -32,7 +32,29 @@
     "nudgeTimeoutMs": 120000,
     "readinessMinBytes": 200,
     "turnStartWindowMs": 120000,
-    "turnStartEscalateMs": 600000
+    "turnStartEscalateMs": 600000,
+    "watchdog": {
+      "enabled": true,
+      "extendOnActivity": true,
+      "extendStepMs": 300000,
+      "activityFreshMs": 180000,
+      "stallTimeoutMs": 600000,
+      "loopThreshold": 4,
+      "maxRuntimeMs": 0,
+      "fallbackOnGatewayError": true,
+      "fallbackOnLoop": true,
+      "fallbackOnStall": true,
+      "fallbackOnPromptBlocked": true
+    },
+    "preflight": {
+      "enabled": true,
+      "timeoutMs": 1500,
+      "autoDetectOpencodeEndpoints": true
+    },
+    "issueTracking": {
+      "mode": "auto",
+      "closeOnPr": true
+    }
   },
   "skills": {
     "triage-po": {
@@ -283,11 +305,12 @@
         "senior-audit"
       ],
       "onFailGoto": null,
-      "spec": "You are the Track 2 Cross-Family Release Reviewer. Based on {reads}: (1) verify HEAD is on the `epic/<slug>` integration branch (NEVER push directly to `{protectedBranches}` and NEVER auto-merge into `{protectedBranches}`); (2) verify target branch `{targetBranch}` is NOT in `{protectedBranches}` (if `{targetBranch}` is protected, STOP after opening PR and wait for human approval); (3) push the branch (`git push -u origin HEAD`), create/update the Pull Request targeting `{targetBranch}` (`gh pr create --base {targetBranch}` or `tea pr create --base {targetBranch}`), and verify CI checks & all upstream VERDICT: PASS gates; (4) when `{targetBranch}` is a non-protected release branch such as `dev` and all checks are green, merge the PR into `{targetBranch}` (or perform local fast-forward/no-ff merge to `{targetBranch}` if no remote PR CLI is configured, never touching `{protectedBranches}`), and record PR URL, CI status, merge commit SHA, and rollback checklist in {out}. Merge Danger / One-Way Door Guard — follow the engine pre-check strictly:\n{mergeDangerReport}\nAlways record explicit lines `Door: one-way` or `Door: two-way` and `Merge-Status: MERGED` or `Merge-Status: PENDING_HUMAN_MERGE`, and end {out} with the final non-empty line strictly as `VERDICT: PASS`.",
+      "spec": "You are the Track 2 Cross-Family Release Reviewer. Based on {reads}: (1) verify HEAD is on the `epic/<slug>` integration branch (NEVER push directly to `{protectedBranches}` and NEVER auto-merge into `{protectedBranches}`); (2) verify target branch `{targetBranch}` is NOT in `{protectedBranches}` (if `{targetBranch}` is protected, STOP after opening PR and wait for human approval); (3) push the branch (`git push -u origin HEAD`), create/update the Pull Request targeting `{targetBranch}` (`gh pr create --base {targetBranch}` or `tea pr create --base {targetBranch}`), and verify CI checks & all upstream VERDICT: PASS gates; (4) when `{targetBranch}` is a non-protected release branch such as `dev` and all checks are green, merge the PR into `{targetBranch}` (or perform local fast-forward/no-ff merge to `{targetBranch}` if no remote PR CLI is configured, never touching `{protectedBranches}`), and record PR URL, CI status, merge commit SHA, and rollback checklist in {out}. Merge Danger / One-Way Door Guard — follow the engine pre-check strictly:\n{mergeDangerReport}\nAlways record explicit lines `Door: one-way` or `Door: two-way` and `Merge-Status: MERGED` or `Merge-Status: PENDING_HUMAN_MERGE`, and end {out} with the final non-empty line strictly as `VERDICT: PASS`. Include issue linking trailers in the PR body when linked issues exist: {issueCloses}.",
       "verify": {
         "requireVerdict": "PASS",
         "mergeDangerCheck": true
-      }
+      },
+      "linkIssues": true
     }
   ]
 }

@@ -33,6 +33,13 @@ import {
 } from "./ledger.mjs";
 import { scanLocalAgents, recommendStrategy, formatScanReport } from "./agent-scanner.mjs";
 import { runStrategyWizard } from "./strategy-wizard.mjs";
+import {
+  resolveIssueTrackingConfig,
+  detectIssueProvider,
+  loadIssueState,
+  syncPlanIssues,
+} from "./issue-tracker.mjs";
+import { generateCiCdFiles } from "./ci-generator.mjs";
 import { createOrcaClient, pick, res, wtStamp, slugify, headSha, MODEL_FLAG_RE, isKiroCmd } from "./lib/orca-cli.mjs";
 import { createStatusManager, writeStatusTo } from "./lib/status.mjs";
 import { createNotifier } from "./lib/notify.mjs";
@@ -101,6 +108,8 @@ const opt = {
   noOpenStatus: false, statusPreview: false, newRun: false,
   allowOneWayMerge: false, dedupKey: null, ledgerHome: null,
   scan: false, setup: false, json: false, yes: false, noOrca: false,
+  issues: false, noIssues: false, epicIssue: null,
+  generateCi: false, selfHostedCd: false,
 };
 const rest = [];
 for (let i = 0; i < argv.length; i++) {
@@ -126,6 +135,11 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--json") opt.json = true;
   else if (a === "--yes" || a === "--apply-recommended") opt.yes = true;
   else if (a === "--no-orca") opt.noOrca = true;
+  else if (a === "--issues") opt.issues = true;
+  else if (a === "--no-issues") opt.noIssues = true;
+  else if (a === "--epic-issue") opt.epicIssue = argv[++i];
+  else if (a === "--generate-ci") opt.generateCi = true;
+  else if (a === "--self-hosted-cd") opt.selfHostedCd = true;
   else if (a === "--agent") {
     const [step, ag] = argv[++i].split("=");
     if (step && ag) opt.agentOverrides[step] = ag;
@@ -150,6 +164,20 @@ if (opt.setup) {
     interactive: !opt.yes && Boolean(process.stdin.isTTY && process.stdout.isTTY),
     applyRecommended: opt.yes,
   });
+  process.exit(0);
+}
+if (opt.generateCi) {
+  const res = generateCiCdFiles(PROJECT_ROOT, {
+    writeGithubCi: true,
+    writeGiteaCi: false,
+    writeSelfHostedCd: opt.selfHostedCd,
+    force: true,
+  });
+  if (opt.json) console.log(JSON.stringify(res, null, 2));
+  else {
+    log(`[ci] detected stack: ${res.detection.summary}`);
+    for (const f of res.written) log(`[ci] wrote ${f}`);
+  }
   process.exit(0);
 }
 
@@ -341,14 +369,18 @@ if (opt.statusPreview && (objective || opt.only || opt.from || Object.keys(opt.a
 if (opt.statusPreview) statusMgr.runPreviewAndExit(HERE);
 
 let WT_DIR = null;
+const ISSUE_CFG = resolveIssueTrackingConfig(cfg, opt);
+let ISSUE_PROVIDER = null;
+let ISSUE_STATE = null;
 const runner = createRunner({
   here: HERE, cfg, opt, objective, configFile: CONFIG_FILE, artDir: ART_DIR, autoRun: AUTO_RUN,
   targetBranch: TARGET_BRANCH, protectedBranches: PROTECTED_BRANCHES, mergeDangerThresholds: MERGE_DANGER_THRESHOLDS,
   turnStartWindowMs: TURN_START_WINDOW_MS, turnStartEscalateMs: TURN_START_ESCALATE_MS,
   readinessRetries: READINESS_RETRIES, readinessMinBytes: READINESS_MIN_BYTES,
   allSteps, steps, byId, enabledIds, groups, isParallel,
-  agentOf, effectiveModel, timeoutOf, nudgeRetriesOf, nudgeTimeoutOf, outPath,
+  agentOf, modelOf, effectiveModel, timeoutOf, nudgeRetriesOf, nudgeTimeoutOf, outPath,
   orcaClient, statusMgr, notifier, getLedger: () => LEDGER, getWtDir: () => WT_DIR,
+  getIssueState: () => ISSUE_STATE, issueTrackingCfg: ISSUE_CFG,
   isolatedState, preStepTargetRefs: PRE_STEP_TARGET_REFS,
   setLastMergeDanger: (cls) => { LAST_MERGE_DANGER = cls; },
   log, warn, die,
@@ -400,11 +432,33 @@ log(`Run: ${runId}`);
 LEDGER.setOrcaRunId(runId);
 statusMgr.initStatus();
 
+// Initialize GitHub/Gitea Issue traceability (auto-enabled when gh/tea & remote available)
+const artDirAbs = join(WT_DIR || ".", ART_DIR);
+ISSUE_STATE = loadIssueState(artDirAbs);
+ISSUE_PROVIDER = detectIssueProvider({
+  repoDir: WT_DIR || ".",
+  mode: ISSUE_CFG.mode,
+  providerOverride: ISSUE_CFG.provider,
+});
+if (ISSUE_PROVIDER.enabled) {
+  log(`[issues] enabled (provider=${ISSUE_PROVIDER.provider}${ISSUE_PROVIDER.repo ? `, repo=${ISSUE_PROVIDER.repo}` : ""}${ISSUE_CFG.epicIssue ? `, epic=#${ISSUE_CFG.epicIssue}` : ""})`);
+  if (ISSUE_CFG.epicIssue && !ISSUE_STATE?.epic) {
+    ISSUE_STATE = syncPlanIssues({
+      providerInfo: ISSUE_PROVIDER, config: ISSUE_CFG, repoDir: WT_DIR || ".", artDirAbs,
+      objective, stepId: "init", artifactPath: null, log, warn,
+    });
+    if (ISSUE_STATE) LEDGER?.recordIssueLinks(ISSUE_STATE);
+  }
+} else if (ISSUE_CFG.mode === true) {
+  warn(`[issues] issueTracking enabled in config/flags but provider unavailable: ${ISSUE_PROVIDER.reason}`);
+}
+
+const PLANNING_STEP_IDS = new Set(ISSUE_CFG.planningSteps || ["po-backlog", "micro-plan", "triage-root-cause"]);
 const retriesUsed = {};
 let gi = 0;
 while (gi < groups.length) {
   await runner.readinessGate(groups[gi]);
-  const results = runner.runGroup(groups[gi]);
+  const results = await runner.runGroup(groups[gi]);
   let jumped = false;
   for (const r of results) {
     let vres = null;
@@ -475,6 +529,18 @@ while (gi < groups.length) {
     }
     if (r.outcome === "succeeded") {
       log(`[ok] ${r.step.title} done -> ${outPath(r.step.writes)}`);
+      if (ISSUE_PROVIDER?.enabled && (r.step.syncIssues || PLANNING_STEP_IDS.has(r.step.id))) {
+        try {
+          const planArt = r.step.writes ? join(WT_DIR || ".", ART_DIR, r.step.writes) : null;
+          ISSUE_STATE = syncPlanIssues({
+            providerInfo: ISSUE_PROVIDER, config: ISSUE_CFG, repoDir: WT_DIR || ".", artDirAbs,
+            objective, stepId: r.step.id, artifactPath: planArt, log, warn,
+          });
+          if (ISSUE_STATE) LEDGER?.recordIssueLinks(ISSUE_STATE);
+        } catch (e) {
+          warn(`[issues] sync after "${r.step.id}" failed (continuing): ${e.message}`);
+        }
+      }
       if (r.step.gate && !AUTO_RUN) runner.runGate(r.step);
       continue;
     }

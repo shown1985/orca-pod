@@ -23,7 +23,12 @@
    - **单向门合并风控**（`.orca/merge-danger.mjs`）：自动识别高危变更（Schema 迁移、鉴权/密钥、CI/部署等），阻止越权自动合并，挂起 `PENDING_HUMAN_MERGE`。
    - **`turnStart` 健康状态机**（`.orca/health.mjs`）：区分“仅就绪未开跑”、“静默运行”、“弹窗卡住”与“dispatch 丢失”，杜绝盲目重试导致双发。
    - **仓库外持久化账本与防撞锁**（`.orca/ledger.mjs`）：支持 4 级验收闭环（`implemented` / `integrated` / `merged` / `synced`）、保护分支 SHA 校验及 `--dedup-key` 并发防撞。
-4. **完整可观测与扩展能力**
+4. **v0.5 生产级稳定性与全链路闭环**
+   - **活性守护监控（Watchdog，`.orca/watchdog.mjs`）**：取代固定 600s 墙钟硬杀。持续监测终端输出、Worktree 文件/Git 变更与产物增长，健康推进中的长耗时 Worker 自动顺延截止时间；同时精准识别**输出死循环**、**无进展假死（stalled/hang）**、**信任/交互弹窗阻塞（`agent_prompt_blocked`）**与**网关断连（`ECONNREFUSED`）**，输出诊断并自动降级或上报。
+   - **主备模型预检降级 + `agy` 隔离 Worktree 信任适配（`.orca/preflight.mjs` + `.orca/lib/orca-cli.mjs`）**：派发前自动探测本地网关（如 `opencode.json` 中的 Magpie `127.0.0.1:3425`）与配置端点，异常时无缝降级至备选 Worker（如 `agy claude-sonnet-5-5 medium`）并写入账本；启动 `agy` 时自动注入会话级 `--settings '{"trustedWorkspaces":["<worktreeDir>"]}'`，绕过新 Worktree 信任弹窗且零污染全局配置。
+   - **GitHub / Gitea Issue → PR 全链路可追踪（`.orca/issue-tracker.mjs`）**：检测到 `gh`/`tea` 可用时默认开启，规划阶段自动创建/关联 Epic & 子任务 Issues 并写入 `.orca/artifacts/ISSUES.json` 与账本；PR 阶段自动注入 `Closes #N` / `Refs #N`。
+   - **真实技术栈 CI & 内网 Self-Hosted CD 模板生成（`.orca/ci-generator.mjs`）**：自动探测 Python / Node / Vue / Vite / Go / Rust / Docker Compose（含前后端混合仓库），生成可直接执行的 CI；可选生成面向家庭/私服内网的 Self-Hosted Runner CD（出站 HTTPS 拉取任务，无需公网 SSH，部署后自动健康检查）。
+5. **完整可观测与扩展能力**
    - 离线免服务实时看板（`status.html` + JSONP artifact 实时预览、`--status-preview`）、Run 历史归档与交互恢复、Claude/Codex Token 统计（`USAGE.md`）、Webhook 通知（`.orca/notify.json`）、按步骤动态挂载 Skills/MCP（`.orca/agent-config.mjs`）。
 
 ---

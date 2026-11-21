@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { scanLocalAgents, recommendStrategy, formatScanReport } from "../.orca/agent-scanner.mjs";
 import { runStrategyWizard } from "../.orca/strategy-wizard.mjs";
+import { detectProjectStacks, generateCiCdFiles } from "../.orca/ci-generator.mjs";
 
 const KIT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const log = (...a) => console.log("[orca-pod]", ...a);
@@ -30,6 +31,10 @@ const FILES = [
   ".orca/worktree-isolation.mjs",
   ".orca/merge-danger.mjs",
   ".orca/health.mjs",
+  ".orca/watchdog.mjs",
+  ".orca/preflight.mjs",
+  ".orca/issue-tracker.mjs",
+  ".orca/ci-generator.mjs",
   ".orca/ledger.mjs",
   ".orca/lib/orca-cli.mjs",
   ".orca/lib/status.mjs",
@@ -75,6 +80,10 @@ const ENGINE_FILES = new Set([
   ".orca/worktree-isolation.mjs",
   ".orca/merge-danger.mjs",
   ".orca/health.mjs",
+  ".orca/watchdog.mjs",
+  ".orca/preflight.mjs",
+  ".orca/issue-tracker.mjs",
+  ".orca/ci-generator.mjs",
   ".orca/ledger.mjs",
   ".orca/lib/orca-cli.mjs",
   ".orca/lib/status.mjs",
@@ -96,6 +105,8 @@ const asJson = args.includes("--json");
 const noOrca = args.includes("--no-orca");
 const applyRecommended = args.includes("--apply-recommended") || args.includes("--yes");
 const noInteractive = args.includes("--no-interactive");
+const generateCi = args.includes("--generate-ci");
+const selfHostedCd = args.includes("--self-hosted-cd");
 
 // --- Scan-only mode (no filesystem changes) ---
 if (scanOnly) {
@@ -117,6 +128,19 @@ if (setupOnly) {
     interactive: !applyRecommended && !noInteractive && Boolean(process.stdin.isTTY && process.stdout.isTTY),
     applyRecommended,
   });
+  process.exit(0);
+}
+
+// --- CI/CD generator-only mode ---
+if (generateCi && !force && !upgradeEngine && existsSync(".orca/flow.mjs")) {
+  const res = generateCiCdFiles(process.cwd(), {
+    writeGithubCi: true,
+    writeGiteaCi: false,
+    writeSelfHostedCd: selfHostedCd,
+    force: true,
+  });
+  log(`detected stack: ${res.detection.summary}`);
+  for (const f of res.written) log(`  generated   ${f}`);
   process.exit(0);
 }
 
@@ -149,11 +173,25 @@ if (gitignoreAdded) {
   catch (e) { die(`could not update .gitignore: ${e.message}`); }
 }
 
+// --- Stack-aware CI/CD tailoring (fresh install or --generate-ci / --self-hosted-cd) ---
+const stackDetect = detectProjectStacks(process.cwd());
+const ciGenerated = [];
+if (generateCi || selfHostedCd || (copied.includes(".github/workflows/ci-release.yml") && stackDetect.hasAny)) {
+  const ciRes = generateCiCdFiles(process.cwd(), {
+    writeGithubCi: generateCi || copied.includes(".github/workflows/ci-release.yml"),
+    writeGiteaCi: copied.includes(".gitea/workflows/ci-release.yml"),
+    writeSelfHostedCd: selfHostedCd,
+    force: true,
+  });
+  ciGenerated.push(...ciRes.written);
+}
+
 // --- Report ---
 log(`installing into ${process.cwd()}`);
 for (const f of copied) log(`  installed   ${f}`);
 for (const f of skipped) log(`  kept yours  ${f}  (already exists; --force to overwrite)`);
 if (gitignoreAdded) log(`  updated     .gitignore  (+ ${GI_LINE})`);
+if (ciGenerated.length) log(`  tailored CI for stack [${stackDetect.summary}]: ${ciGenerated.join(", ")}`);
 
 if (upgradeEngine) {
   log("");

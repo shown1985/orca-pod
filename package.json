@@ -1,7 +1,7 @@
 {
   "name": "orca-pod",
-  "version": "0.4.0",
-  "description": "Lightweight, governance-hardened multi-agent SDLC orchestrator for Orca ADE — 3-Track pipelines, local agent/subscription scanner & pre-dev strategy wizard, isolated worktrees, hard gates, one-way merge danger guard, turnStart health machine, and out-of-repo run ledger.",
+  "version": "0.5.0",
+  "description": "Lightweight, governance-hardened multi-agent SDLC orchestrator for Orca ADE — 3-Track pipelines, activity-aware Watchdog supervisor, primary/fallback pre-flight auto-downgrade + agy worktree trust, GitHub/Gitea Issue-to-PR traceability, stack-aware CI & intranet Self-Hosted CD generator, isolated worktrees, hard gates, and out-of-repo run ledger.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -12,7 +12,9 @@
   },
   "scripts": {
     "test": "node test/run-tests.mjs",
-    "scan": "node .orca/agent-scanner.mjs"
+    "scan": "node .orca/agent-scanner.mjs",
+    "ci-gen": "node .orca/ci-generator.mjs",
+    "issues": "node .orca/issue-tracker.mjs"
   },
   "files": [
     ".orca/flow.mjs",
@@ -23,6 +25,10 @@
     ".orca/worktree-isolation.mjs",
     ".orca/merge-danger.mjs",
     ".orca/health.mjs",
+    ".orca/watchdog.mjs",
+    ".orca/preflight.mjs",
+    ".orca/issue-tracker.mjs",
+    ".orca/ci-generator.mjs",
     ".orca/ledger.mjs",
     ".orca/lib/orca-cli.mjs",
     ".orca/lib/status.mjs",

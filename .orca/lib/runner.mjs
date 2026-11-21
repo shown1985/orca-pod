@@ -22,6 +22,9 @@ import {
   formatMergeDangerPromptBlock,
 } from "../merge-danger.mjs";
 import { initMemberHealth, evaluateMemberHealth } from "../health.mjs";
+import { createWatchdogTracker, evaluateWatchdog } from "../watchdog.mjs";
+import { buildCandidateChain, selectHealthyCandidate } from "../preflight.mjs";
+import { formatIssuePrBlock } from "../issue-tracker.mjs";
 import { pick, res, sleepMs, parkedPromptOf, outcomeOf, promptChoice } from "./orca-cli.mjs";
 import { createNudgeController } from "./nudge.mjs";
 import { parseStatusJs } from "./status.mjs";
@@ -69,10 +72,16 @@ export function createRunner({
   targetBranch, protectedBranches, mergeDangerThresholds,
   turnStartWindowMs, turnStartEscalateMs, readinessRetries, readinessMinBytes,
   allSteps, steps, byId, enabledIds, groups, isParallel,
-  agentOf, effectiveModel, timeoutOf, nudgeRetriesOf, nudgeTimeoutOf, outPath,
+  agentOf, modelOf: modelOfArg = null, effectiveModel, timeoutOf, nudgeRetriesOf, nudgeTimeoutOf, outPath,
   orcaClient, statusMgr, notifier, getLedger, getWtDir,
+  getIssueState = () => null, issueTrackingCfg = null,
   isolatedState, preStepTargetRefs, setLastMergeDanger, log, warn, die,
 }) {
+  const modelOf = modelOfArg || ((s) => {
+    const m = s.model !== undefined ? s.model : cfg.defaults?.model;
+    const t = m == null ? "" : String(m).trim();
+    return t && t !== "default" ? t : null;
+  });
   const { orca, resolveWorktree, resolveWorktreePath, startWorker, workerVitals, wtSource, getRunId, getWt, getWtPin, getOrcaBin } = orcaClient;
   const { statusSet, statusBegin, statusEnd, writeStatus, refreshProgress, writeArtifactSnapshot, listRuns, printRunList } = statusMgr;
   const taskIds = {};
@@ -110,9 +119,20 @@ export function createRunner({
     }
     const hasPlaceholder = (step.spec || "").includes("{mergeDangerReport}");
     const mdSuffix = (!hasPlaceholder && mergeDangerBlock) ? `\n\nMERGE DANGER PRE-CHECK:\n${mergeDangerBlock}` : "";
+    const issueState = getIssueState ? getIssueState() : null;
+    const closeOnPr = issueTrackingCfg?.closeOnPr ?? true;
+    const issueFmt = formatIssuePrBlock(issueState, { closeOnPr });
+    const prStepIds = new Set(issueTrackingCfg?.prSteps || ["pr-submit", "pr-release-dev"]);
+    const isPrStep = Boolean(step.linkIssues || prStepIds.has(step.id));
+    const hasIssueTok = /\{(?:issueRefs|issueCloses|issueTraceability)\}/.test(step.spec || "");
+    const issueSuffix = (isPrStep && !hasIssueTok && issueFmt.block) ? `\n\n${issueFmt.block}` : "";
     const rep = (str, tok, val) => str.replaceAll(tok, () => val);
-    let rendered = objectiveLine + (step.spec || "") + autonomy + interview + wtNote + mdSuffix;
+    let rendered = objectiveLine + (step.spec || "") + autonomy + interview + wtNote + mdSuffix + issueSuffix;
     rendered = rep(rendered, "{mergeDangerReport}", mergeDangerBlock || "(no merge-danger check configured)");
+    rendered = rep(rendered, "{epicIssue}", issueFmt.epicIssue || "(none)");
+    rendered = rep(rendered, "{issueRefs}", issueFmt.issueRefs || "(no linked issues)");
+    rendered = rep(rendered, "{issueCloses}", issueFmt.issueCloses || "(no linked issues)");
+    rendered = rep(rendered, "{issueTraceability}", issueFmt.block || "(no linked issues)");
     rendered = rep(rendered, "{out}", outPath(step.writes));
     rendered = rep(rendered, "{tasks}", step.progress ? outPath(step.progress) : "{tasks}");
     rendered = rep(rendered, "{reads}", readList);
@@ -148,6 +168,10 @@ export function createRunner({
       if (s.isolatedWorktree) flags.push("isolated-wt");
       const vSum = formatVerifySummary(s.verify);
       if (vSum) flags.push(`verify=${vSum}`);
+      const cands = buildCandidateChain(s, cfg, { agentOf, modelOf });
+      if (cands.length > 1) {
+        flags.push(`fallback=${cands.slice(1).map((c) => c.model ? `${c.agent}(${c.model})` : c.agent).join("->")}`);
+      }
       console.log(
         `  ${i + 1}. ${s.title.padEnd(26)} agent=${agentOf(s).padEnd(9)}` +
         `${model ? ` model=${model}` : ""} ` +
@@ -208,26 +232,111 @@ export function createRunner({
     syncOutputsFromIsolatedWorktree, getWtDir, artDir,
   });
 
-  function launchMember(step, stepCtx = null) {
+  function releaseWorkerHandle(m) {
+    if (m.terminal) {
+      const c = orca(["terminal", "close", "--terminal", m.terminal]);
+      if (!c.ok) warn(`terminal close '${m.step.title}' did not confirm: ${c.stderr || c.raw}`);
+    } else if (m.dispatchId) {
+      const rel = orca(["orchestration", "worker-release", "--dispatch", m.dispatchId]);
+      if (!rel.ok) warn(`worker-release '${m.step.title}' did not confirm: ${rel.stderr || rel.raw}`);
+    }
+  }
+
+  async function launchMember(step, stepCtx = null, { startCandidateIndex = 0, fallbackReason = null, fallbackPhase = null, prevCandidate = null } = {}) {
     if (step.verify?.mergeDangerCheck && !preStepTargetRefs[step.id]) {
       preStepTargetRefs[step.id] = snapshotTargetRefs(stepCtx?.isolated ? stepCtx.dir : (getWtDir() || "."), targetBranch);
     }
     const preRefs = preStepTargetRefs[step.id] || { localSha: null, originSha: null, remoteSha: null, remoteError: null, hasOrigin: false, headSha: null };
     const taskId = ensureTask(step, stepCtx);
-    const wtTag = stepCtx?.isolated ? `, worktree=${stepCtx.wtName}, branch=${stepCtx.branch}` : "";
-    log(`> ${step.title}  (agent=${agentOf(step)}, task=${taskId}${wtTag})`);
-    const requestId = `req-${++attemptSeq}-${step.id}`;
+    const worktreeDir = stepCtx?.isolated ? stepCtx.dir : (getWtDir() || ".");
     const LEDGER = getLedger();
-    if (LEDGER) {
-      LEDGER.recordIntent({
-        requestId, stepId: step.id, title: step.title, agent: agentOf(step),
-        model: effectiveModel(step), attempt: attemptSeq,
-        worktree: stepCtx?.isolated ? stepCtx.wtName : (getWt() || "integration"),
-        branch: stepCtx?.isolated ? stepCtx.branch : null,
+
+    const fullChain = buildCandidateChain(step, cfg, { agentOf, modelOf });
+    const remainingChain = fullChain.slice(startCandidateIndex);
+    const preflightRes = await selectHealthyCandidate(remainingChain, { cfg, projectDir: worktreeDir });
+    let candIndex = startCandidateIndex + Math.max(0, preflightRes.index);
+    let activeCand = fullChain[candIndex] || fullChain[0];
+
+    if (preflightRes.downgraded && preflightRes.failures.length) {
+      const primaryFail = preflightRes.failures[0];
+      warn(`[preflight] "${step.title}" primary agent "${primaryFail.agent}" failed pre-check (${primaryFail.reason}); auto-downgrading to fallback "${activeCand.agent}"${activeCand.model ? ` (model=${activeCand.model}${activeCand.effort ? `, effort=${activeCand.effort}` : ""})` : ""}.`);
+      LEDGER?.recordFallback({
+        stepId: step.id,
+        fromAgent: primaryFail.agent,
+        fromModel: primaryFail.model,
+        toAgent: activeCand.agent,
+        toModel: activeCand.model,
+        toEffort: activeCand.effort,
+        reason: primaryFail.reason,
+        phase: "preflight",
       });
+    } else if (fallbackReason && prevCandidate) {
+      warn(`[fallback] "${step.title}" downgrading from "${prevCandidate.agent}" to "${activeCand.agent}"${activeCand.model ? ` (model=${activeCand.model}${activeCand.effort ? `, effort=${activeCand.effort}` : ""})` : ""} (${fallbackPhase || "runtime"}: ${fallbackReason}).`);
+      LEDGER?.recordFallback({
+        stepId: step.id,
+        fromAgent: prevCandidate.agent,
+        fromModel: prevCandidate.model,
+        toAgent: activeCand.agent,
+        toModel: activeCand.model,
+        toEffort: activeCand.effort,
+        reason: fallbackReason,
+        phase: fallbackPhase || "runtime",
+      });
+    } else if (preflightRes.allFailed && preflightRes.failures.length) {
+      warn(`[preflight] "${step.title}" all candidate pre-checks failed (${preflightRes.failures.map((f) => `${f.agent}: ${f.reason}`).join("; ")}); attempting primary anyway.`);
     }
-    const launchedAt = Date.now();
-    const started = startWorker(step, taskId, stepCtx?.selector || null);
+
+    let started = null;
+    let launchedAt = Date.now();
+    let requestId = null;
+
+    while (candIndex < fullChain.length) {
+      activeCand = fullChain[candIndex];
+      const hasNextCandidate = candIndex + 1 < fullChain.length;
+      const wtTag = stepCtx?.isolated ? `, worktree=${stepCtx.wtName}, branch=${stepCtx.branch}` : "";
+      const modelTag = activeCand.model ? `, model=${activeCand.model}` : "";
+      const effortTag = activeCand.effort ? `, effort=${activeCand.effort}` : "";
+      log(`> ${step.title}  (agent=${activeCand.agent}${modelTag}${effortTag}, task=${taskId}${wtTag})`);
+      requestId = `req-${++attemptSeq}-${step.id}`;
+      if (LEDGER) {
+        LEDGER.recordIntent({
+          requestId, stepId: step.id, title: step.title, agent: activeCand.agent,
+          model: activeCand.model || effectiveModel(step), attempt: attemptSeq,
+          worktree: stepCtx?.isolated ? stepCtx.wtName : (getWt() || "integration"),
+          branch: stepCtx?.isolated ? stepCtx.branch : null,
+        });
+      }
+      launchedAt = Date.now();
+      started = startWorker(step, taskId, stepCtx?.selector || null, {
+        agentOverride: activeCand.agent,
+        modelOverride: activeCand.model,
+        effortOverride: activeCand.effort,
+        worktreePath: worktreeDir,
+        allowError: hasNextCandidate,
+      });
+      if (started && started.ok !== false) break;
+
+      const errReason = started?.error || "worker-start failed";
+      const nextIdx = candIndex + 1;
+      if (nextIdx >= fullChain.length) {
+        die(`worker-start '${step.title}' failed: ${errReason}`);
+      }
+      const nextCand = fullChain[nextIdx];
+      warn(`[fallback] worker-start "${step.title}" failed on "${activeCand.agent}" (${errReason}); auto-downgrading to "${nextCand.agent}"${nextCand.model ? ` (model=${nextCand.model}${nextCand.effort ? `, effort=${nextCand.effort}` : ""})` : ""}.`);
+      LEDGER?.recordFallback({
+        stepId: step.id,
+        fromAgent: activeCand.agent,
+        fromModel: activeCand.model,
+        toAgent: nextCand.agent,
+        toModel: nextCand.model,
+        toEffort: nextCand.effort,
+        reason: errReason,
+        phase: "worker_start",
+      });
+      orca(["orchestration", "task-update", "--id", taskId, "--status", "ready"]);
+      candIndex = nextIdx;
+    }
+
     const dispatchedAt = Date.now();
     const { dispatchId, terminal } = started;
     const receiptTurnStart = started.receiptTurnStart || (terminal ? "observed" : null);
@@ -236,32 +345,44 @@ export function createRunner({
       turnStartWindowMs: step.turnStartWindowMs ?? turnStartWindowMs,
       turnStartEscalateMs: step.turnStartEscalateMs ?? turnStartEscalateMs,
     });
+    const artDirPath = join(worktreeDir, artDir);
+    const artifactPath = step.writes ? join(artDirPath, step.writes) : null;
+    const watchdog = createWatchdogTracker({
+      step, cfg, startedAt: launchedAt, worktreeDir, artifactPath, artDirPath,
+    });
     if (LEDGER) {
       LEDGER.recordDispatchResult({
         requestId, stepId: step.id, dispatchId, terminal,
         turnStart: health.turnStart, state: started.dispatchState || (terminal ? "manual" : "ready"),
       });
     }
-    statusSet(step.id, { health: health.state, turnStart: health.turnStart });
+    statusSet(step.id, {
+      agent: activeCand.agent,
+      health: health.state,
+      turnStart: health.turnStart,
+      ...(candIndex > 0 ? { note: `fallback active: ${activeCand.agent}${activeCand.model ? ` (${activeCand.model})` : ""}` } : {}),
+    });
     const interactiveNow = !autoRun && step.interactive;
     const baseIdleMs = timeoutOf(step);
     const baseHardMs = step.hardTimeoutMs ?? cfg.defaults?.hardTimeoutMs ?? 4 * baseIdleMs;
     const maxIdleMs = interactiveNow ? Math.max(baseIdleMs, 3600000) : baseIdleMs;
+    const wdSliceCap = watchdog.config.stallTimeoutMs > 0 ? Math.max(1000, Math.floor(watchdog.config.stallTimeoutMs / 2)) : 120000;
     return {
       step, ctx: stepCtx, taskId, dispatchId, terminal, requestId,
+      candidateChain: fullChain, candidateIndex: candIndex, activeCandidate: activeCand,
       preStepTargetSha: preRefs.localSha, preStepOriginTargetSha: preRefs.originSha,
       preStepRemoteTargetSha: preRefs.remoteSha, preStepRemoteError: preRefs.remoteError,
-      preStepHasOrigin: preRefs.hasOrigin, preStepHeadSha: preRefs.headSha, health,
+      preStepHasOrigin: preRefs.hasOrigin, preStepHeadSha: preRefs.headSha, health, watchdog,
       maxIdleMs,
       hardCapMs: interactiveNow ? Math.max(baseHardMs, 14400000) : baseHardMs,
-      sliceMs: Math.min(120000, maxIdleMs, health.turnStartWindowMs, health.turnStartEscalateMs),
+      sliceMs: Math.min(120000, maxIdleMs, health.turnStartWindowMs, health.turnStartEscalateMs, wdSliceCap),
       startedAt: launchedAt, lastBusy: launchedAt, lastPreview: undefined,
       quietWarned: false, parkedSeen: new Set(), parkedLabel: null, settled: false, done: null, note: "", outcome: null,
       nudge: { left: nudgeRetriesOf(step), phase: null, sentAt: 0, count: 0, outcome: null, done: null },
     };
   }
 
-  function runGroup(members) {
+  async function runGroup(members) {
     const materializedDirs = [];
     let M = [];
     const wtDir = getWtDir() || ".";
@@ -289,7 +410,10 @@ export function createRunner({
         materializeAgentConfig({ worktree: p.ctx.dir, members: [{ ...p.step, agent: agentOf(p.step) }], cfg, configDir: here, die, warn });
       }
       for (const s of members) statusBegin(s.id);
-      M = prepared.map((p) => launchMember(p.step, p.ctx));
+      M = [];
+      for (const p of prepared) {
+        M.push(await launchMember(p.step, p.ctx));
+      }
       while (true) {
         const open = M.filter((m) => !m.settled);
         if (!open.length) break;
@@ -346,6 +470,59 @@ export function createRunner({
           } else if (v.lastBusyMs > 0 && Date.now() - v.lastBusyMs < m.maxIdleMs) {
             m.lastBusy = Date.now();
           }
+
+          // Watchdog evaluation: monitor git/file/artifact/preview activity + detect loops, hangs, trust prompts, gateway errors
+          const hasFallback = (m.candidateIndex + 1) < (m.candidateChain?.length || 1);
+          const wres = m.watchdog ? evaluateWatchdog(m.watchdog, {
+            preview: v.preview,
+            previewChanged,
+            previewSeenBefore,
+            agentWait: v.agentWait,
+            fallbackAvailable: hasFallback,
+          }) : null;
+          if (wres && (wres.gitChanged || wres.artifactChanged)) {
+            m.lastBusy = Date.now();
+          }
+          if (wres && wres.status === "anomaly") {
+            LEDGER?.recordWatchdogEvent({
+              stepId: m.step.id,
+              kind: wres.kind,
+              action: wres.action,
+              diagnosis: wres.diagnosis,
+              evidence: wres.evidence,
+            });
+            if (wres.action === "fallback" && hasFallback) {
+              warn(`[watchdog:${wres.kind}] "${m.step.title}" — ${wres.diagnosis}. Releasing broken worker and downgrading to fallback...`);
+              releaseWorkerHandle(m);
+              orca(["orchestration", "task-update", "--id", m.taskId, "--status", "ready"]);
+              const replacement = await launchMember(m.step, m.ctx, {
+                startCandidateIndex: m.candidateIndex + 1,
+                fallbackReason: `watchdog:${wres.kind} — ${wres.diagnosis}`,
+                fallbackPhase: "watchdog",
+                prevCandidate: m.activeCandidate,
+              });
+              const idx = M.indexOf(m);
+              if (idx >= 0) M[idx] = replacement;
+              continue;
+            }
+            if (wres.kind === "gateway_disconnect" || wres.kind === "output_loop") {
+              warn(`[watchdog:${wres.kind}] "${m.step.title}" — ${wres.diagnosis}`);
+              m.note = `[watchdog:${wres.kind}] ${wres.diagnosis}`;
+              statusSet(m.step.id, { health: "blocked", note: m.note });
+              releaseWorkerHandle(m);
+              settleMember(m, "failed", null);
+              continue;
+            }
+            if (wres.kind === "stalled_hang") {
+              warn(`[watchdog:stalled_hang] "${m.step.title}" — ${wres.diagnosis}`);
+              m.note = `[watchdog:stalled_hang] ${wres.diagnosis}`;
+              statusSet(m.step.id, { health: "degraded", note: m.note });
+              settleMember(m, "still-running", null);
+              continue;
+            }
+            // wres.kind === "prompt_blocked" && action === "block": fall through to parked-prompt handling below
+          }
+
           if (!previewChanged && v.preview != null) {
             const parked = parkedPromptOf(v.preview);
             if (parked && !m.parkedSeen.has(parked.sig)) {
@@ -364,7 +541,7 @@ export function createRunner({
             const hres = evaluateMemberHealth(m.health, {
               startedAt: m.startedAt, dispatchStatus: v.status, heartbeatMs: v.heartbeatMs,
               previewChanged, previewSeenBefore, parkedLabel: m.parkedLabel, agentWait: v.agentWait,
-              artifactSize: artSize, silenceMs, maxIdleMs: m.maxIdleMs,
+              artifactSize: artSize, gitChanged: Boolean(wres?.gitChanged), silenceMs, maxIdleMs: m.maxIdleMs,
             });
             statusSet(m.step.id, { health: hres.state, turnStart: hres.turnStart });
             if (hres.changed && LEDGER) {
@@ -402,6 +579,21 @@ export function createRunner({
             }
           }
           if (Date.now() - m.startedAt >= m.hardCapMs) {
+            if (wres?.extendDeadline) {
+              const stepExt = Math.max(m.watchdog?.config?.extendStepMs || 300000, m.maxIdleMs || 60000);
+              m.hardCapMs += stepExt;
+              m.watchdog.extensionsCount += 1;
+              const elapsedSec = Math.round((Date.now() - m.startedAt) / 1000);
+              log(`[watchdog] "${m.step.title}" is actively progressing after ${elapsedSec}s — extending deadline by ${Math.round(stepExt / 1000)}s (extension #${m.watchdog.extensionsCount}) instead of fixed-timeout kill.`);
+              LEDGER?.recordWatchdogEvent({
+                stepId: m.step.id,
+                kind: "deadline_extended",
+                action: "extend",
+                diagnosis: `Active progress observed at ${elapsedSec}s; extended deadline by ${Math.round(stepExt / 1000)}s`,
+                evidence: wres.evidence,
+              });
+              continue;
+            }
             const mins = Math.round((Date.now() - m.startedAt) / 60000);
             log(`[warn] "${m.step.title}" not settled after ${mins}min; leaving its terminal open and stopping the pipeline.`);
             m.note = m.parkedLabel ? `parked on ${m.parkedLabel} — not settled after ${mins}min` : `not settled after ${mins}min`;
@@ -496,7 +688,7 @@ export function createRunner({
     for (const step of producers) {
       for (let attempt = 1; ; attempt++) {
         log(`[readiness] re-running "${step.title}" (attempt ${attempt}/${readinessRetries})`);
-        const [r] = runGroup([step]);
+        const [r] = await runGroup([step]);
         if (r.outcome === "still-running") {
           statusMgr.STATUS.overall = "still-running";
           writeStatus();

@@ -9,6 +9,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline";
 import { scanLocalAgents, recommendStrategy, formatScanReport } from "./agent-scanner.mjs";
+import { detectProjectStacks, generateCiCdFiles } from "./ci-generator.mjs";
 
 export const STEP_ROLE_MAP = {
   grill: "coordinator",
@@ -62,6 +63,14 @@ export function applyStrategyToProject(projectDir, strategy) {
     if (Array.isArray(strategy.protectedBranches) && strategy.protectedBranches.length) {
       cfg.defaults.protectedBranches = strategy.protectedBranches;
     }
+    if (strategy.fallbackAgent) {
+      cfg.defaults.fallback = typeof strategy.fallbackAgent === "string"
+        ? { agent: strategy.fallbackAgent }
+        : strategy.fallbackAgent;
+    }
+    if (strategy.issueTrackingMode !== undefined) {
+      cfg.defaults.issueTracking = { ...(cfg.defaults.issueTracking || {}), mode: strategy.issueTrackingMode };
+    }
     if (Array.isArray(cfg.pipeline)) {
       for (const step of cfg.pipeline) {
         const role = STEP_ROLE_MAP[step?.id];
@@ -91,6 +100,9 @@ export function applyStrategyToProject(projectDir, strategy) {
     `- **Release Target Branch**: \`${strategy.targetBranch || "dev"}\``,
     `- **Protected Branches (no direct push/auto-merge)**: \`${(strategy.protectedBranches || ["main", "master"]).join("`, `")}\``,
     ...(strategy.projectNote ? [`- **Project / Test Note**: ${strategy.projectNote}`] : []),
+    ...(strategy.fallbackAgent ? [`- **Fallback Worker**: \`${typeof strategy.fallbackAgent === "string" ? strategy.fallbackAgent : strategy.fallbackAgent.agent}\``] : []),
+    ...(strategy.stackSummary ? [`- **Detected Tech Stack**: ${strategy.stackSummary}`] : []),
+    ...(strategy.ciGenerated?.length ? [`- **Generated CI/CD**: ${strategy.ciGenerated.map((f) => `\`${f}\``).join(", ")}`] : []),
     "",
     "## Agent Routing",
     "| Role | Agent | Purpose |",
@@ -136,10 +148,12 @@ export async function runStrategyWizard({
       log("[orca-pod] Non-interactive shell detected — skipped interactive wizard (pass --apply-recommended to apply the recommended routing automatically).");
       return { applied: false, strategy: rec, updated: [] };
     }
-    const res = applyStrategyToProject(projectDir, rec);
+    const stackInfo = detectProjectStacks(projectDir);
+    const enriched = { ...rec, stackSummary: stackInfo.summary };
+    const res = applyStrategyToProject(projectDir, enriched);
     log("");
-    log(`[orca-pod] Applied recommended strategy (${res.updated.length} files updated, wrote .orca/STRATEGY.md).`);
-    return { applied: true, strategy: rec, updated: res.updated };
+    log(`[orca-pod] Applied recommended strategy (${res.updated.length} files updated, wrote .orca/STRATEGY.md; stack: ${stackInfo.summary}).`);
+    return { applied: true, strategy: enriched, updated: res.updated };
   }
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -174,6 +188,22 @@ export async function runStrategyWizard({
     }
     const safeTarget = protectedBranches.includes(targetBranch) ? "dev" : targetBranch;
 
+    const stackInfo = detectProjectStacks(projectDir);
+    log(`  Detected project stack: ${stackInfo.summary}`);
+    const fbAns = await ask(rl, `Fallback agent on primary outage (e.g. agy) [${roles.coordinator !== roles.coder ? roles.coordinator : "none"}]: `);
+    const fallbackAgent = fbAns === "none" ? null : (fbAns || (roles.coordinator !== roles.coder ? roles.coordinator : null));
+    const genCiAns = await ask(rl, "Generate stack-aware .github/workflows/ci-release.yml? [y/N]: ");
+    const wantCi = /^(y|yes)$/i.test(genCiAns);
+    let wantSelfHostedCd = false;
+    let cdHealthUrl = "http://127.0.0.1:8000/health";
+    if (wantCi) {
+      const cdAns = await ask(rl, "Also generate intranet Self-Hosted Runner CD (.github/workflows/cd-selfhosted.yml)? [y/N]: ");
+      wantSelfHostedCd = /^(y|yes)$/i.test(cdAns);
+      if (wantSelfHostedCd) {
+        const hAns = await ask(rl, `Post-deploy health check URL [${cdHealthUrl}]: `);
+        if (hAns) cdHealthUrl = hAns;
+      }
+    }
     const projectNote = await ask(rl, "Optional project/test command note (e.g. pnpm test) [skip]: ");
     const confirm = await ask(rl, "Write this strategy to .orca/flow*.json and .orca/STRATEGY.md? [Y/n]: ");
     if (/^(n|no)$/i.test(confirm)) {
@@ -181,15 +211,30 @@ export async function runStrategyWizard({
       return { applied: false, strategy: rec, updated: [] };
     }
 
+    let ciGenerated = [];
+    if (wantCi) {
+      const ciRes = generateCiCdFiles(projectDir, {
+        writeGithubCi: true,
+        writeGiteaCi: false,
+        writeSelfHostedCd: wantSelfHostedCd,
+        force: true,
+        healthUrl: cdHealthUrl,
+      });
+      ciGenerated = ciRes.written;
+    }
     const finalStrategy = {
       ...rec,
       defaultTrack: chosenTrack,
       targetBranch: safeTarget,
       protectedBranches,
       roles,
+      fallbackAgent,
+      stackSummary: stackInfo.summary,
+      ciGenerated,
       projectNote: projectNote || null,
     };
     const res = applyStrategyToProject(projectDir, finalStrategy);
+    res.updated.push(...ciGenerated);
     log("");
     log("[orca-pod] Strategy confirmed and saved:");
     for (const f of res.updated) log(`  updated  ${f}`);

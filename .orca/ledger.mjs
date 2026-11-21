@@ -248,6 +248,9 @@ export function createRunLedger({
     closeout: null,
     steps: {},
     gaps: [],
+    fallbacks: [],
+    watchdogEvents: [],
+    issues: null,
   };
 
   function persistSummary(soft = true) {
@@ -352,6 +355,51 @@ export function createRunLedger({
       summary.steps[stepId] = { ...cur, health: state, turnStart: turnStart || cur.turnStart, healthNote: note };
       summary.health = state;
       return append("health", { stepId, state, turnStart, signals, note }, { critical: false });
+    },
+
+    recordFallback({ stepId, fromAgent, fromModel = null, toAgent, toModel = null, toEffort = null, reason = null, phase = "preflight" }) {
+      const entry = {
+        ts: new Date().toISOString(),
+        stepId,
+        phase,
+        fromAgent,
+        fromModel: fromModel || "default",
+        toAgent,
+        toModel: toModel || "default",
+        toEffort: toEffort || null,
+        reason: reason || null,
+      };
+      summary.fallbacks.push(entry);
+      const cur = summary.steps[stepId] || {};
+      summary.steps[stepId] = { ...cur, agent: toAgent, model: toModel || "default", effort: toEffort || cur.effort || null, fallback: entry };
+      return append("fallback", entry, { critical: false });
+    },
+
+    recordWatchdogEvent({ stepId, kind, action, diagnosis = null, evidence = null }) {
+      const entry = {
+        ts: new Date().toISOString(),
+        stepId,
+        kind,
+        action,
+        diagnosis,
+        evidence,
+      };
+      summary.watchdogEvents.push(entry);
+      if (summary.watchdogEvents.length > 50) summary.watchdogEvents.shift();
+      const cur = summary.steps[stepId] || {};
+      summary.steps[stepId] = { ...cur, lastWatchdog: entry };
+      return append("watchdog", entry, { critical: false });
+    },
+
+    recordIssueLinks({ provider = null, repo = null, epic = null, tasks = [] }) {
+      summary.issues = {
+        provider,
+        repo,
+        epic: epic ? { number: epic.number, url: epic.url || null, title: epic.title || null } : null,
+        tasks: (tasks || []).map((t) => ({ id: t.id, number: t.number || null, url: t.url || null, title: t.title || null })),
+        updatedAt: new Date().toISOString(),
+      };
+      return append("issue_links", summary.issues, { critical: false });
     },
 
     recordStepSettled({ stepId, outcome, note = null, verifyOk = null, verifyReason = null, contractCommit = null }) {

@@ -1276,7 +1276,7 @@ scenario("I1 installer (empty project: every whitelisted file lands)", async () 
   ok("I1 no copy failure", !/copy failed/.test(r.out + r.err), (r.out + r.err).trim());
   for (const f of [
     "flow.mjs", "agent-config.mjs", "agent-scanner.mjs", "strategy-wizard.mjs",
-    "gate-verify.mjs", "worktree-isolation.mjs", "merge-danger.mjs", "health.mjs", "ledger.mjs",
+    "gate-verify.mjs", "worktree-isolation.mjs", "merge-danger.mjs", "health.mjs", "watchdog.mjs", "preflight.mjs", "issue-tracker.mjs", "ci-generator.mjs", "ledger.mjs",
     "lib/orca-cli.mjs", "lib/status.mjs", "lib/status-template.html", "lib/usage.mjs", "lib/notify.mjs", "lib/nudge.mjs", "lib/runner.mjs",
     "flow.config.json", "flow-hotfix.json", "flow-feature.json", "flow-epic.json",
     "CONFIGURATION.md", "README.md", "notify.json",
@@ -1954,6 +1954,412 @@ scenario("P11 Bot anti-collision --dedup-key lock blocks live dup, reclaims stal
   ok("P11 installed merge-danger.mjs", existsSync(join(inst.dir, ".orca", "merge-danger.mjs")));
   ok("P11 installed health.mjs", existsSync(join(inst.dir, ".orca", "health.mjs")));
   ok("P11 installed ledger.mjs", existsSync(join(inst.dir, ".orca", "ledger.mjs")));
+});
+
+// ---------------------------------------------------------------------------
+// V1 — Activity-Aware Watchdog: healthy active worker survives past fixed
+// timeout; output dead-loop fails fast; gateway ECONNREFUSED triggers fallback.
+// ---------------------------------------------------------------------------
+scenario("V1 Watchdog (active extension, dead-loop, trust-prompt, gateway fallback)", async () => {
+  const {
+    detectGatewayDisconnect,
+    detectPromptBlocked,
+    detectOutputLoop,
+    createWatchdogTracker,
+    evaluateWatchdog,
+  } = await import(join(REPO, ".orca", "watchdog.mjs"));
+
+  // Unit assertions
+  ok("V1 detectGatewayDisconnect catches ECONNREFUSED", Boolean(detectGatewayDisconnect("Error: connect ECONNREFUSED 127.0.0.1:3425")));
+  ok("V1 detectGatewayDisconnect ignores normal output", detectGatewayDisconnect("All 42 pytest cases passed") === null);
+  const pb = detectPromptBlocked("Do you trust the contents of this project?\n[y/N]");
+  ok("V1 detectPromptBlocked catches agy workspace trust dialog", Boolean(pb && pb.matched && /agent_prompt_blocked/.test(pb.label)));
+  const loopIntra = detectOutputLoop([], [
+    "Retrying invalid tool call payload against gateway...",
+    "Retrying invalid tool call payload against gateway...",
+    "Retrying invalid tool call payload against gateway...",
+    "Retrying invalid tool call payload against gateway...",
+    "Retrying invalid tool call payload against gateway...",
+  ], { threshold: 4 });
+  ok("V1 detectOutputLoop catches intra-preview repeat", Boolean(loopIntra && loopIntra.pattern === "intra_preview_repeat"));
+  const loopOsc = detectOutputLoop([
+    "Step A failed with syntax error in handler.py",
+    "Step B reverting handler.py and retrying build",
+    "Step A failed with syntax error in handler.py",
+    "Step B reverting handler.py and retrying build",
+  ], [], { threshold: 4 });
+  ok("V1 detectOutputLoop catches period-2 oscillation", Boolean(loopOsc && loopOsc.pattern === "period2_cycle"));
+
+  // Stall detection unit test
+  const t0 = 1000000;
+  const wTracker = createWatchdogTracker({
+    step: { watchdog: { stallTimeoutMs: 5000, extendOnActivity: true } },
+    startedAt: t0,
+    probeFn: () => ({ gitFingerprint: "same", artifactFingerprint: "same", artifactSize: 0 }),
+  });
+  const stallRes = evaluateWatchdog(wTracker, { now: t0 + 6000, preview: "idle", previewChanged: false, previewSeenBefore: true, fallbackAvailable: false });
+  eq("V1 stall detected when silent past stallTimeoutMs", stallRes.kind, "stalled_hang");
+  eq("V1 stall action without fallback is escalate", stallRes.action, "escalate");
+
+  // E2E V1a: actively progressing worker survives past short hardTimeoutMs (2500ms)
+  const tmpV1 = mkdtempSync(join(tmpdir(), "orca-v1-"));
+  dirsOfCurrentScenario.push(tmpV1);
+  const activeCfgPath = join(REPO, ".orca", "_tmp-v1a.config.json");
+  const loopCfgPath = join(REPO, ".orca", "_tmp-v1b.config.json");
+  const gwCfgPath = join(REPO, ".orca", "_tmp-v1c.config.json");
+  try {
+    writeFileSync(activeCfgPath, JSON.stringify({
+      defaults: {
+        timeoutMs: 1200,
+        hardTimeoutMs: 2200,
+        watchdog: { enabled: true, extendOnActivity: true, extendStepMs: 5000, activityFreshMs: 10000, stallTimeoutMs: 0, maxRuntimeMs: 0 },
+      },
+      pipeline: [{ id: "alpha", title: "Alpha", agent: "stub", spec: "Long work writing {out}.", writes: "A.md" }],
+    }));
+    const rActive = await runFlow({
+      name: "v1a-active",
+      config: "_tmp-v1a.config.json",
+      scenario: "v5-watchdog-active.cjs",
+      args: ["--ledger-home", join(tmpV1, "ledger-a")],
+      budgetMs: 45000,
+    });
+    eq("V1a active worker succeeded despite crossing initial hardTimeoutMs", rActive.code, 0);
+    ok("V1a watchdog logged deadline extension", /[watchdog].*extending deadline/.test(rActive.out + rActive.err));
+    eq("V1a status overall succeeded", rActive.status?.overall, "succeeded");
+
+    // E2E V1b: output dead-loop without fallback -> fails fast with diagnosis + ledger event
+    writeFileSync(loopCfgPath, JSON.stringify({
+      defaults: {
+        timeoutMs: 10000,
+        hardTimeoutMs: 30000,
+        watchdog: { enabled: true, loopThreshold: 4 },
+      },
+      pipeline: [{ id: "alpha", title: "Alpha", agent: "stub", spec: "Looping work writing {out}.", writes: "A.md" }],
+    }));
+    const ledgerB = join(tmpV1, "ledger-b");
+    const rLoop = await runFlow({
+      name: "v1b-loop",
+      config: "_tmp-v1b.config.json",
+      scenario: "v5-watchdog-loop.cjs",
+      args: ["--ledger-home", ledgerB],
+      budgetMs: 30000,
+    });
+    eq("V1b dead-loop exited non-zero", rLoop.code, 1);
+    ok("V1b logged watchdog output_loop", /[watchdog:output_loop]/.test(rLoop.out + rLoop.err));
+
+    // E2E V1c: mid-run gateway ECONNREFUSED triggers seamless fallback from opencode2 -> agy
+    writeFileSync(gwCfgPath, JSON.stringify({
+      defaults: {
+        timeoutMs: 5000,
+        hardTimeoutMs: 25000,
+        preflight: { enabled: false },
+        watchdog: { enabled: true, fallbackOnGatewayError: true },
+      },
+      pipeline: [{
+        id: "backend",
+        title: "Backend Worker",
+        agent: "opencode2",
+        model: "magpie/remote-magpie/opencode-go/deepseek-v4.1-flash",
+        fallback: { agent: "agy", model: "claude-sonnet-5-5", effort: "medium" },
+        spec: "Implement API writing {out}.",
+        writes: "BACKEND.md",
+      }],
+    }));
+    const ledgerC = join(tmpV1, "ledger-c");
+    const rGw = await runFlow({
+      name: "v1c-gw-fallback",
+      config: "_tmp-v1c.config.json",
+      scenario: "v5-watchdog-gw-fallback.cjs",
+      args: ["--ledger-home", ledgerC],
+      budgetMs: 45000,
+    });
+    eq("V1c gateway fallback succeeded", rGw.code, 0);
+    ok("V1c logged watchdog gateway_disconnect", /[watchdog:gateway_disconnect]/.test(rGw.out + rGw.err));
+    ok("V1c logged fallback to agy", /[fallback].*downgrading from "opencode2" to "agy"/.test(rGw.out + rGw.err));
+    const starts = rGw.state?.extra?.starts || [];
+    eq("V1c dispatched primary then fallback", starts.map((s) => s.agent), ["opencode2", "agy"]);
+    eq("V1c fallback received model claude-sonnet-5-5", starts[1]?.model, "claude-sonnet-5-5");
+    eq("V1c fallback received effort medium", starts[1]?.effort, "medium");
+    const { listLedgerSummaries } = await import(join(REPO, ".orca", "ledger.mjs"));
+    const sumsC = listLedgerSummaries({ ledgerHome: ledgerC });
+    ok("V1c ledger recorded fallback event", (sumsC[0]?.fallbacks?.length || 0) >= 1);
+    eq("V1c ledger fallback toAgent=agy", sumsC[0]?.fallbacks?.[0]?.toAgent, "agy");
+    ok("V1c ledger recorded watchdog gateway_disconnect", sumsC[0]?.watchdogEvents?.some((e) => e.kind === "gateway_disconnect"));
+  } finally {
+    for (const f of [activeCfgPath, loopCfgPath, gwCfgPath]) { try { rmSync(f, { force: true }); } catch {} }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// V2 — Pre-flight Primary/Fallback Health Check + agy Isolated Worktree Trust
+// ---------------------------------------------------------------------------
+scenario("V2 Preflight auto-downgrade (ECONNREFUSED) + agy --settings trustedWorkspaces", async () => {
+  const { buildAgentCommand, buildAgySettingsArg, isAgyCmd } = await import(join(REPO, ".orca", "lib", "orca-cli.mjs"));
+  const { discoverOpencodeLocalEndpoints, buildCandidateChain, selectHealthyCandidate } = await import(join(REPO, ".orca", "preflight.mjs"));
+  const net = await import("node:net");
+
+  // Unit assertions for agy command builder (session-scoped --settings, never mutates global file)
+  ok("V2 isAgyCmd detects agy", isAgyCmd("agy"));
+  ok("V2 isAgyCmd detects antigravity", isAgyCmd("antigravity --model gemini"));
+  const agyCmd = buildAgentCommand("agy", "claude-sonnet-5-5", {
+    autoRun: true,
+    effort: "medium",
+    worktreePath: "/tmp/sxcj-wt-backend",
+    isWin: false,
+  });
+  ok("V2 agy command includes --model", agyCmd.includes("--model claude-sonnet-5-5"));
+  ok("V2 agy command includes --effort", agyCmd.includes("--effort medium"));
+  ok("V2 agy command includes --dangerously-skip-permissions", agyCmd.includes("--dangerously-skip-permissions"));
+  ok("V2 agy command injects session-scoped trustedWorkspaces", agyCmd.includes(`--settings '{"trustedWorkspaces":["/tmp/sxcj-wt-backend"]}'`));
+  ok("V2 buildAgySettingsArg handles single dir", buildAgySettingsArg("/a/b", { isWin: false }).includes('{"trustedWorkspaces":["/a/b"]}'));
+
+  // Unit assertion for opencode.json localhost Magpie discovery
+  const tmpV2 = mkdtempSync(join(tmpdir(), "orca-v2-"));
+  dirsOfCurrentScenario.push(tmpV2);
+  writeFileSync(join(tmpV2, "opencode.json"), JSON.stringify({
+    provider: {
+      magpie: { options: { baseURL: "http://127.0.0.1:3425/v1" } },
+      cloud: { options: { baseURL: "https://api.example.com/v1" } },
+    },
+  }));
+  const eps = discoverOpencodeLocalEndpoints({ projectDir: tmpV2, model: "magpie/remote-magpie/opencode-go/deepseek-v4.1-flash" });
+  eq("V2 discovered local magpie endpoint", eps.length, 1);
+  eq("V2 magpie port is 3425", eps[0]?.port, 3425);
+
+  // Allocate a guaranteed-closed ephemeral port for ECONNREFUSED preflight test
+  const closedPort = await new Promise((resolvePort) => {
+    const srv = net.createServer();
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = srv.address();
+      srv.close(() => resolvePort(port));
+    });
+  });
+
+  const chain = buildCandidateChain(
+    { id: "w1", agent: "opencode2", model: "magpie/ds", preflight: { tcp: `127.0.0.1:${closedPort}`, timeoutMs: 500 }, fallback: { agent: "agy", model: "claude-sonnet-5-5", effort: "medium" } },
+    { defaults: { preflight: { enabled: true, timeoutMs: 500 } } }
+  );
+  const sel = await selectHealthyCandidate(chain, { projectDir: tmpV2 });
+  eq("V2 preflight downgraded to fallback", sel.downgraded, true);
+  eq("V2 selected fallback agent agy", sel.candidate?.agent, "agy");
+  ok("V2 failure reason recorded ECONNREFUSED", /ECONNREFUSED/i.test(sel.failures[0]?.reason || ""));
+
+  // E2E: runFlow with terminal-ok.cjs -> primary opencode2 fails TCP preflight -> agy launches via manualStart with --settings trustedWorkspaces!
+  const pfCfgPath = join(REPO, ".orca", "_tmp-v2-pf.config.json");
+  const ledgerV2 = join(tmpV2, "ledger");
+  try {
+    writeFileSync(pfCfgPath, JSON.stringify({
+      defaults: {
+        timeoutMs: 15000,
+        hardTimeoutMs: 30000,
+        warmupTimeoutMs: 25000,
+        startGraceMs: 4000,
+        preflight: { enabled: true, timeoutMs: 500 },
+        agentFallbacks: {
+          opencode2: [{ agent: "agy", model: "claude-sonnet-5-5", effort: "medium" }],
+        },
+      },
+      pipeline: [{
+        id: "backend",
+        title: "Backend Worker",
+        agent: "opencode2",
+        model: "magpie/remote-magpie/opencode-go/deepseek-v4.1-flash",
+        preflight: { tcp: `127.0.0.1:${closedPort}`, timeoutMs: 500 },
+        spec: "Build backend writing {out}.",
+        writes: "BACKEND.md",
+      }],
+    }));
+    const r = await runFlow({
+      name: "v2-preflight-agy",
+      config: "_tmp-v2-pf.config.json",
+      scenario: "terminal-ok.cjs",
+      args: ["--ledger-home", ledgerV2],
+      budgetMs: 60000,
+    });
+    eq("V2 E2E preflight downgrade succeeded", r.code, 0);
+    ok("V2 E2E logged preflight downgrade", /[preflight].*auto-downgrading to fallback "agy"/.test(r.out + r.err));
+    const tcCalls = r.by("terminal create");
+    eq("V2 E2E created 1 terminal (skipped dead primary)", tcCalls.length, 1);
+    const launchedCmd = tcCalls[0]?.flags?.command || "";
+    ok("V2 E2E terminal command uses agy", launchedCmd.startsWith("agy "));
+    ok("V2 E2E terminal command has model & effort", launchedCmd.includes("--model claude-sonnet-5-5") && launchedCmd.includes("--effort medium"));
+    ok("V2 E2E terminal command injects trustedWorkspaces for worktree", launchedCmd.includes(`--settings '{"trustedWorkspaces":[`) && launchedCmd.includes(r.wt));
+    const { listLedgerSummaries } = await import(join(REPO, ".orca", "ledger.mjs"));
+    const sums = listLedgerSummaries({ ledgerHome: ledgerV2 });
+    eq("V2 E2E ledger recorded preflight fallback", sums[0]?.fallbacks?.[0]?.phase, "preflight");
+    eq("V2 E2E ledger fallback toAgent=agy", sums[0]?.fallbacks?.[0]?.toAgent, "agy");
+  } finally {
+    try { rmSync(pfCfgPath, { force: true }); } catch {}
+  }
+});
+
+// ---------------------------------------------------------------------------
+// V3 — GitHub / Gitea Issue + PR Full Traceability Loop
+// ---------------------------------------------------------------------------
+scenario("V3 Issue Tracker (BACKLOG_DAG -> Epic/Task Issues -> Ledger -> PR Closes/Refs)", async () => {
+  const { parseBacklogTasks, parseRemoteHost, formatIssuePrBlock } = await import(join(REPO, ".orca", "issue-tracker.mjs"));
+
+  // Unit assertions
+  const parsed = parseBacklogTasks([
+    "# Backlog",
+    "### T1: Migrate SQLite schema to MySQL",
+    "- [ ] T2: Add pytest suite and GitHub Actions CI",
+    "| T3 | Build Vue dashboard filter | frontend |",
+    "| id | title | owner |",
+    "| --- | --- | --- |",
+  ].join("\n"));
+  eq("V3 parsed 3 backlog tasks", parsed.length, 3);
+  eq("V3 task 1 id", parsed[0].id, "T1");
+  eq("V3 task 2 id", parsed[1].id, "T2");
+  eq("V3 task 3 owner", parsed[2].owner, "frontend");
+  eq("V3 parseRemoteHost rejects local path", parseRemoteHost("/tmp/origin.git").isRemote, false);
+  eq("V3 parseRemoteHost parses GitHub SSH", parseRemoteHost("git@github.com:shown1985/sxcj.git").repoSlug, "shown1985/sxcj");
+
+  const fmt = formatIssuePrBlock({ epic: { number: 10 }, tasks: [{ number: 11 }, { number: 12 }] });
+  eq("V3 issueCloses includes Closes tasks + Refs epic", fmt.issueCloses, "Closes #11, Closes #12\nRefs #10");
+
+  // E2E with fake gh CLI executable
+  const tmpV3 = mkdtempSync(join(tmpdir(), "orca-v3-"));
+  dirsOfCurrentScenario.push(tmpV3);
+  const ghStateFile = join(tmpV3, "gh-state.json");
+  const fakeGhPath = join(tmpV3, "fake-gh.mjs");
+  writeFileSync(fakeGhPath, `#!/usr/bin/env node
+import fs from "node:fs";
+const sf = ${JSON.stringify(ghStateFile)};
+const st = fs.existsSync(sf) ? JSON.parse(fs.readFileSync(sf, "utf8")) : { next: 101, created: [], comments: [] };
+const a = process.argv.slice(2);
+if (a[0] === "--version") { console.log("gh version 2.60.0 (fake)"); process.exit(0); }
+if (a[0] === "auth" && a[1] === "status") { console.log("Logged in to github.com as tester"); process.exit(0); }
+if (a[0] === "issue" && a[1] === "create") {
+  const num = st.next++;
+  const ti = a.indexOf("--title"), bi = a.indexOf("--body");
+  st.created.push({ number: num, title: ti >= 0 ? a[ti + 1] : "", body: bi >= 0 ? a[bi + 1] : "" });
+  fs.writeFileSync(sf, JSON.stringify(st, null, 2));
+  console.log("https://github.com/example/sxcj/issues/" + num);
+  process.exit(0);
+}
+if (a[0] === "issue" && a[1] === "comment") {
+  const bi = a.indexOf("--body");
+  st.comments.push({ number: Number(a[2]), body: bi >= 0 ? a[bi + 1] : "" });
+  fs.writeFileSync(sf, JSON.stringify(st, null, 2));
+  console.log("comment ok");
+  process.exit(0);
+}
+process.exit(0);
+`, { mode: 0o755 });
+
+  const issCfgPath = join(REPO, ".orca", "_tmp-v3-issues.config.json");
+  const ledgerV3 = join(tmpV3, "ledger");
+  try {
+    writeFileSync(issCfgPath, JSON.stringify({
+      defaults: {
+        timeoutMs: 10000,
+        issueTracking: { mode: true, provider: "gh", closeOnPr: true },
+      },
+      pipeline: [
+        { id: "po-backlog", title: "PO Backlog", agent: "stub", spec: "Plan tasks into {out}.", writes: "BACKLOG_DAG.md" },
+        { id: "pr-release-dev", title: "Release PR", agent: "stub", reads: ["po-backlog"], spec: "Open PR and include: {issueCloses}. Write {out}.", writes: "EPIC_RELEASE_GATE.md" },
+      ],
+    }));
+    const r = await runFlow({
+      name: "v3-issues",
+      config: "_tmp-v3-issues.config.json",
+      scenario: "v5-issues.cjs",
+      objective: "Migrate sxcj to MySQL and CI/CD",
+      args: ["--ledger-home", ledgerV3],
+      env: { ORCA_ISSUE_CLI: fakeGhPath, ORCA_ISSUE_ALLOW_LOCAL: "1" },
+      budgetMs: 45000,
+    });
+    eq("V3 E2E issue traceability run succeeded", r.code, 0);
+    const ghState = JSON.parse(readFileSync(ghStateFile, "utf8"));
+    eq("V3 created 1 Epic + 2 Task issues", ghState.created.length, 3);
+    eq("V3 Epic issue is #101", ghState.created[0].number, 101);
+    ok("V3 Task #102 references Epic #101", ghState.created[1].body.includes("Part of Epic #101"));
+    eq("V3 posted checklist comment on Epic #101", ghState.comments.length, 1);
+    ok("V3 checklist comment links #102 and #103", ghState.comments[0].body.includes("#102") && ghState.comments[0].body.includes("#103"));
+
+    const issuesJson = JSON.parse(readFileSync(join(r.wt, ".orca", "artifacts", "ISSUES.json"), "utf8"));
+    eq("V3 ISSUES.json records epic #101", issuesJson.epic?.number, 101);
+    eq("V3 ISSUES.json records 2 tasks", issuesJson.tasks?.length, 2);
+    ok("V3 ISSUES.md generated", existsSync(join(r.wt, ".orca", "artifacts", "ISSUES.md")));
+
+    const prTask = Object.values(r.state?.tasks || {}).find((t) => (t.spec || "").includes("# Release PR"));
+    ok("V3 PR step spec contains Closes #102, Closes #103", (prTask?.spec || "").includes("Closes #102, Closes #103"));
+    ok("V3 PR step spec contains Refs #101", (prTask?.spec || "").includes("Refs #101"));
+
+    const { listLedgerSummaries } = await import(join(REPO, ".orca", "ledger.mjs"));
+    const sums = listLedgerSummaries({ ledgerHome: ledgerV3 });
+    eq("V3 ledger recorded epic #101", sums[0]?.issues?.epic?.number, 101);
+    eq("V3 ledger recorded 2 tasks", sums[0]?.issues?.tasks?.length, 2);
+  } finally {
+    try { rmSync(issCfgPath, { force: true }); } catch {}
+  }
+});
+
+// ---------------------------------------------------------------------------
+// V4 — Stack-Aware CI Generator (Hybrid Python+Vue+Docker) & Intranet CD
+// ---------------------------------------------------------------------------
+scenario("V4 CI/CD Generator (hybrid Python+Vue+Docker CI + Self-Hosted Intranet CD)", async () => {
+  const { detectProjectStacks } = await import(join(REPO, ".orca", "ci-generator.mjs"));
+  const { spawnSync } = await import("node:child_process");
+
+  const tmpV4 = mkdtempSync(join(tmpdir(), "orca-v4-sxcj-"));
+  dirsOfCurrentScenario.push(tmpV4);
+  mkdirSync(join(tmpV4, "backend", "tests"), { recursive: true });
+  mkdirSync(join(tmpV4, "frontend"), { recursive: true });
+  writeFileSync(join(tmpV4, "backend", "requirements.txt"), "fastapi==0.115.0\npytest==8.3.0\nruff==0.7.0\n");
+  writeFileSync(join(tmpV4, "backend", "Dockerfile"), "FROM python:3.12-slim\n");
+  writeFileSync(join(tmpV4, "backend", "tests", "test_health.py"), "def test_ok(): assert True\n");
+  writeFileSync(join(tmpV4, "frontend", "package.json"), JSON.stringify({
+    name: "sxcj-web",
+    scripts: { lint: "eslint .", test: "vitest run", build: "vite build" },
+    dependencies: { vue: "^3.5.0" },
+    devDependencies: { vite: "^5.4.0", vitest: "^2.1.0" },
+  }, null, 2));
+  writeFileSync(join(tmpV4, "frontend", "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+  writeFileSync(join(tmpV4, "docker-compose.yml"), "services:\n  api:\n    build: ./backend\n");
+
+  const det = detectProjectStacks(tmpV4);
+  eq("V4 detected 1 Python stack (backend)", det.python.length, 1);
+  eq("V4 Python dir is backend", det.python[0].dir, "backend");
+  eq("V4 Python hasPytest=true & hasRuff=true", [det.python[0].hasPytest, det.python[0].hasRuff], [true, true]);
+  eq("V4 detected 1 Node stack (frontend)", det.node.length, 1);
+  eq("V4 Node dir is frontend & pm is pnpm", [det.node[0].dir, det.node[0].packageManager], ["frontend", "pnpm"]);
+  eq("V4 detected docker-compose.yml", det.composeFile, "docker-compose.yml");
+
+  // Run CLI generator with --self-hosted-cd
+  const gen = spawnSync(NODE, [
+    join(REPO, ".orca", "ci-generator.mjs"),
+    "--dir", tmpV4, "--write", "--self-hosted-cd",
+    "--health-url", "http://127.0.0.1:8000/api/health",
+    "--deploy-branch", "main",
+  ], { encoding: "utf8" });
+  eq("V4 ci-generator CLI exited 0", gen.status, 0);
+
+  const ciYml = readFileSync(join(tmpV4, ".github", "workflows", "ci-release.yml"), "utf8");
+  ok("V4 CI has verify-python-backend job", ciYml.includes("verify-python-backend:"));
+  ok("V4 CI runs ruff and pytest", ciYml.includes("ruff check .") && ciYml.includes("pytest -q"));
+  ok("V4 CI has verify-node-frontend job", ciYml.includes("verify-node-frontend:"));
+  ok("V4 CI runs pnpm install & pnpm run build", ciYml.includes("pnpm install") && ciYml.includes("pnpm run build"));
+  ok("V4 CI has verify-docker compose config validation", ciYml.includes('docker compose -f "docker-compose.yml" config --quiet'));
+  ok("V4 CI tokenhub review waits for all verify jobs", ciYml.includes("needs: [verify-python-backend, verify-node-frontend, verify-docker]"));
+
+  const cdYml = readFileSync(join(tmpV4, ".github", "workflows", "cd-selfhosted.yml"), "utf8");
+  ok("V4 CD runs on self-hosted runner", cdYml.includes("runs-on: [self-hosted, linux]"));
+  ok("V4 CD documents outbound HTTPS / zero public SSH", /OUTBOUND HTTPS/.test(cdYml) && /ZERO public SSH/.test(cdYml));
+  ok("V4 CD deploys via docker compose up -d --build", cdYml.includes('COMPOSE_FILE="docker-compose.yml"') && cdYml.includes('docker compose -f "$COMPOSE_FILE" up -d --build'));
+  ok("V4 CD has automated health check against configured URL", cdYml.includes("http://127.0.0.1:8000/api/health") && cdYml.includes("curl -fsS"));
+
+  // Verify bin/init.mjs on a fresh hybrid project auto-tailors CI workflow!
+  const tmpV4Init = mkdtempSync(join(tmpdir(), "orca-v4-init-"));
+  dirsOfCurrentScenario.push(tmpV4Init);
+  mkdirSync(join(tmpV4Init, "backend"), { recursive: true });
+  writeFileSync(join(tmpV4Init, "backend", "requirements.txt"), "pytest\n");
+  const initRes = await runInit({ name: "v4-init", dir: tmpV4Init, args: ["--no-interactive", "--self-hosted-cd"] });
+  eq("V4 init with --self-hosted-cd exited 0", initRes.code, 0);
+  const tailoredCi = readFileSync(join(tmpV4Init, ".github", "workflows", "ci-release.yml"), "utf8");
+  ok("V4 init auto-tailored CI for Python backend", tailoredCi.includes("verify-python-backend:"));
+  ok("V4 init created cd-selfhosted.yml", existsSync(join(tmpV4Init, ".github", "workflows", "cd-selfhosted.yml")));
 });
 
 // ---------------------------------------------------------------------------

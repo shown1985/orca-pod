@@ -34,21 +34,38 @@ export function createNudgeController({
     });
     if (ws.deadlineExceeded || !ws.ok) return null;
     const wsJson = res(ws.json);
-    const wsDispId = pick(wsJson, ["dispatchId", "dispatch_id"])
-      || pick(wsJson.dispatch || {}, ["id", "dispatchId", "dispatch_id"])
-      || pick(ws.json || {}, ["dispatchId", "dispatch_id"])
-      || null;
-    if (!wsDispId || wsDispId !== m.dispatchId) {
-      warn(`[nudge] ignoring worker-show terminal for "${m.step.title}": returned dispatchId "${wsDispId || "missing"}" !== active "${m.dispatchId}"`);
+    const rawDispIds = [
+      wsJson?.dispatchId,
+      wsJson?.dispatch_id,
+      wsJson?.dispatch?.id,
+      wsJson?.dispatch?.dispatchId,
+      wsJson?.dispatch?.dispatch_id,
+      ws.json?.dispatchId,
+      ws.json?.dispatch_id,
+      ws.json?.dispatch?.id,
+      ws.json?.dispatch?.dispatchId,
+      ws.json?.dispatch?.dispatch_id,
+    ]
+      .filter((v) => typeof v === "string" && v.trim())
+      .map((v) => v.trim());
+    const uniqueDispIds = [...new Set(rawDispIds)];
+    if (uniqueDispIds.length === 0 || uniqueDispIds.some((id) => id !== m.dispatchId)) {
+      warn(`[nudge] ignoring worker-show terminal for "${m.step.title}": dispatch IDs [${uniqueDispIds.join(", ") || "missing"}] do not unanimously match active "${m.dispatchId}"`);
       return null;
     }
     const t = pick(wsJson, ["terminal"]) || {};
-    const id = pick(t, ["id", "terminalId", "terminal_id", "handle", "terminalHandle"]);
-    if (id) {
-      m.nudgeTerminal = id;
-      m.nudgeTerminalDispatchId = m.dispatchId;
-    }
-    return id || null;
+    const termIds = [
+      t?.id, t?.terminalId, t?.terminal_id, t?.handle, t?.terminalHandle,
+      wsJson?.terminalHandle, wsJson?.terminal_handle,
+    ]
+      .filter((v) => typeof v === "string" && v.trim())
+      .map((v) => v.trim());
+    const uniqueTermIds = [...new Set(termIds)];
+    if (uniqueTermIds.length !== 1) return null;
+    const id = uniqueTermIds[0];
+    m.nudgeTerminal = id;
+    m.nudgeTerminalDispatchId = m.dispatchId;
+    return id;
   }
 
   function send(m, text) {

@@ -383,14 +383,21 @@ export function createRunLedger({
 
     recordDispatchResult({
       requestId, stepId, dispatchId = null, terminal = null, turnStart = "unobserved", state = null,
-      effectiveAgent = null, effectiveModel = null, effectiveEffort = null, executedFamilies = null,
+      effectiveAgent = null, effectiveModel = undefined, effectiveModelResolved = false,
+      effectiveEffort = undefined, effectiveEffortResolved = false, executedFamilies = null,
     }) {
       const cur = summary.steps[stepId] || {};
       const mergedFams = Array.isArray(executedFamilies)
         ? [...new Set([...(cur.executedFamilies || []), ...executedFamilies])]
         : (cur.executedFamilies || []);
-      const resolvedEffModel = effectiveModel || cur.model || "default";
-      const resolvedEffEffort = effectiveEffort !== undefined ? effectiveEffort : (cur.effort || null);
+      // P2-01: When `effectiveModelResolved` / `effectiveEffortResolved` is true (or `effectiveModel === null`
+      // was explicitly passed), preserve `null` instead of backfilling pre-estimated `cur.model` / `cur.effort`!
+      const resolvedEffModel = (effectiveModelResolved || effectiveModel === null)
+        ? (effectiveModel ?? null)
+        : (effectiveModel !== undefined ? (effectiveModel || cur.model || "default") : (cur.model || "default"));
+      const resolvedEffEffort = effectiveEffortResolved
+        ? (effectiveEffort ?? null)
+        : (effectiveEffort !== undefined ? effectiveEffort : (cur.effort || null));
       summary.steps[stepId] = {
         ...cur,
         agent: effectiveAgent || cur.agent,
@@ -408,8 +415,8 @@ export function createRunLedger({
       return append("result", {
         requestId, stepId, dispatchId, terminal, turnStart, state,
         effectiveAgent: effectiveAgent || cur.agent,
-        effectiveModel: effectiveModel || cur.model || "default",
-        effectiveEffort: effectiveEffort ?? null,
+        effectiveModel: resolvedEffModel,
+        effectiveEffort: resolvedEffEffort,
         executedFamilies: mergedFams,
       }, { critical: false });
     },

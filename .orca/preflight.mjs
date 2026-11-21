@@ -297,8 +297,8 @@ export function tokenizeShellCommand(cmdStr) {
     if (ch === ";" || ch === "|" || ch === "&" || ch === "`" || ch === "<" || ch === ">" || ch === "(" || ch === ")") {
       return { ok: false, parseable: false, tokens: [], tokenSpans: [], commentStart: -1, reason: "shell_control_operator" };
     }
-    // Reject unquoted variable, command, brace (`{a,b}`), glob (`*`, `?`), or tilde (`~`) expansions!
-    if (ch === "$" || ch === "{" || ch === "}" || ch === "*" || ch === "?" || (!inToken && ch === "~")) {
+    // Reject unquoted variable, command, brace (`{a,b}`), bracket/char-class (`[56]`), glob (`*`, `?`), or tilde (`~`) expansions!
+    if (ch === "$" || ch === "{" || ch === "}" || ch === "[" || ch === "]" || ch === "*" || ch === "?" || (!inToken && ch === "~")) {
       return { ok: false, parseable: false, tokens: [], tokenSpans: [], commentStart: -1, reason: "shell_expansion" };
     }
     if (ch === "'" || ch === '"') {
@@ -364,6 +364,36 @@ export function stripUnquotedShellComment(cmdStr) {
     inToken = true;
   }
   return src.trimEnd();
+}
+
+/**
+ * Validate that a candidate `model` or `effort` value is a single safe CLI token
+ * with ZERO whitespace, quotes, backslashes, shell metacharacters, globs (`[...]`, `*`, `?`, `{...}`),
+ * or leading `-` option prefixes (preventing flag injection like `"claude-sonnet-5-5 --model gpt-6.2-sol"`).
+ */
+export function isSafeSingleTokenValue(val) {
+  if (typeof val !== "string") return false;
+  if (!val || val !== val.trim()) return false;
+  if (/[\s"'\\$`|&;<>(){}[\]*?~#!]/.test(val)) return false;
+  if (val.startsWith("-")) return false;
+  return true;
+}
+
+/**
+ * Insert synthesized CLI flags BEFORE any `--` end-of-options terminator (whether
+ * written `--`, `"--"`, `'--'`, or `\-\-`) using `parseAgentCommandSpec` token spans!
+ */
+export function appendFlagsBeforeTerminator(cmdStr, extraFlags, parsedSpec = null) {
+  if (!extraFlags.length) return cmdStr;
+  const parsed = parsedSpec || parseAgentCommandSpec(cmdStr);
+  if (!parsed.parseable) return cmdStr;
+  const flagBlock = extraFlags.join(" ");
+  if (parsed.hasOptionTerminator && parsed.optionTerminatorRawStart >= 0) {
+    const prefix = cmdStr.slice(0, parsed.optionTerminatorRawStart).trimEnd();
+    const suffix = cmdStr.slice(parsed.optionTerminatorRawStart);
+    return prefix ? `${prefix} ${flagBlock} ${suffix}` : `${flagBlock} ${suffix}`;
+  }
+  return `${cmdStr} ${flagBlock}`;
 }
 
 /**
@@ -471,6 +501,9 @@ export function parseAgentCommandSpec(agentCmd) {
         explicitDefaultModel = true;
         embeddedModel = "default";
       } else {
+        if (!isSafeSingleTokenValue(mv)) {
+          return { raw, parseable: false, parseReason: "invalid_model_token", argv, baseAgent, lowerBase, isKiro, embeddedModel: null, explicitDefaultModel: false, embeddedEffort: null, hasModelFlag: true, hasEffortFlag, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator, optionTerminatorRawStart };
+        }
         explicitDefaultModel = false;
         embeddedModel = mv;
       }
@@ -480,12 +513,15 @@ export function parseAgentCommandSpec(agentCmd) {
       hasModelFlag = true;
       const mv = t.slice(t.indexOf("=") + 1).trim();
       if (!mv) {
-        return { raw, parseable: false, parseReason: "empty_model_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel: null, explicitDefaultModel: false, embeddedEffort: null, hasModelFlag: true, hasEffortFlag, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator };
+        return { raw, parseable: false, parseReason: "empty_model_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel: null, explicitDefaultModel: false, embeddedEffort: null, hasModelFlag: true, hasEffortFlag, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator, optionTerminatorRawStart };
       }
       if (mv.toLowerCase() === "default") {
         explicitDefaultModel = true;
         embeddedModel = "default";
       } else {
+        if (!isSafeSingleTokenValue(mv)) {
+          return { raw, parseable: false, parseReason: "invalid_model_token", argv, baseAgent, lowerBase, isKiro, embeddedModel: null, explicitDefaultModel: false, embeddedEffort: null, hasModelFlag: true, hasEffortFlag, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator, optionTerminatorRawStart };
+        }
         explicitDefaultModel = false;
         embeddedModel = mv;
       }
@@ -495,16 +531,22 @@ export function parseAgentCommandSpec(agentCmd) {
     if (t === "--effort" || t === "--reasoning-effort") {
       hasEffortFlag = true;
       if (i + 1 >= argv.length) {
-        return { raw, parseable: false, parseReason: "dangling_effort_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel, explicitDefaultModel, embeddedEffort: null, hasModelFlag, hasEffortFlag: true, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator };
+        return { raw, parseable: false, parseReason: "dangling_effort_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel, explicitDefaultModel, embeddedEffort: null, hasModelFlag, hasEffortFlag: true, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator, optionTerminatorRawStart };
       }
       const ev = String(argv[++i] || "").trim();
-      if (ev) embeddedEffort = ev;
+      if (!ev || !isSafeSingleTokenValue(ev)) {
+        return { raw, parseable: false, parseReason: "invalid_effort_token", argv, baseAgent, lowerBase, isKiro, embeddedModel, explicitDefaultModel, embeddedEffort: null, hasModelFlag, hasEffortFlag: true, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator, optionTerminatorRawStart };
+      }
+      embeddedEffort = ev;
       continue;
     }
     if (t.startsWith("--effort=") || t.startsWith("--reasoning-effort=")) {
       hasEffortFlag = true;
       const ev = t.slice(t.indexOf("=") + 1).trim();
-      if (ev) embeddedEffort = ev;
+      if (!ev || !isSafeSingleTokenValue(ev)) {
+        return { raw, parseable: false, parseReason: "invalid_effort_token", argv, baseAgent, lowerBase, isKiro, embeddedModel, explicitDefaultModel, embeddedEffort: null, hasModelFlag, hasEffortFlag: true, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator, optionTerminatorRawStart };
+      }
+      embeddedEffort = ev;
       continue;
     }
 
@@ -557,11 +599,10 @@ export function parseAgentCommandSpec(agentCmd) {
 }
 
 export function resolveEffectiveLaunchSpec(agent, model = null, effort = null, { projectDir = null, configPaths = null } = {}) {
-  const parsed = parseAgentCommandSpec(agent);
-  const reqModel = (model != null && String(model).trim() && String(model).trim().toLowerCase() !== "default")
-    ? String(model).trim()
-    : null;
-  const reqEffort = (effort != null && String(effort).trim()) ? String(effort).trim() : null;
+  const cleanAgent = stripUnquotedShellComment(String(agent || "").trim());
+  const parsed = parseAgentCommandSpec(cleanAgent);
+  const rawModelStr = model != null ? String(model).trim() : "";
+  const rawEffortStr = effort != null ? String(effort).trim() : "";
 
   if (!parsed.parseable) {
     return {
@@ -578,34 +619,83 @@ export function resolveEffectiveLaunchSpec(agent, model = null, effort = null, {
     };
   }
 
-  // P0-03 & P2-01: If the command explicitly passed `--model default` (or `-m default`),
-  // the launched CLI receives literal `default` (step `reqModel` and project `opencode.json`
-  // default model do NOT override an explicit CLI `--model default` flag!). Keep `passedModel: null`,
-  // `effectiveModel: "default"` -> `family: "unknown"` (fail closed for cross-family proof!).
-  let passedModel = null;
-  if (!parsed.isKiro) {
-    if (parsed.explicitDefaultModel) {
-      passedModel = null;
-    } else {
-      passedModel = parsed.embeddedModel || reqModel || null;
-    }
+  // P0-03: Strictly reject multi-token / flag-injecting / globbing `model` or `effort` values
+  // (e.g. `"claude-sonnet-5-5 --model gpt-6.2-sol"` or `"claude-sonnet-5-[56]"`) so preflight
+  // NEVER admits a candidate whose shell argv would diverge or expand!
+  if (rawModelStr && rawModelStr.toLowerCase() !== "default" && !isSafeSingleTokenValue(rawModelStr)) {
+    return {
+      agent: parsed.raw,
+      parseable: false,
+      parseReason: "invalid_model_value",
+      baseAgent: parsed.baseAgent,
+      embeddedModel: null,
+      explicitDefaultModel: false,
+      embeddedEffort: null,
+      passedModel: null,
+      effectiveModel: null,
+      effectiveEffort: null,
+    };
   }
+  if (rawEffortStr && !isSafeSingleTokenValue(rawEffortStr)) {
+    return {
+      agent: parsed.raw,
+      parseable: false,
+      parseReason: "invalid_effort_value",
+      baseAgent: parsed.baseAgent,
+      embeddedModel: null,
+      explicitDefaultModel: false,
+      embeddedEffort: null,
+      passedModel: null,
+      effectiveModel: null,
+      effectiveEffort: null,
+    };
+  }
+
+  const reqModel = (rawModelStr && rawModelStr.toLowerCase() !== "default") ? rawModelStr : null;
+  const reqEffort = rawEffortStr || null;
+
+  // P0-03 & P2-01: Synthesize the exact final launch command using `appendFlagsBeforeTerminator`
+  // and re-parse its final `argv` so preflight family classification and real shell execution
+  // derive `passedModel` and `effectiveEffort` from the IDENTICAL final argv!
+  const synthFlags = [];
+  if (reqModel && !parsed.hasModelFlag && !parsed.isKiro) synthFlags.push(`--model ${reqModel}`);
+  if (reqEffort && !parsed.hasEffortFlag && !parsed.isKiro) synthFlags.push(`--effort ${reqEffort}`);
+  const synthesizedCmd = appendFlagsBeforeTerminator(cleanAgent, synthFlags, parsed);
+  const finalParsed = parseAgentCommandSpec(synthesizedCmd);
+  if (!finalParsed.parseable) {
+    return {
+      agent: parsed.raw,
+      parseable: false,
+      parseReason: finalParsed.parseReason,
+      baseAgent: parsed.baseAgent,
+      embeddedModel: null,
+      explicitDefaultModel: false,
+      embeddedEffort: null,
+      passedModel: null,
+      effectiveModel: null,
+      effectiveEffort: null,
+    };
+  }
+
+  const passedModel = (!finalParsed.isKiro && !finalParsed.explicitDefaultModel)
+    ? (finalParsed.embeddedModel || null)
+    : null;
   let configModel = null;
-  if (!passedModel && !parsed.explicitDefaultModel && (parsed.lowerBase === "opencode" || parsed.lowerBase === "opencode2") && (projectDir || configPaths)) {
+  if (!passedModel && !finalParsed.explicitDefaultModel && (finalParsed.lowerBase === "opencode" || finalParsed.lowerBase === "opencode2") && (projectDir || configPaths)) {
     const oc = resolveOpencodeConfig({ projectDir: projectDir || process.cwd(), configPaths });
     if (oc.configuredModel) configModel = oc.configuredModel;
   }
-  const effectiveModel = parsed.explicitDefaultModel
+  const effectiveModel = finalParsed.explicitDefaultModel
     ? "default"
     : (passedModel || configModel || null);
-  const effectiveEffort = parsed.embeddedEffort || reqEffort || null;
+  const effectiveEffort = finalParsed.embeddedEffort || null;
   return {
     agent: parsed.raw,
     parseable: true,
     parseReason: null,
-    baseAgent: parsed.baseAgent,
+    baseAgent: finalParsed.baseAgent,
     embeddedModel: parsed.embeddedModel,
-    explicitDefaultModel: parsed.explicitDefaultModel,
+    explicitDefaultModel: finalParsed.explicitDefaultModel,
     embeddedEffort: parsed.embeddedEffort,
     passedModel,
     effectiveModel,
@@ -1076,7 +1166,11 @@ export function filterCrossFamilyCandidates(
   }
 
   for (const cand of chain || []) {
-    const fam = cand.family ?? classifyModelFamily(cand.agent, cand.model, { projectDir });
+    const rawCandModel = cand.requestedModel !== undefined ? cand.requestedModel : cand.model;
+    const computedFam = classifyModelFamily(cand.agent, rawCandModel, { projectDir });
+    const fam = (computedFam === "unknown" && cand.family === "stub" && allowSyntheticStub)
+      ? "stub"
+      : (cand.agent ? computedFam : (cand.family ?? "unknown"));
     if (fam === "stub" && allowSyntheticStub) {
       allowed.push(cand);
       continue;

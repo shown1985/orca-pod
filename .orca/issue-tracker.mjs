@@ -357,7 +357,7 @@ function normalizeMarkdownRefKey(k) {
   return String(k || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-const MULTILINE_MD_REF_DEF_RE = /^[ \t]{0,3}\[([^\[\]]{1,999})\]:[ \t]*(?:\r?\n[ \t]*)?<?([^\s>\[\]]+)>?(?:[ \t]+(?:"[^"\r\n]*"|'[^'\r\n]*'|\([^)\r\n]*\)))?[ \t]*$/gm;
+const MULTILINE_MD_REF_DEF_RE = /^[ \t]{0,3}\[((?:\\.|[^\[\]\\]){1,999})\]:[ \t]*(?:\r?\n[ \t]*)?<?([^\s>\[\]]+)>?(?:[ \t]+(?:"[^"\r\n]*"|'[^'\r\n]*'|\([^)\r\n]*\)))?[ \t]*$/gm;
 
 function stripFencedBlocksForRefs(markdown) {
   const out = [];
@@ -429,10 +429,10 @@ export function extractExplicitLocalIssueNumber(text, { currentHost = null, curr
 
   // Remove single-line and multiline CommonMark reference definition blocks before scanning
   let sanitizedForScan = srcText.replace(new RegExp(MULTILINE_MD_REF_DEF_RE.source, "gm"), "");
-  // 1) Inline Markdown links `[label](url)`
-  sanitizedForScan = sanitizedForScan.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_full, label, rawUrl) => inspectResolvedLink(label, rawUrl));
+  // 1) Inline Markdown links `[label](url)` (supporting backslash-escaped `\[` / `\]`)
+  sanitizedForScan = sanitizedForScan.replace(/\[((?:\\.|[^\[\]\\])+)\]\(([^)]+)\)/g, (_full, label, rawUrl) => inspectResolvedLink(label, rawUrl));
   // 2) Full & collapsed reference-style Markdown links `[label][ref]` / `[label][]`
-  sanitizedForScan = sanitizedForScan.replace(/\[([^\]]+)\]\[([^\]]*)\]/g, (full, label, ref) => {
+  sanitizedForScan = sanitizedForScan.replace(/\[((?:\\.|[^\[\]\\])+)\]\[((?:\\.|[^\[\]\\])*)\]/g, (full, label, ref) => {
     const key = normalizeMarkdownRefKey(ref || label);
     if (!effectiveRefs.has(key)) {
       // Unresolved reference link: strip `#<digits>` from bracketed reference label to fail closed
@@ -442,7 +442,7 @@ export function extractExplicitLocalIssueNumber(text, { currentHost = null, curr
   });
   // 3) Shortcut reference links `[label]` when `label` matches a defined reference key
   if (effectiveRefs.size > 0) {
-    sanitizedForScan = sanitizedForScan.replace(/\[([^\]]+)\](?![(\[])/g, (full, label) => {
+    sanitizedForScan = sanitizedForScan.replace(/\[((?:\\.|[^\[\]\\])+)\](?![(\[])/g, (full, label) => {
       const key = normalizeMarkdownRefKey(label);
       if (!effectiveRefs.has(key)) return full;
       return inspectResolvedLink(label, effectiveRefs.get(key));
@@ -470,11 +470,12 @@ export function parseBacklogTasks(markdown, { maxTasks = 20, currentHost = null,
 
   const collectCandidate = ({ id = null, title, owner = null, existingNumber = null }) => {
     const cleanTitle = String(title || "")
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-      .replace(/\[([^\]]+)\]\[[^\]]*\]/g, "$1")
-      .replace(/\[([^\]]+)\](?![(\[])/g, (full, label) => (
+      .replace(/\[((?:\\.|[^\[\]\\])+)\]\([^)]+\)/g, "$1")
+      .replace(/\[((?:\\.|[^\[\]\\])+)\]\[(?:\\.|[^\[\]\\])*\]/g, "$1")
+      .replace(/\[((?:\\.|[^\[\]\\])+)\](?![(\[])/g, (full, label) => (
         docRefDefs.has(normalizeMarkdownRefKey(label)) ? label : full
       ))
+      .replace(/\\([\[\]])/g, "$1")
       .replace(/[*_`~]/g, "")
       .replace(/\s+/g, " ")
       .trim();
@@ -654,13 +655,19 @@ export function parseTrustedCreatedIssueUrl(stdout = "", { host = null, origin =
       }
     }
     if (repo) {
-      const normBase = String(basePath || "").trim().replace(/\/+$/, "").toLowerCase();
-      const basePrefix = normBase ? (normBase.startsWith("/") ? normBase : `/${normBase}`) : "";
+      const rawBase = String(basePath || "").trim().replace(/\/+$/, "");
+      const exactBasePrefix = rawBase && rawBase !== "/" ? (rawBase.startsWith("/") ? rawBase : `/${rawBase}`) : "";
       const normRepo = String(repo).replace(/^\/+|\/+$/g, "").toLowerCase();
-      const wantExactPath = `${basePrefix}/${normRepo}/issues/${num}`;
-      const gotPath = parsedUrl.pathname.replace(/\/+$/, "").toLowerCase();
-      // P1-07: Require EXACT `<basePath>/<owner>/<repo>/issues/<id>` match (reject arbitrary extra path prefixes!)
-      if (gotPath !== wantExactPath) continue;
+      const gotPath = parsedUrl.pathname.replace(/\/+$/, "");
+      // P1-07: Preserve exact case of `basePath` (HTTP server routing is case-sensitive!),
+      // requiring exact `<basePath>/<owner>/<repo>/issues/<id>` match!
+      if (exactBasePrefix) {
+        if (!gotPath.startsWith(`${exactBasePrefix}/`)) continue;
+        const remainder = gotPath.slice(exactBasePrefix.length);
+        if (remainder.toLowerCase() !== `/${normRepo}/issues/${num}`) continue;
+      } else {
+        if (gotPath.toLowerCase() !== `/${normRepo}/issues/${num}`) continue;
+      }
     }
     return { number: num, url: urlStr };
   }

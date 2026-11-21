@@ -491,30 +491,46 @@ export function createRunner({
     } else if (m.dispatchId) {
       const rel = orca(["orchestration", "worker-release", "--dispatch", m.dispatchId], { allowPostDeadlineCleanup: true, timeoutMs: 3000 });
       const relJson = res(rel.json);
-      const relDispId = pick(relJson, ["dispatchId", "dispatch_id", "id"]) || pick(relJson.dispatch || {}, ["id", "dispatchId"]) || null;
-      const relAction = String(pick(relJson, ["action", "status", "releaseStatus", "state"]) || "").trim().toLowerCase();
-      const keptOpen = Boolean(
+      const relDispIds = [
+        relJson?.dispatchId, relJson?.dispatch_id, relJson?.id,
+        relJson?.dispatch?.id, relJson?.dispatch?.dispatchId, relJson?.dispatch?.dispatch_id,
+        rel.json?.dispatchId, rel.json?.dispatch_id,
+        rel.json?.dispatch?.id, rel.json?.dispatch?.dispatchId,
+      ]
+        .filter((v) => typeof v === "string" && v.trim())
+        .map((v) => v.trim());
+      const unanimousRelDisp = relDispIds.length > 0 && relDispIds.every((id) => id === m.dispatchId);
+      const rawStatuses = [
+        relJson?.action, relJson?.status, relJson?.releaseStatus, relJson?.release_status, relJson?.state, relJson?.processAction, relJson?.process_action,
+        rel.json?.action, rel.json?.status, rel.json?.releaseStatus, rel.json?.release_status, rel.json?.state,
+      ]
+        .filter((v) => typeof v === "string" && v.trim())
+        .map((v) => v.trim().toLowerCase());
+      const relAction = rawStatuses[0] || "";
+      const keptOpenOrConflicting = Boolean(
         relJson?.keptOpen === true ||
         relJson?.kept_open === true ||
         relJson?.retained === true ||
-        relAction === "retained" ||
-        relAction === "kept_open" ||
-        relAction === "release_unknown" ||
-        relAction === "release_pending"
+        rel.json?.keptOpen === true ||
+        rel.json?.kept_open === true ||
+        rel.json?.retained === true ||
+        rawStatuses.some((s) => /^(?:retained|kept_open|keep_open|release_unknown|release_pending|pending|unknown|failed|none|fenced)$/.test(s))
       );
-      if (!rel.ok || relAction === "release_unknown" || relAction === "release_pending") {
+      const unanimousReleased = rawStatuses.length > 0 && rawStatuses.every((s) =>
+        /^(?:released|already_released|closed|closed_agent_terminal|stopped|terminated|not_found)$/.test(s)
+      );
+      if (!rel.ok || rawStatuses.includes("release_unknown") || rawStatuses.includes("release_pending")) {
         warn(`worker-release '${m.step.title}' (${m.dispatchId}) returned ${relAction || sanitizeText(rel.stderr || rel.raw, { maxLen: 200 })}`);
       }
       // P0-01: Respect Orca's supervised release retention decision — ONLY close `m.nudgeTerminal`
-      // when `nudgeTerminal` was positively attributed to `m.dispatchId` AND `worker-release`
-      // positively released `m.dispatchId` without `retained` / `keptOpen`!
+      // when ALL dispatch IDs and ALL release status fields unanimously confirm `released` without `retained`/`keptOpen`!
       if (
         m.nudgeTerminal &&
         m.nudgeTerminalDispatchId === m.dispatchId &&
         rel.ok &&
-        relDispId === m.dispatchId &&
-        !keptOpen &&
-        (relAction === "released" || relAction === "already_released" || relAction === "closed")
+        unanimousRelDisp &&
+        !keptOpenOrConflicting &&
+        unanimousReleased
       ) {
         orca(["terminal", "close", "--terminal", m.nudgeTerminal], { allowPostDeadlineCleanup: true, timeoutMs: 3000 });
       }
@@ -971,7 +987,9 @@ export function createRunner({
         state: started.dispatchState || (terminal ? "manual" : "ready"),
         effectiveAgent: started.effectiveAgent || activeCand.agent,
         effectiveModel: finalModel || "default",
+        effectiveModelResolved: true,
         effectiveEffort: finalEffort,
+        effectiveEffortResolved: true,
         executedFamilies: execRec.executedFamilies,
       });
     }

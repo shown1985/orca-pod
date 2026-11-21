@@ -6501,6 +6501,425 @@ process.exit(0);
 });
 
 // ---------------------------------------------------------------------------
+// V15 — Round-7 final closure regressions (P0-01, P0-03, P1-02, P1-06, P1-07, P1-11, P2-01)
+// ---------------------------------------------------------------------------
+scenario("V15 Round-7 final closure: target-attributed show error & state=running ambiguity, all-field nudge/release consistency, multiline-span/list-fence/wtRoot-symlink gate, single-token model & [glob] preflight, shared probe+RPC deadline budget, escaped-bracket refs, case-sensitive basePath, fresh inspect health requirement, and ledger null model resolution", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { symlinkSync } = await import("node:fs");
+  const {
+    createOrcaClient,
+    buildAgentCommand,
+    verifyManualTerminalClosed,
+  } = await import("../.orca/lib/orca-cli.mjs");
+  const { verifyStepArtifact } = await import("../.orca/gate-verify.mjs");
+  const { detectProjectStacks, renderSelfHostedCdWorkflow } = await import("../.orca/ci-generator.mjs");
+  const {
+    tokenizeShellCommand,
+    resolveEffectiveLaunchSpec,
+    classifyModelFamily,
+    filterCrossFamilyCandidates,
+  } = await import("../.orca/preflight.mjs");
+  const {
+    parseBacklogTasks,
+    extractExplicitLocalIssueNumber,
+    createIssueViaCli,
+  } = await import("../.orca/issue-tracker.mjs");
+  const { createRunLedger } = await import("../.orca/ledger.mjs");
+
+  const tmpV15 = mkdtempSync(join(tmpdir(), "orca-v15-"));
+  dirsOfCurrentScenario.push(tmpV15);
+
+  // =========================================================================
+  // 1) P0-01a: `terminal show` error naming a DIFFERENT terminal (`term-other`)
+  //    AND `worker-start` failure carrying `state: "running"` alongside `permission_denied`!
+  // =========================================================================
+  const rWrongErrHandle = verifyManualTerminalClosed((args) => {
+    if (args[1] === "close") return { ok: true, json: { result: { handle: "term-a", status: "closed", closed: true } } };
+    return { ok: false, stderr: "Terminal term-other not found", raw: "" };
+  }, "term-a");
+  eq("V15 P0-01 verifyManualTerminalClosed REJECTS 'Terminal term-other not found' when closing 'term-a'",
+    rWrongErrHandle.ok, false);
+
+  const rRightErrHandle = verifyManualTerminalClosed((args) => {
+    if (args[1] === "close") return { ok: true, json: { result: { handle: "term-a", status: "closed", closed: true } } };
+    return { ok: false, stderr: "Terminal term-a not found", raw: "" };
+  }, "term-a");
+  eq("V15 P0-01 verifyManualTerminalClosed ACCEPTS 'Terminal term-a not found' matching target 'term-a'",
+    rRightErrHandle.ok, true);
+
+  const mockOrcaV15 = join(tmpV15, "mock-orca-v15.cjs");
+  writeFileSync(mockOrcaV15, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const mode = process.env.MOCK_V15_MODE || "";
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const out = (code, obj) => { console.log(JSON.stringify(obj)); process.exit(code); };
+const key = args.slice(0, 2).join(" ");
+if (mode === "shared_deadline_budget") {
+  if (args.includes("--version")) { sleep(250); console.log("orca 1.0.0"); process.exit(0); }
+  if (key === "worktree current") { sleep(1500); return out(0, { result: { worktree: { path: "/tmp" } } }); }
+}
+if (mode === "perm_denied_with_running_state") {
+  if (key === "terminal create") return out(1, { error: "no warm terminal" });
+  if (key === "orchestration worker-start") {
+    return out(1, { result: { code: "permission_denied", state: "running", lastError: "denied after spawn" } });
+  }
+  if (key === "orchestration dispatch-show") return out(0, { result: { dispatch: { id: null, status: "unknown" } } });
+}
+out(0, { result: { worktree: { path: ${JSON.stringify(tmpV15)} } } });
+`, { mode: 0o755 });
+
+  const prevOrca15 = process.env.ORCA_CLI_COMMAND;
+  const prevMode15 = process.env.MOCK_V15_MODE;
+  try {
+    process.env.ORCA_CLI_COMMAND = mockOrcaV15;
+
+    // P1-02: `--version` (250ms) + `worktree current` (1500ms) under 500ms total `deadlineAt`
+    // MUST share the same remaining budget and return `deadlineExceeded: true` around ~500ms (NEVER ~750-1750ms)!
+    process.env.MOCK_V15_MODE = "shared_deadline_budget";
+    const freshCli15 = createOrcaClient({
+      cfg: { defaults: {} },
+      opt: {},
+      objective: "v15-budget",
+      autoRun: true,
+      agentOf: (s) => s.agent,
+      modelOf: (s) => s.model,
+      writeStatus: () => {},
+      log: () => {},
+      warn: () => {},
+      die: (m) => { throw new Error(m); },
+    });
+    const tStartBudget = Date.now();
+    const rSharedBudget = freshCli15.orca(["worktree", "current"], { deadlineAt: tStartBudget + 500 });
+    const elapsedBudget = Date.now() - tStartBudget;
+    ok(`V15 P1-02 --version (250ms) + worktree current (1500ms) under 500ms deadlineAt aborts at ~500ms (got ${elapsedBudget}ms, deadlineExceeded=${rSharedBudget.deadlineExceeded})`,
+      rSharedBudget.deadlineExceeded === true && elapsedBudget <= 650);
+
+    // P0-01: `permission_denied` + `state: "running"` MUST stay `ambiguous: true`!
+    process.env.MOCK_V15_MODE = "perm_denied_with_running_state";
+    const cliRun15 = createOrcaClient({
+      cfg: { defaults: { startRetries: 0, warmTerminal: true } },
+      opt: {},
+      objective: "v15",
+      autoRun: true,
+      agentOf: (s) => s.agent,
+      modelOf: (s) => s.model,
+      writeStatus: () => {},
+      log: () => {},
+      warn: () => {},
+      die: (m) => { throw new Error(m); },
+    });
+    cliRun15.setRunId("run-v15");
+    const rRunningConflict = cliRun15.startWorker({ id: "s1", title: "S1", agent: "codex", model: "gpt-6.2-sol" }, "t1", "name:testlab");
+    eq("V15 P0-01 permission_denied receipt carrying conflicting state=running stays ambiguous=true",
+      [rRunningConflict.ok, rRunningConflict.ambiguous], [false, true]);
+  } finally {
+    if (prevOrca15 === undefined) delete process.env.ORCA_CLI_COMMAND;
+    else process.env.ORCA_CLI_COMMAND = prevOrca15;
+    if (prevMode15 === undefined) delete process.env.MOCK_V15_MODE;
+    else process.env.MOCK_V15_MODE = prevMode15;
+  }
+
+  // =========================================================================
+  // 2) P0-01b: E2E conflicting `worker-show` (`dispatchId` matches, `dispatch.id` foreign)
+  //    AND conflicting `worker-release` (`action: "released", releaseStatus: "retained"`)!
+  // =========================================================================
+  const v15ConflictScen = join(REPO, "test", "scenarios", "_tmp-v15-nudge-conflict.cjs");
+  writeFileSync(v15ConflictScen, `module.exports = {
+  handlers: {
+    "orchestration worker-start": (c) => {
+      const id = "disp-" + c.id();
+      c.state.dispatches[id] = { id, task: c.flags.task, status: "dispatching", created: Date.now() };
+      c.state.nudgeTask = c.flags.task;
+      c.state.activeDisp = id;
+      c.pushDone(c.flags.task, "succeeded", id);
+      c.ok({ dispatchId: id, state: "ready" });
+    },
+    "orchestration worker-show": (c) => {
+      if (process.env.V15_SPLIT_DISP === "1") {
+        // Top-level dispatchId matches, nested dispatch.id is foreign!
+        return c.ok({ dispatchId: c.flags.dispatch, dispatch: { id: "disp-foreign-nested" }, terminal: { id: "term-split-1", lastOutputAt: Date.now(), preview: "idle" } });
+      }
+      return c.ok({ dispatchId: c.flags.dispatch, dispatch: { id: c.flags.dispatch }, terminal: { id: "term-rel-conflict", lastOutputAt: Date.now(), preview: "idle" } });
+    },
+    "terminal send": (c) => {
+      const text = String(c.flags.text ?? "");
+      const m = text.match(/\\.orca\\/artifacts\\/([\\w.\\-]+)/);
+      if (text.includes("[orca-flow]") && m) {
+        const fs = require("node:fs"), { join } = require("node:path");
+        const dir = join(process.env.ORCA_FAKE_WT || ".", ".orca", "artifacts");
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(join(dir, m[1]), "# Recovered\\n<!-- orca-dispatch: " + c.state.activeDisp + " -->\\n\\n" + "Filler content line.\\n".repeat(10));
+        c.pushDone(c.state.nudgeTask, "succeeded", c.state.activeDisp);
+      }
+      c.ok({});
+    },
+    "orchestration worker-release": (c) => {
+      // Contradictory release receipt: action="released" alongside releaseStatus="retained"!
+      c.ok({ dispatchId: c.flags.dispatch, action: "released", releaseStatus: "retained" });
+    },
+  },
+};\n`);
+  try {
+    const rSplitDisp = await runFlow({
+      name: "v15-split-disp",
+      config: "../test/configs/nudge-post.config.json",
+      scenario: "_tmp-v15-nudge-conflict.cjs",
+      env: { V15_SPLIT_DISP: "1" },
+      budgetMs: 30000,
+    });
+    eq("V15 P0-01 worker-show with matching dispatchId but foreign nested dispatch.id sends 0 nudges and 0 closes",
+      [rSplitDisp.by("terminal send").length, rSplitDisp.by("terminal close").length], [0, 0]);
+
+    const rConflictRelease = await runFlow({
+      name: "v15-conflict-release",
+      config: "../test/configs/nudge-post.config.json",
+      scenario: "_tmp-v15-nudge-conflict.cjs",
+      budgetMs: 30000,
+    });
+    eq("V15 P0-01 worker-release with action='released' + releaseStatus='retained' NEVER calls terminal close",
+      [rConflictRelease.code, rConflictRelease.by("terminal send").length >= 1, rConflictRelease.by("terminal close").length],
+      [0, true, 0]);
+  } finally {
+    try { rmSync(v15ConflictScen, { force: true }); } catch {}
+  }
+
+  // =========================================================================
+  // 3) P0-01c: Multi-line double-backtick span, list-nested code fence, AND
+  //    `.orca` / `artDir` ancestor symlink under worktree root!
+  // =========================================================================
+  const gateWt15 = join(tmpV15, "gate-wt-15");
+  const gateArt15 = join(gateWt15, ".orca", "artifacts");
+  mkdirSync(gateArt15, { recursive: true });
+  writeFileSync(join(gateArt15, ".dispatch-gate-claims.json"), JSON.stringify({
+    "REVIEW.md": { cleared: true, activeDispatchId: "disp-15", stepId: "code-review", fsEpochMtimeMs: 0 },
+  }, null, 2));
+
+  // (a) Multi-line double-backtick inline code span -> REJECTED!
+  writeFileSync(join(gateArt15, "REVIEW.md"), [
+    "# Review",
+    "",
+    "See snippet ``",
+    "<!-- orca-dispatch: disp-15 -->",
+    "Dispatch-ID: disp-15",
+    "`` in notes.",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\n"));
+  const gMultiSpan = verifyStepArtifact(
+    { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+    gateArt15, gateWt15, 30,
+    { mode: "settlement", dispatchId: "disp-15", clearedBeforeDispatch: true }
+  );
+  eq("V15 P0-01 gate REJECTS provenance marker inside multi-line double-backtick code span", gMultiSpan.ok, false);
+
+  // (b) List-nested fenced code block -> REJECTED!
+  writeFileSync(join(gateArt15, "REVIEW.md"), [
+    "# Review",
+    "",
+    "- Example:",
+    "  ```markdown",
+    "  <!-- orca-dispatch: disp-15 -->",
+    "  Dispatch-ID: disp-15",
+    "  ```",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\n"));
+  const gListFence = verifyStepArtifact(
+    { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+    gateArt15, gateWt15, 30,
+    { mode: "settlement", dispatchId: "disp-15", clearedBeforeDispatch: true }
+  );
+  eq("V15 P0-01 gate REJECTS provenance marker inside list-nested fenced code block", gListFence.ok, false);
+
+  // (c) Ancestor symlink above `artDir` (`wt/.orca -> external-orca`) -> REJECTED!
+  const symWt15 = join(tmpV15, "sym-wt-15");
+  const extOrca15 = join(tmpV15, "ext-orca-15");
+  mkdirSync(symWt15, { recursive: true });
+  mkdirSync(join(extOrca15, "artifacts", ".dispatch-disp-15"), { recursive: true });
+  symlinkSync(extOrca15, join(symWt15, ".orca"));
+  writeFileSync(join(extOrca15, "artifacts", ".dispatch-gate-claims.json"), JSON.stringify({
+    "REVIEW.md": { cleared: true, activeDispatchId: "disp-15", stepId: "code-review", fsEpochMtimeMs: 0 },
+  }, null, 2));
+  writeFileSync(join(extOrca15, "artifacts", ".dispatch-disp-15", "REVIEW.md"),
+    "<!-- orca-dispatch: disp-15 -->\n# External Orca Dir\n\nDetailed review.\n\nVERDICT: PASS\n");
+  const gRootSymlink = verifyStepArtifact(
+    { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+    join(symWt15, ".orca", "artifacts"), symWt15, 30,
+    { mode: "settlement", dispatchId: "disp-15", clearedBeforeDispatch: true }
+  );
+  eq("V15 P0-01 gate REJECTS scoped artifact when ancestor '.orca' under worktree root is a symlink",
+    [gRootSymlink.ok, existsSync(join(extOrca15, "artifacts", "REVIEW.md"))], [false, false]);
+
+  // =========================================================================
+  // 4) P0-03: Multi-token flag-injecting `model: "claude-sonnet-5-5 --model gpt-6.2-sol"`
+  //    AND character-class glob `claude-sonnet-5-[56]`!
+  // =========================================================================
+  const injectedModel = "claude-sonnet-5-5 --model gpt-6.2-sol";
+  const injSpec = resolveEffectiveLaunchSpec("agy", injectedModel, "high");
+  const injFiltered = filterCrossFamilyCandidates(
+    [{ agent: "agy", model: injectedModel, isPrimary: true }],
+    new Map([["openai", [{ stepId: "coding", agent: "codex", model: "gpt-6.2-sol" }]]])
+  );
+  const injBuilt = buildAgentCommand("agy", injectedModel, { autoRun: false });
+  eq("V15 P0-03 multi-token model 'claude-sonnet-5-5 --model gpt-6.2-sol' is rejected as unknown and NEVER admitted against OpenAI author",
+    [injSpec.parseable, classifyModelFamily("agy", injectedModel), injFiltered.allowed.length, injBuilt.includes("gpt-6.2-sol")],
+    [false, "unknown", 0, false]);
+
+  const bracketGlobCmd = "agy --model claude-sonnet-5-[56]";
+  const bracketFiltered = filterCrossFamilyCandidates(
+    [{ agent: "agy", model: "claude-sonnet-5-[56]", isPrimary: true }],
+    new Map([["openai", [{ stepId: "coding", agent: "codex", model: "gpt-6.2-sol" }]]])
+  );
+  eq("V15 P0-03 character-class glob 'claude-sonnet-5-[56]' returns parseable=false & family=unknown and is blocked",
+    [tokenizeShellCommand(bracketGlobCmd).parseable, classifyModelFamily("agy", "claude-sonnet-5-[56]"), bracketFiltered.allowed.length],
+    [false, "unknown", 0]);
+
+  // =========================================================================
+  // 5) P1-06: Escaped brackets `[Issue #42 \[UI\]]` in shortcut & ref definition -> `null`!
+  // =========================================================================
+  const escapedBracketMd = [
+    "- [ ] Fix layout [Issue #42 \\[UI\\]]",
+    "",
+    "[Issue #42 \\[UI\\]]: https://github.com/other/repo/issues/42",
+  ].join("\n");
+  const escTasks = parseBacklogTasks(escapedBracketMd, { currentHost: "github.com", currentRepo: "shown1985/sxcj" });
+  eq("V15 P1-06 escaped-bracket reference link '[Issue #42 \\[UI\\]]' to external repo returns null (NEVER 42)",
+    [escTasks.length, escTasks[0]?.number, extractExplicitLocalIssueNumber(escapedBracketMd, { currentHost: "github.com", currentRepo: "shown1985/sxcj" })],
+    [1, null, null]);
+
+  // =========================================================================
+  // 6) P1-07: Case-sensitive `basePath` verification (`/FORGE` rejected when `/forge` confirmed)!
+  // =========================================================================
+  const upperBaseReject = createIssueViaCli({
+    provider: "tea",
+    bin: "tea",
+    repoDir: tmpV15,
+    host: "git.example.test",
+    origin: "https://git.example.test",
+    basePath: "/forge",
+    repo: "local/repo",
+    teaLogin: "forge-login",
+    title: "T",
+    body: "B",
+    execFn: () => ({ ok: true, status: 0, stdout: "https://git.example.test/FORGE/local/repo/issues/42\n", stderr: "", timedOut: false }),
+  });
+  eq("V15 P1-07 case-mismatched '/FORGE/...' URL is REJECTED when confirmed basePath is '/forge'",
+    [upperBaseReject.ok, upperBaseReject.number], [false, null]);
+
+  // =========================================================================
+  // 7) P1-11: Container declares `Config.Healthcheck`, stale `compose ps` says
+  //    `healthy`, fresh `docker inspect` is `running` WITHOUT `State.Health` -> FAILS (exit 1)!
+  // =========================================================================
+  const cdDir15 = join(tmpV15, "cd-15");
+  mkdirSync(cdDir15, { recursive: true });
+  writeFileSync(join(cdDir15, "docker-compose.prod.yml"), "services:\n  api:\n    image: alpine\n");
+  const cdYml15 = renderSelfHostedCdWorkflow(detectProjectStacks(cdDir15), { deployBranch: "main", serviceName: "api", healthUrl: "http://127.0.0.1:8000/health" });
+  const lines15 = cdYml15.split(/\r?\n/);
+  const hdr15 = lines15.findIndex((l) => l.includes("- name:") && l.includes("Post-deploy automated health check (PII-safe)"));
+  const run15 = lines15.findIndex((l, idx) => idx > hdr15 && /^\s+run:\s*\|\s*$/.test(l));
+  const ind15 = lines15[run15 + 1]?.match(/^(\s*)/)?.[1]?.length || 10;
+  const body15 = [];
+  for (let i = run15 + 1; i < lines15.length; i++) {
+    if (!lines15[i].trim()) { body15.push(""); continue; }
+    if (lines15[i].match(/^(\s*)/)[1].length < ind15) break;
+    body15.push(lines15[i].slice(ind15));
+  }
+  const cdHealth15 = body15.join("\n");
+  const bin15 = join(tmpV15, "bin-15");
+  mkdirSync(bin15, { recursive: true });
+  const rev15 = "a".repeat(40);
+  writeFileSync(join(bin15, "docker"), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a.includes("config") && a.includes("--services")) { console.log("api"); process.exit(0); }
+if (a.includes("ps") && a.includes("--format")) { process.stdout.write(process.env.MOCK_PS_JSON || "[]"); process.exit(0); }
+if (a.includes("inspect")) { process.stdout.write(process.env.MOCK_INSPECT_JSON || "{}"); process.exit(0); }
+process.exit(0);
+`, { mode: 0o755 });
+  writeFileSync(join(bin15, "curl"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const a = process.argv.slice(2);
+const oi = a.indexOf("-o");
+if (oi >= 0 && a[oi + 1]) fs.writeFileSync(a[oi + 1], "ok");
+process.stdout.write("200");
+process.exit(0);
+`, { mode: 0o755 });
+
+  const rMissingInspectHealth = spawnSync("bash", ["-c", cdHealth15], {
+    cwd: cdDir15,
+    env: {
+      ...process.env,
+      PATH: `${bin15}:${process.env.PATH}`,
+      COMPOSE_FILE: "docker-compose.prod.yml",
+      SERVICE_NAME: "api",
+      ORCA_DEPLOY_SHA: rev15,
+      DEFAULT_HEALTHCHECK_URL: "http://127.0.0.1:8000/health",
+      HEALTHCHECK_URL: "",
+      DEPLOY_ONESHOT_SERVICES: "",
+      HEALTHCHECK_RETRIES: "1",
+      HEALTHCHECK_INTERVAL: "0",
+      MOCK_PS_JSON: JSON.stringify([{ ID: "c1", Service: "api", State: "running", Health: "healthy", Labels: `io.orca-pod.deploy-sha=${rev15}` }]),
+      MOCK_INSPECT_JSON: JSON.stringify({
+        Config: { Healthcheck: { Test: ["CMD-SHELL", "curl -f http://localhost/health"] }, Labels: { "io.orca-pod.deploy-sha": rev15 } },
+        State: { Status: "running", Running: true, ExitCode: 0 },
+      }),
+    },
+    encoding: "utf8",
+  });
+  eq("V15 P1-11 CD health FAILS when Config.Healthcheck is declared and fresh docker inspect lacks State.Health despite stale compose ps healthy",
+    rMissingInspectHealth.status, 1);
+
+  // =========================================================================
+  // 8) P2-01: Direct `ledger.recordDispatchResult` with `effectiveModel: null,
+  //    effectiveModelResolved: true` preserves `null` (NEVER backfills `gpt-6.2-sol`)!
+  // =========================================================================
+  const ledWt15 = join(tmpV15, "led-wt-15");
+  const ledHome15 = join(tmpV15, "led-home-15");
+  mkdirSync(ledWt15, { recursive: true });
+  const led15 = createRunLedger({
+    runKey: "run-v15-null-model",
+    repoDir: ledWt15,
+    ledgerHome: ledHome15,
+    objective: "v15 ledger",
+    configFile: "flow.config.json",
+  });
+  led15.recordIntent({
+    requestId: "req-1",
+    stepId: "coding",
+    title: "Coding",
+    agent: "agy",
+    model: "gpt-6.2-sol",
+    requestedModel: "gpt-6.2-sol",
+    requestedEffort: "high",
+    effort: "high",
+    family: "openai",
+    attempt: 1,
+  });
+  const recRes15 = led15.recordDispatchResult({
+    requestId: "req-1",
+    stepId: "coding",
+    dispatchId: "disp-15",
+    effectiveAgent: "agy",
+    effectiveModel: null,
+    effectiveModelResolved: true,
+    effectiveEffort: null,
+    effectiveEffortResolved: true,
+    executedFamilies: ["unknown"],
+  });
+  eq("V15 P2-01 ledger.recordDispatchResult preserves resolved null model & effort without backfilling pre-estimated gpt-6.2-sol/high",
+    [
+      led15.summary.steps.coding.model,
+      led15.summary.steps.coding.effectiveModel,
+      led15.summary.steps.coding.effort,
+      led15.summary.steps.coding.effectiveEffort,
+      recRes15.effectiveModel,
+      recRes15.effectiveEffort,
+    ],
+    [null, null, null, null, null, null]);
+});
+
+// ---------------------------------------------------------------------------
 (async () => {
   const t0 = Date.now();
   for (const s of scenarios) {

@@ -565,6 +565,7 @@ while (gi < groups.length) {
       const checkDir = r.ctx?.isolated ? r.ctx.dir : (WT_DIR || ".");
       vres = verifyStepArtifact(r.step, join(WT_DIR || ".", ART_DIR), checkDir, READINESS_MIN_BYTES, {
         mode: "settlement", targetBranch: TARGET_BRANCH, allowOneWayMerge: opt.allowOneWayMerge,
+        wtRootDir: WT_DIR || ".",
         dispatchId: r.dispatchId || null,
         fsEpochMtimeMs: r.fsEpochMtimeMs,
         minMtimeMs: r.clearedAtMs, clearedBeforeDispatch: r.clearedBeforeDispatch,

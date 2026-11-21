@@ -9,7 +9,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import readline from "node:readline";
 import { WATCHDOG_PARKED_PROMPTS, detectGatewayDisconnect, detectPromptBlocked } from "../watchdog.mjs";
-import { parseAgentCommandSpec, resolveEffectiveLaunchSpec, stripUnquotedShellComment } from "../preflight.mjs";
+import { appendFlagsBeforeTerminator, isSafeSingleTokenValue, parseAgentCommandSpec, resolveEffectiveLaunchSpec, stripUnquotedShellComment } from "../preflight.mjs";
 import { sanitizeText } from "./sanitize.mjs";
 
 export const IS_WIN = process.platform === "win32";
@@ -84,23 +84,6 @@ export function buildAgySettingsArg(trustedDirs, { isWin = IS_WIN, settingsDir =
   return `--settings '${json.replace(/'/g, "'\\''")}'`;
 }
 
-/**
- * Insert synthesized CLI flags BEFORE any `--` end-of-options terminator (whether
- * written `--`, `"--"`, `'--'`, or `\-\-`) using the exact same `parseAgentCommandSpec`
- * token spans as preflight! If the command is unparseable, NEVER inject `--model`/`--effort`.
- */
-function appendFlagsBeforeTerminator(cmdStr, extraFlags, parsedSpec = null) {
-  if (!extraFlags.length) return cmdStr;
-  const parsed = parsedSpec || parseAgentCommandSpec(cmdStr);
-  const flagBlock = extraFlags.join(" ");
-  if (parsed.parseable && parsed.hasOptionTerminator && parsed.optionTerminatorRawStart >= 0) {
-    const prefix = cmdStr.slice(0, parsed.optionTerminatorRawStart).trimEnd();
-    const suffix = cmdStr.slice(parsed.optionTerminatorRawStart);
-    return prefix ? `${prefix} ${flagBlock} ${suffix}` : `${flagBlock} ${suffix}`;
-  }
-  return `${cmdStr} ${flagBlock}`;
-}
-
 export function buildAgentCommand(agent, model = null, { autoRun = true, effort = null, worktreePath = null, extraTrustedDirs = [], settingsDir = null, warn = () => {}, isWin = IS_WIN } = {}) {
   let cmd = stripUnquotedShellComment(String(agent || "").trim());
   const parsed = parseAgentCommandSpec(cmd);
@@ -113,16 +96,25 @@ export function buildAgentCommand(agent, model = null, { autoRun = true, effort 
   const isAgy = baseLower === "agy" || baseLower === "antigravity";
   const hasModel = parsed.hasModelFlag;
   const hasEffort = parsed.hasEffortFlag;
-  const normModel = (model != null && String(model).trim() && String(model).trim().toLowerCase() !== "default")
+  const rawModel = (model != null && String(model).trim() && String(model).trim().toLowerCase() !== "default")
     ? String(model).trim()
     : null;
+  const normModel = rawModel && isSafeSingleTokenValue(rawModel) ? rawModel : null;
+  if (rawModel && !normModel) {
+    warn(`step model "${sanitizeText(rawModel, { maxLen: 80 })}" rejected: must be a single safe CLI token without spaces or globs.`);
+  }
+  const rawEffort = (effort != null && String(effort).trim()) ? String(effort).trim() : null;
+  const normEffort = rawEffort && isSafeSingleTokenValue(rawEffort) ? rawEffort : null;
+  if (rawEffort && !normEffort) {
+    warn(`step effort "${sanitizeText(rawEffort, { maxLen: 80 })}" rejected: must be a single safe CLI token without spaces or globs.`);
+  }
 
   const extraFlags = [];
   if (normModel && !hasModel && !isKiro) extraFlags.push(`--model ${normModel}`);
   else if (normModel && isKiro && !hasModel) warn(`step model "${normModel}" ignored: kiro-cli has no model selection.`);
 
   if (isAgy) {
-    if (effort && !hasEffort) extraFlags.push(`--effort ${effort}`);
+    if (normEffort && !hasEffort) extraFlags.push(`--effort ${normEffort}`);
     if (autoRun && !parsed.hasDangerouslySkipFlag && !parsed.hasModeFlag) {
       extraFlags.push("--dangerously-skip-permissions");
     }
@@ -295,10 +287,41 @@ export function verifyManualTerminalClosed(orcaFn, termHandle) {
       pick(checkRes.json || {}, ["code", "errorCode", "error_code"]) ||
       ""
     ).trim().toLowerCase();
-    const errTxt = `${checkRes.stderr || ""} ${checkRes.raw || ""} ${checkRes.json?.error || ""}`;
+    const parsedErrMsg = pick(errJson, ["error", "message", "lastError"]) || checkRes.json?.error || checkRes.json?.message || "";
+    const errTxt = [
+      checkRes.stderr || "",
+      typeof parsedErrMsg === "string" ? parsedErrMsg : "",
+      !checkRes.json ? (checkRes.raw || "") : "",
+    ].join(" ");
+    // Extract ANY terminal identifier tokens mentioned in the error text so `Terminal term-other not found`
+    // NEVER passes verification when closing `term-a`!
+    const mentionedTermIds = new Set();
+    const NOT_ID_WORDS = new Set(["not", "found", "does", "exist", "is", "closed", "already", "gone", "unknown", "invalid", "such", "error", "handle", "id", "session", "for", "the", "a", "an"]);
+    const addIdCandidate = (tok) => {
+      const cleaned = String(tok || "").replace(/^["'`(\[{]+|["'`)\]},.:;!?]+$/g, "").trim();
+      if (cleaned && !NOT_ID_WORDS.has(cleaned.toLowerCase())) mentionedTermIds.add(cleaned);
+    };
+    for (const m of errTxt.matchAll(/\b(?:unknown|invalid|no[\s_-]+such)[\s_-]+terminal(?:\s+(?:handle|id|session))?\s+([^\s,;:]+)/gi)) {
+      addIdCandidate(m[1]);
+    }
+    for (const m of errTxt.matchAll(/\bterminal(?:\s+(?:handle|id|session))?\s+([^\s,;:]+)\s+(?:not[\s_-]*found|does not exist|is closed|already closed|gone)\b/gi)) {
+      addIdCandidate(m[1]);
+    }
+    for (const m of errTxt.matchAll(/\b((?:term|structworker)[-_][A-Za-z0-9._:-]+)\b/gi)) {
+      addIdCandidate(m[1]);
+    }
+    const wrongTextId = [...mentionedTermIds].find((id) => id !== target);
+    if (wrongTextId) {
+      return {
+        ok: false,
+        reason: `terminal show error referenced different terminal "${wrongTextId}" (expected "${target}")`,
+      };
+    }
+    const escapedTarget = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const errMentionsTarget = mentionedTermIds.has(target) || new RegExp(`(?:^|[^A-Za-z0-9._-])${escapedTarget}(?:$|[^A-Za-z0-9._-])`).test(errTxt);
     // Reject generic gateway errors like `endpoint not found` or `route not found` or `method not found`!
     const isGenericGatewayNotFound = /\b(?:endpoint|route|url|path|method|command|service|server|daemon|gateway|rpc)\s+not[\s_-]*found\b/i.test(errTxt);
-    const explicitTerminalGone = !isGenericGatewayNotFound && (
+    const explicitTerminalGone = !isGenericGatewayNotFound && (showHandles.includes(target) || errMentionsTarget) && (
       /^(?:terminal_not_found|unknown_terminal|no_such_terminal|terminal_closed|terminal_gone)$/.test(errCode) ||
       /\b(?:terminal(?:\s+handle|\s+id|\s+session)?(?:\s+["'`]?[A-Za-z0-9._:-]+["'`]?)?\s+(?:not[\s_-]*found|does not exist|is closed|already closed|gone)|unknown[\s_-]*terminal|no[\s_-]*such[\s_-]*terminal|invalid[\s_-]*terminal)\b/i.test(errTxt)
     );
@@ -307,7 +330,7 @@ export function verifyManualTerminalClosed(orcaFn, termHandle) {
     }
     return {
       ok: false,
-      reason: `terminal show (${target}) failed without explicit terminal-not-found confirmation: ${sanitizeText(errTxt || "unknown error", { maxLen: 180 })}`,
+      reason: `terminal show (${target}) failed without target-attributed terminal-not-found confirmation: ${sanitizeText(errTxt || "unknown error", { maxLen: 180 })}`,
     };
   }
 
@@ -509,6 +532,9 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       const rem = clampTimeoutToDeadline(deadlineAt, 3000);
       if (rem === 0) return null;
       const p = spawnSync(c, ["--version"], { encoding: "utf8", timeout: rem });
+      if (deadlineAt != null && Number.isFinite(deadlineAt) && (Date.now() >= deadlineAt || p.error?.code === "ETIMEDOUT" || p.signal === "SIGTERM")) {
+        return null;
+      }
       if (!p.error) { orcaBin = c; return c; }
     }
     die("Could not find the orca CLI. Set ORCA_CLI_COMMAND.");
@@ -516,19 +542,6 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
 
   function orca(args, { timeoutMs, deadlineAt = null, allowPostDeadlineCleanup = false } = {}) {
     if (!allowPostDeadlineCleanup && deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
-      return {
-        ok: false,
-        json: null,
-        raw: "",
-        stderr: "step deadline reached before RPC",
-        timedOut: true,
-        deadlineExceeded: true,
-      };
-    }
-    const effTimeout = allowPostDeadlineCleanup
-      ? Math.min(timeoutMs ?? CLEANUP_RPC_TIMEOUT_MS, CLEANUP_RPC_TIMEOUT_MS)
-      : clampTimeoutToDeadline(deadlineAt, timeoutMs);
-    if (!allowPostDeadlineCleanup && effTimeout === 0) {
       return {
         ok: false,
         json: null,
@@ -551,8 +564,30 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
         };
       }
     }
+    // P1-02: Recompute remaining budget IMMEDIATELY before spawning `orcaBin` (never reuse a pre-`resolveOrca` timeout)!
+    const effTimeout = allowPostDeadlineCleanup
+      ? Math.min(timeoutMs ?? CLEANUP_RPC_TIMEOUT_MS, CLEANUP_RPC_TIMEOUT_MS)
+      : clampTimeoutToDeadline(deadlineAt, timeoutMs);
+    if (!allowPostDeadlineCleanup && (effTimeout === 0 || (deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt))) {
+      return {
+        ok: false,
+        json: null,
+        raw: "",
+        stderr: "step deadline reached before RPC",
+        timedOut: true,
+        deadlineExceeded: true,
+      };
+    }
     const full = args.includes("--json") ? args : [...args, "--json"];
     const r = spawnSync(orcaBin, full, { encoding: "utf8", timeout: effTimeout, maxBuffer: 64 * 1024 * 1024 });
+    const timedOut = Boolean(r.error?.code === "ETIMEDOUT" || r.signal === "SIGTERM");
+    const hitDeadline = Boolean(
+      !allowPostDeadlineCleanup &&
+      deadlineAt != null &&
+      Number.isFinite(deadlineAt) &&
+      (timedOut || r.error) &&
+      Date.now() >= deadlineAt - 5
+    );
     const raw = (r.stdout || "").trim();
     let json = null;
     for (const line of raw.split(/\r?\n/).reverse()) {
@@ -565,7 +600,8 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       json,
       raw,
       stderr: (r.stderr || (r.error ? r.error.message : "") || "").trim(),
-      timedOut: Boolean(r.error?.code === "ETIMEDOUT" || r.signal === "SIGTERM"),
+      timedOut,
+      ...(hitDeadline ? { deadlineExceeded: true } : {}),
     };
   }
 
@@ -1066,12 +1102,13 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     const parsedCmd = parseAgentCommandSpec(effAgent);
     const reqModel = launchOpts.modelOverride !== undefined ? launchOpts.modelOverride : modelOf(step);
     const reqEffort = launchOpts.effortOverride !== undefined ? launchOpts.effortOverride : (step.effort || null);
-    const normReqModel = (reqModel != null && String(reqModel).trim() && String(reqModel).trim().toLowerCase() !== "default")
+    const rawNormModel = (reqModel != null && String(reqModel).trim() && String(reqModel).trim().toLowerCase() !== "default")
       ? String(reqModel).trim()
       : null;
+    const normReqModel = rawNormModel && isSafeSingleTokenValue(rawNormModel) ? rawNormModel : null;
     // P0-03 & P2-01: Honor embedded `--model`/`--effort` in `effAgent` consistently on coldStart;
-    // if `effAgent` explicitly specified `--model default`, do NOT override with `reqModel`!
-    const model = (!parsedCmd.parseable || parsedCmd.isKiro || parsedCmd.explicitDefaultModel)
+    // if `effAgent` explicitly specified `--model default` or `rawNormModel` was invalid, do NOT override!
+    const model = (!parsedCmd.parseable || parsedCmd.isKiro || parsedCmd.explicitDefaultModel || (rawNormModel && !normReqModel))
       ? null
       : (parsedCmd.embeddedModel || normReqModel || null);
     const effWtPath = resolveEffectiveWtPath(wtSelector, launchOpts.worktreePath || null, deadlineAt);
@@ -1096,8 +1133,9 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       : resolveEffectiveLaunchSpec(effAgent, model, null, { projectDir: effWtPath || null });
     const recordedColdModel = parsedCmd.explicitDefaultModel
       ? "default"
-      : (model || (parsedCmd.parseable && /^opencode2?$/i.test(orcaAgent) ? resolvedColdSpec.effectiveModel : null) || null);
-    const effort = parsedCmd.parseable ? (parsedCmd.embeddedEffort || reqEffort || null) : null;
+      : (model || (parsedCmd.parseable && !(rawNormModel && !normReqModel) && /^opencode2?$/i.test(orcaAgent) ? resolvedColdSpec.effectiveModel : null) || null);
+    const rawColdEffort = parsedCmd.parseable ? (parsedCmd.embeddedEffort || reqEffort || null) : null;
+    const effort = (rawColdEffort && isSafeSingleTokenValue(String(rawColdEffort).trim())) ? String(rawColdEffort).trim() : null;
 
     const enforceColdAgyTrust = process.env.ORCA_ENFORCE_COLD_AGY_TRUST === "1" || process.env.ORCA_TEST_MODE !== "1";
     if (orcaAgent === "antigravity" && enforceColdAgyTrust && effWtPath && !isAgyWorkspaceTrusted(effWtPath)) {
@@ -1333,12 +1371,27 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
             ""
           ).trim().toLowerCase();
           const allRetHandles = extractAllReceiptTerminalHandles(r.json);
+          const allReceiptStates = [
+            pick(result, ["state"]),
+            pick(result, ["status"]),
+            pick(result.dispatch || {}, ["state"]),
+            pick(result.dispatch || {}, ["status"]),
+            pick(r.json || {}, ["state"]),
+            pick(r.json || {}, ["status"]),
+            pick(r.json?.dispatch || {}, ["state"]),
+            pick(r.json?.dispatch || {}, ["status"]),
+          ]
+            .filter((v) => typeof v === "string" && v.trim())
+            .map((v) => v.trim().toLowerCase());
+          const hasConflictingActiveState = allReceiptStates.some(
+            (st) => !/^(?:failed|rejected|invalid|error|aborted|cancelled|canceled|denied|blocked_untrusted)$/.test(st)
+          );
           const hasConflictingStage = Boolean(normFailedStage && !STRICT_PRE_LAUNCH_REJECTION_CODES.has(normFailedStage));
           const provenPreSpawnFailure = Boolean(
             r.json &&
             !r.timedOut &&
             !r.ok &&
-            state !== "outcome_unknown" &&
+            !hasConflictingActiveState &&
             !hasResiduals &&
             allRetHandles.length === 0 &&
             !gwErr &&

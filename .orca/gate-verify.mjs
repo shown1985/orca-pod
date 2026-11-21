@@ -306,51 +306,130 @@ export function verifyArtifactContent(text, verify, { gitDir = null, artDir = nu
   return { ok: true, reason: null, verdict: foundVerdict, contractCommit: foundCommit, expectedCommit, mergeDanger, mergeDangerResult, pendingHumanMerge };
 }
 
-function stripInlineCodeSpans(line) {
-  return String(line || "").replace(/(`+)([\s\S]*?)\1/g, " ");
+function stripContainerPrefixes(line) {
+  let s = String(line || "");
+  while (true) {
+    const next = s.replace(/^[ \t]{0,3}(?:>[ \t]?|(?:[-*+]|\d{1,9}[.)])[ \t]+)/, "");
+    if (next === s) break;
+    s = next;
+  }
+  return s;
 }
 
-function stripMarkdownCodeFences(text) {
-  const out = [];
-  let inFence = false;
-  let fenceChar = "";
-  let fenceLen = 0;
-  for (const raw of String(text || "").split(/\r?\n/)) {
-    // Strip leading blockquote markers (`> > `) BEFORE testing for fenced code blocks!
-    const unquoted = raw.replace(/^\s*(?:>\s*)+/, "");
-    const tf = unquoted.trimStart();
-    const fm = tf.match(/^(`{3,}|~{3,})/);
-    if (fm) {
-      const ch = fm[1][0];
-      const len = fm[1].length;
-      if (!inFence) {
-        inFence = true;
-        fenceChar = ch;
-        fenceLen = len;
-        continue;
-      }
-      if (ch === fenceChar && len >= fenceLen && tf.slice(len).trim() === "") {
-        inFence = false;
-        fenceChar = "";
-        fenceLen = 0;
-        continue;
-      }
+/**
+ * Strip multi-line CommonMark inline code spans (matching exact backtick run lengths `N`
+ * across newlines per CommonMark §6.1, while honoring `\` escapes outside code spans and
+ * unwrapping standalone `Dispatch-ID: \`<id>\`` value-only backticks).
+ */
+function stripMultiLineInlineCodeSpans(docText) {
+  const preUnwrapped = String(docText || "").replace(
+    /^([ \t]{0,3}(?:\*\*|__)?Dispatch-ID(?:\*\*|__)?[ \t]*:[ \t]*)`([^`\r\n\s*]+)`([ \t]*)$/gim,
+    "$1$2$3"
+  );
+  let out = "";
+  let i = 0;
+  while (i < preUnwrapped.length) {
+    const ch = preUnwrapped[i];
+    if (ch === "\\" && i + 1 < preUnwrapped.length) {
+      out += ch + preUnwrapped[i + 1];
+      i += 2;
+      continue;
     }
-    if (!inFence) out.push(stripInlineCodeSpans(raw));
+    if (ch === "`") {
+      let runLen = 1;
+      while (i + runLen < preUnwrapped.length && preUnwrapped[i + runLen] === "`") {
+        runLen++;
+      }
+      // Scan forward for a matching closing run of EXACT length `runLen`
+      let j = i + runLen;
+      let closeIdx = -1;
+      while (j < preUnwrapped.length) {
+        if (preUnwrapped[j] === "`") {
+          let cLen = 1;
+          while (j + cLen < preUnwrapped.length && preUnwrapped[j + cLen] === "`") {
+            cLen++;
+          }
+          if (cLen === runLen) {
+            closeIdx = j;
+            break;
+          }
+          j += cLen;
+          continue;
+        }
+        j++;
+      }
+      if (closeIdx >= 0) {
+        const spanSlice = preUnwrapped.slice(i, closeIdx + runLen);
+        out += spanSlice.replace(/[^\r\n]/g, " ");
+        i = closeIdx + runLen;
+        continue;
+      }
+      // Unclosed backtick run is literal text in CommonMark
+      out += "`".repeat(runLen);
+      i += runLen;
+      continue;
+    }
+    out += ch;
+    i++;
   }
   return out;
 }
 
+function extractTopLevelMarkdownProseLines(text) {
+  const rawLines = String(text || "").split(/\r?\n/);
+  const kept = [];
+  let inFence = false;
+  let fenceChar = "";
+  let fenceLen = 0;
+  for (const raw of rawLines) {
+    // Strip any leading blockquote (`>`) AND list item (`- `, `* `, `+ `, `1. `) prefixes
+    // so fenced code blocks nested inside lists or blockquotes are ALWAYS tracked!
+    const strippedContainer = stripContainerPrefixes(raw);
+    const tf = strippedContainer.replace(/^[ \t]{0,3}/, "");
+    const fm = tf.match(/^(`{3,}|~{3,})/);
+    if (fm) {
+      const ch = fm[1][0];
+      const len = fm[1].length;
+      if (!inFence && (ch === "~" || !tf.slice(len).includes("`"))) {
+        inFence = true;
+        fenceChar = ch;
+        fenceLen = len;
+        kept.push("");
+        continue;
+      }
+      if (inFence && ch === fenceChar && len >= fenceLen && tf.slice(len).trim() === "") {
+        inFence = false;
+        fenceChar = "";
+        fenceLen = 0;
+        kept.push("");
+        continue;
+      }
+    }
+    if (inFence) {
+      kept.push("");
+      continue;
+    }
+    // Reject blockquoted lines (`>`), list-item lines, or 4-space/tab indented code lines
+    // as top-level writer provenance declarations!
+    if (/^[ \t]{0,3}>/.test(raw) || /^(?: {4,}|\t)/.test(raw) || strippedContainer !== raw) {
+      kept.push("");
+      continue;
+    }
+    kept.push(raw);
+  }
+  return stripMultiLineInlineCodeSpans(kept.join("\n")).split("\n");
+}
+
 export function extractWriterAttestedDispatchIds(text) {
   const ids = new Set();
-  const unfencedLines = stripMarkdownCodeFences(text);
-  const unfencedText = unfencedLines.join("\n");
+  const topLines = extractTopLevelMarkdownProseLines(text);
+  const topText = topLines.join("\n");
   const commentRe = /<!--\s*orca-dispatch:\s*([^\s>]+)\s*-->/gi;
   let cm = null;
-  while ((cm = commentRe.exec(unfencedText)) !== null) {
+  while ((cm = commentRe.exec(topText)) !== null) {
     if (cm[1]) ids.add(cm[1].trim());
   }
-  for (const raw of unfencedLines) {
+  for (const raw of topLines) {
     const cleaned = normalizeMarkerLine(raw);
     const dm = /^(?:\*\*|__)?Dispatch-ID(?:\*\*|__)?\s*:\s*`?([^`\s*]+)`?$/i.exec(cleaned);
     if (dm && dm[1]) ids.add(dm[1].trim());
@@ -360,6 +439,27 @@ export function extractWriterAttestedDispatchIds(text) {
 
 function lstatSafe(p) {
   try { return lstatSync(p); } catch { return null; }
+}
+
+function resolveTrustedWalkRoot(artDir, gitDir = null, wtRootDir = null) {
+  const artAbs = resolve(artDir);
+  if (wtRootDir) {
+    const wtAbs = resolve(wtRootDir);
+    const r = relative(wtAbs, artAbs);
+    if (!r.startsWith("..") && !isAbsolute(r)) return wtAbs;
+  }
+  if (gitDir) {
+    const gitAbs = resolve(gitDir);
+    const r = relative(gitAbs, artAbs);
+    if (!r.startsWith("..") && !isAbsolute(r)) return gitAbs;
+  }
+  // Standard `.orca/artifacts` layout: walk from the enclosing worktree root two levels up
+  // so `.orca` or `.orca/artifacts` being a symlink is ALWAYS detected even in standalone calls!
+  const parentDir = dirname(artAbs);
+  if (basename(parentDir) === ".orca") {
+    return dirname(parentDir);
+  }
+  return artAbs;
 }
 
 /**
@@ -404,6 +504,12 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
   const dispatchScopedPath = dispatchScopedDir ? join(dispatchScopedDir, step.writes) : null;
   const canonicalPath = join(artDir, step.writes);
 
+  const walkRoot = resolveTrustedWalkRoot(artDir, gitDir, opts.wtRootDir || null);
+  const artRootCheck = hasSymlinkInPath(walkRoot, artDir);
+  if (artRootCheck.bad) {
+    return { ok: false, reason: artRootCheck.reason };
+  }
+
   const thresholdMs = (opts.fsEpochMtimeMs != null && Number.isFinite(opts.fsEpochMtimeMs))
     ? opts.fsEpochMtimeMs
     : ((opts.minMtimeMs != null && Number.isFinite(opts.minMtimeMs)) ? opts.minMtimeMs : null);
@@ -411,6 +517,12 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
   const verifyDispatchClaimRecord = (stMtimeMs) => {
     if (!opts.dispatchId) return { ok: true };
     const claimFile = join(artDir, ".dispatch-gate-claims.json");
+    if (hasSymlinkInPath(walkRoot, claimFile).bad) {
+      return {
+        ok: false,
+        reason: `symlink rejected on dispatch provenance claim file for ${step.writes}`,
+      };
+    }
     const clStat = lstatSafe(claimFile);
     if (!clStat || clStat.isSymbolicLink() || !clStat.isFile()) {
       return {
@@ -444,7 +556,7 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
   // entire path chain and wrong-ID/invalid content BEFORE touching canonical `<writes>`!),
   // then atomically promote via basename temp + rename!
   if (isSettlement && dispatchScopedPath) {
-    const scopedChain = hasSymlinkInPath(artDir, dispatchScopedPath);
+    const scopedChain = hasSymlinkInPath(walkRoot, dispatchScopedPath);
     if (scopedChain.bad) {
       return { ok: false, reason: scopedChain.reason };
     }
@@ -487,8 +599,8 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
         if (!contentRes.ok) return contentRes;
       }
 
-      // All checks passed in-place: verify entire canonical destination path has zero symlinks, then atomically promote!
-      const canonChain = hasSymlinkInPath(artDir, canonicalPath);
+      // All checks passed in-place: verify entire canonical destination path from `walkRoot` has zero symlinks, then atomically promote!
+      const canonChain = hasSymlinkInPath(walkRoot, canonicalPath);
       if (canonChain.bad) {
         return { ok: false, reason: canonChain.reason };
       }
@@ -506,7 +618,7 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
     }
   }
 
-  const canonPathCheck = hasSymlinkInPath(artDir, canonicalPath);
+  const canonPathCheck = hasSymlinkInPath(walkRoot, canonicalPath);
   if (canonPathCheck.bad) {
     return { ok: false, reason: canonPathCheck.reason };
   }

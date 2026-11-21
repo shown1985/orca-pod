@@ -7170,6 +7170,291 @@ process.exit(0);
 });
 
 // ---------------------------------------------------------------------------
+// V17 — Round 9 Final Hardening Regression Suite (P0-01a & P0-01b)
+// ---------------------------------------------------------------------------
+scenario("V17: Round 9 P0-01a manual release status exclusivity & multi-field helper check + P0-01b physical/symlink containment before FS mutation", async () => {
+  const { lstatSync, symlinkSync } = await import("node:fs");
+  const {
+    createOrcaClient,
+    hasUnconfirmedHelper,
+    verifyManualStopAndReleaseReceipt,
+    verifyStopAndReleaseReceipt,
+  } = await import("../.orca/lib/orca-cli.mjs");
+  const {
+    bindStepArtifactDispatchClaim,
+    clearStaleStepArtifact,
+    syncOutputsFromIsolatedWorktree,
+  } = await import("../.orca/worktree-isolation.mjs");
+  const {
+    assertSafePathFromRoot,
+    verifySafePathFromRoot,
+    verifyStepArtifact,
+  } = await import("../.orca/gate-verify.mjs");
+
+  const tmpV17 = mkdtempSync(join(tmpdir(), "orca-v17-"));
+  dirsOfCurrentScenario.push(tmpV17);
+
+  // =========================================================================
+  // 1) P0-01a Probe 1: Warm manual terminal where preamble fetch fails and
+  //    `worker-release` returns contradictory `{ action: "released", releaseStatus: "retained" }`
+  //    MUST abort with `ambiguous: true` and ZERO `worker-start` calls (NEVER enters `coldStart`)!
+  //    Positive control: unanimous `{ status: "retained" }` after confirmed terminal close enters `coldStart` (`1` `worker-start`).
+  // =========================================================================
+  const mockLog17 = join(tmpV17, "orca-v17.jsonl");
+  const mockCli17 = join(tmpV17, "mock-orca-v17.cjs");
+  writeFileSync(mockCli17, `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const logFile = process.env.MOCK_V17_LOG;
+if (logFile) fs.appendFileSync(logFile, JSON.stringify({ args }) + "\\n");
+if (args.includes("--version")) { console.log("orca 1.0.0"); process.exit(0); }
+const key = args.slice(0, 2).join(" ");
+const mode = process.env.MOCK_V17_REL_MODE || "contradictory";
+const out = (code, obj) => { console.log(JSON.stringify(obj)); process.exit(code); };
+if (key === "worktree current") return out(0, { result: { worktree: { path: process.env.MOCK_V17_WT } } });
+if (key === "terminal create") return out(0, { result: { terminal: { handle: "term-m17" } } });
+if (key === "terminal wait") return out(0, { result: { ready: true, terminal: { handle: "term-m17", preview: "claude > " } } });
+if (key === "terminal show") {
+  const closed = fs.existsSync(process.env.MOCK_V17_CLOSED_FLAG);
+  return out(0, { result: { terminal: { handle: "term-m17", status: closed ? "closed" : "running", closed, preview: "claude > " } } });
+}
+if (key === "terminal close") {
+  fs.writeFileSync(process.env.MOCK_V17_CLOSED_FLAG, "1");
+  return out(0, { result: { handle: "term-m17", closed: true, status: "closed" } });
+}
+if (key === "orchestration dispatch") {
+  if (args.includes("--dry-run")) return out(1, { error: "preamble fetch failed" });
+  return out(0, { result: { dispatchId: "dm-17" } });
+}
+if (key === "orchestration worker-stop") {
+  return out(0, { result: { dispatchId: "dm-17", state: "fenced" } });
+}
+if (key === "orchestration worker-release") {
+  if (mode === "contradictory") {
+    return out(0, { result: { dispatchId: "dm-17", action: "released", releaseStatus: "retained" } });
+  }
+  return out(0, { result: { dispatchId: "dm-17", status: "retained" } });
+}
+if (key === "orchestration worker-start") {
+  return out(0, { result: { dispatchId: "dc-17", state: "ready" } });
+}
+return out(0, { result: {} });
+`, { mode: 0o755 });
+
+  const wt17 = join(tmpV17, "wt-manual");
+  mkdirSync(join(wt17, ".orca", "artifacts"), { recursive: true });
+  const closedFlag17 = join(tmpV17, "term-closed.flag");
+  const prevOrca17 = process.env.ORCA_CLI_COMMAND;
+  const prevLog17 = process.env.MOCK_V17_LOG;
+  const prevMode17 = process.env.MOCK_V17_REL_MODE;
+  const prevWt17 = process.env.MOCK_V17_WT;
+  const prevFlag17 = process.env.MOCK_V17_CLOSED_FLAG;
+  try {
+    process.env.ORCA_CLI_COMMAND = mockCli17;
+    process.env.MOCK_V17_LOG = mockLog17;
+    process.env.MOCK_V17_WT = wt17;
+    process.env.MOCK_V17_CLOSED_FLAG = closedFlag17;
+
+    const cli17 = createOrcaClient({
+      cfg: { defaults: { startRetries: 0, warmTerminal: true } },
+      opt: {},
+      objective: "v17-manual-exclusivity",
+      autoRun: true,
+      agentOf: (s) => s.agent,
+      modelOf: (s) => s.model,
+      writeStatus: () => {},
+      log: () => {},
+      warn: () => {},
+      die: (m) => { throw new Error(m); },
+    });
+    cli17.setRunId("run-v17");
+
+    // (a) Contradictory `{ action: "released", releaseStatus: "retained" }` -> MUST block (`ambiguous: true`) with ZERO `worker-start`!
+    process.env.MOCK_V17_REL_MODE = "contradictory";
+    rmSync(mockLog17, { force: true });
+    rmSync(closedFlag17, { force: true });
+    const rContra = cli17.startWorker(
+      { id: "s17", title: "S17", agent: "claude", model: "claude-sonnet-4-5" },
+      "task-17",
+      `path:${wt17}`,
+      { worktreePath: wt17 }
+    );
+    const contraCalls = readFileSync(mockLog17, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    eq("V17 P0-01a warm manual preamble failure + contradictory action=released/releaseStatus=retained blocks coldStart (ambiguous=true, 0 worker-start)",
+      [rContra.ok, rContra.ambiguous, contraCalls.filter((c) => c.args[1] === "worker-start").length],
+      [false, true, 0]);
+
+    // Also unit-verify mixed `worker-stop` `{ state: "fenced", status: "stopped" }` is rejected on manual stop!
+    const mixedFence = verifyManualStopAndReleaseReceipt((args) => {
+      if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "dm-mix", state: "fenced", status: "stopped" } } };
+      if (args[0] === "terminal" && args[1] === "close") return { ok: true, json: { result: { handle: "t-mix", closed: true } } };
+      if (args[0] === "terminal" && args[1] === "show") return { ok: true, json: { result: { terminal: { handle: "t-mix", status: "closed", closed: true } } } };
+      if (args[1] === "worker-release") return { ok: true, json: { result: { dispatchId: "dm-mix", status: "retained" } } };
+      return { ok: true, json: {} };
+    }, "dm-mix", "t-mix");
+    eq("V17 P0-01a manual worker-stop with mixed state=fenced + status=stopped is REJECTED", mixedFence.ok, false);
+
+    // (b) Positive control: unanimous `{ status: "retained" }` after confirmed terminal close proceeds to `coldStart` (`1` `worker-start`)!
+    process.env.MOCK_V17_REL_MODE = "pure_retained";
+    rmSync(mockLog17, { force: true });
+    rmSync(closedFlag17, { force: true });
+    const rPureRet = cli17.startWorker(
+      { id: "s17b", title: "S17b", agent: "claude", model: "claude-sonnet-4-5" },
+      "task-17b",
+      `path:${wt17}`,
+      { worktreePath: wt17 }
+    );
+    const pureCalls = readFileSync(mockLog17, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    eq("V17 P0-01a positive control: unanimous status=retained after terminal close proceeds to coldStart (ok=true, 1 worker-start)",
+      [rPureRet.ok, rPureRet.startMode, pureCalls.filter((c) => c.args[1] === "worker-start").length],
+      [true, "cold", 1]);
+  } finally {
+    if (prevOrca17 === undefined) delete process.env.ORCA_CLI_COMMAND; else process.env.ORCA_CLI_COMMAND = prevOrca17;
+    if (prevLog17 === undefined) delete process.env.MOCK_V17_LOG; else process.env.MOCK_V17_LOG = prevLog17;
+    if (prevMode17 === undefined) delete process.env.MOCK_V17_REL_MODE; else process.env.MOCK_V17_REL_MODE = prevMode17;
+    if (prevWt17 === undefined) delete process.env.MOCK_V17_WT; else process.env.MOCK_V17_WT = prevWt17;
+    if (prevFlag17 === undefined) delete process.env.MOCK_V17_CLOSED_FLAG; else process.env.MOCK_V17_CLOSED_FLAG = prevFlag17;
+  }
+
+  // =========================================================================
+  // 2) P0-01a Probe 2: `helpers: [{ status: "stopped", state: "running" }]`
+  //    MUST fail BOTH `verifyStopAndReleaseReceipt` AND `verifyManualStopAndReleaseReceipt`!
+  // =========================================================================
+  const conflictHelperPayload = {
+    result: {
+      dispatchId: "disp-hlp-17",
+      state: "stopped",
+      helpers: [{ id: "hlp-1", status: "stopped", state: "running" }],
+    },
+  };
+  const supHelperCheck = verifyStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") return { ok: true, json: conflictHelperPayload };
+    if (args[1] === "worker-release") return { ok: true, json: { result: { dispatchId: "disp-hlp-17", status: "released" } } };
+    return { ok: true, json: {} };
+  }, "disp-hlp-17");
+  const manHelperCheck = verifyManualStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") {
+      return {
+        ok: true,
+        json: {
+          result: {
+            dispatchId: "disp-hlp-17",
+            state: "fenced",
+            helpers: [{ id: "hlp-1", status: "stopped", state: "running" }],
+          },
+        },
+      };
+    }
+    if (args[0] === "terminal" && args[1] === "close") return { ok: true, json: { result: { handle: "t-hlp", closed: true } } };
+    if (args[0] === "terminal" && args[1] === "show") return { ok: true, json: { result: { terminal: { handle: "t-hlp", status: "closed", closed: true } } } };
+    if (args[1] === "worker-release") return { ok: true, json: { result: { dispatchId: "disp-hlp-17", status: "retained" } } };
+    return { ok: true, json: {} };
+  }, "disp-hlp-17", "t-hlp");
+  eq("V17 P0-01a helpers=[{status:'stopped', state:'running'}] is REJECTED by hasUnconfirmedHelper, verifyStopAndReleaseReceipt, and verifyManualStopAndReleaseReceipt",
+    [
+      hasUnconfirmedHelper(conflictHelperPayload),
+      supHelperCheck.ok,
+      manHelperCheck.ok,
+    ],
+    [true, false, false]);
+
+  // =========================================================================
+  // 3) P0-01b Probe 1: `wt/.orca/artifacts/link` symlinks to an external directory
+  //    containing `REVIEW.md` -> `clearStaleStepArtifact({ writes: "link/REVIEW.md" })`
+  //    MUST throw BEFORE `rmSync` and leave external `REVIEW.md` 100% intact!
+  // =========================================================================
+  const extDir1 = join(tmpV17, "external-victim-1");
+  mkdirSync(extDir1, { recursive: true });
+  const extVictimFile = join(extDir1, "REVIEW.md");
+  const extSentinel = "# External File Outside Worktree\nMUST NEVER BE DELETED!\n";
+  writeFileSync(extVictimFile, extSentinel);
+
+  const symWt1 = join(tmpV17, "sym-wt-1");
+  mkdirSync(join(symWt1, ".orca", "artifacts"), { recursive: true });
+  symlinkSync(extDir1, join(symWt1, ".orca", "artifacts", "link"));
+
+  let clearSymThrew = false;
+  try {
+    clearStaleStepArtifact({ id: "code-review", writes: "link/REVIEW.md" }, symWt1, null, ".orca/artifacts");
+  } catch {
+    clearSymThrew = true;
+  }
+  let bindSymLinkThrew = false;
+  try {
+    bindStepArtifactDispatchClaim(symWt1, ".orca/artifacts", { id: "code-review", writes: "link/REVIEW.md" }, { dispatchId: "disp-17" });
+  } catch {
+    bindSymLinkThrew = true;
+  }
+  const gSymLink = verifyStepArtifact(
+    { id: "code-review", writes: "link/REVIEW.md", verify: { requireVerdict: "PASS" } },
+    join(symWt1, ".orca", "artifacts"),
+    symWt1,
+    10,
+    { mode: "settlement", dispatchId: "disp-17", clearedBeforeDispatch: true }
+  );
+  eq("V17 P0-01b symlinked artifacts/link -> external dir is REJECTED by clear/bind/gate and NEVER deletes external REVIEW.md",
+    [
+      clearSymThrew,
+      bindSymLinkThrew,
+      gSymLink.ok,
+      existsSync(extVictimFile),
+      readFileSync(extVictimFile, "utf8") === extSentinel,
+    ],
+    [true, true, false, true, true]);
+
+  // =========================================================================
+  // 4) P0-01b Probe 2: `wt/.orca` symlinks to an external directory ->
+  //    `bindStepArtifactDispatchClaim` AND `clearStaleStepArtifact` MUST throw
+  //    BEFORE `mkdirSync` / `writeGateClaims` and create ZERO files in external dir!
+  // =========================================================================
+  const extDir2 = join(tmpV17, "external-victim-2");
+  mkdirSync(extDir2, { recursive: true });
+  const symWt2 = join(tmpV17, "sym-wt-2");
+  mkdirSync(symWt2, { recursive: true });
+  symlinkSync(extDir2, join(symWt2, ".orca"));
+  ok("V17 P0-01b setup: wt/.orca is a symbolic link", lstatSync(join(symWt2, ".orca")).isSymbolicLink());
+
+  let bindDotOrcaThrew = false;
+  try {
+    bindStepArtifactDispatchClaim(symWt2, ".orca/artifacts", { id: "code-review", writes: "REVIEW.md" }, { dispatchId: "disp-17" });
+  } catch {
+    bindDotOrcaThrew = true;
+  }
+  let clearDotOrcaThrew = false;
+  try {
+    clearStaleStepArtifact({ id: "code-review", writes: "REVIEW.md" }, symWt2, null, ".orca/artifacts");
+  } catch {
+    clearDotOrcaThrew = true;
+  }
+  let assertDotOrcaThrew = false;
+  try {
+    assertSafePathFromRoot(symWt2, join(symWt2, ".orca", "artifacts"), join(symWt2, ".orca", "artifacts", "REVIEW.md"));
+  } catch {
+    assertDotOrcaThrew = true;
+  }
+  // Also verify `syncOutputsFromIsolatedWorktree` refuses to write when destination `wt/.orca` is a symlink!
+  const cleanIsoWt17 = join(tmpV17, "clean-iso-17");
+  mkdirSync(join(cleanIsoWt17, ".orca", "artifacts"), { recursive: true });
+  writeFileSync(join(cleanIsoWt17, ".orca", "artifacts", "REVIEW.md"), "<!-- orca-dispatch: disp-17 -->\n# Review\n\nVERDICT: PASS\n");
+  syncOutputsFromIsolatedWorktree({
+    step: { id: "code-review", writes: "REVIEW.md" },
+    stepWtDir: cleanIsoWt17,
+    wtDir: symWt2,
+    artDirRel: ".orca/artifacts",
+    dispatchId: "disp-17",
+  });
+  eq("V17 P0-01b symlinked wt/.orca -> external dir is REJECTED before mkdirSync/writeGateClaims/syncOutputs (external dir stays 100% empty!)",
+    [
+      verifySafePathFromRoot(symWt2, join(symWt2, ".orca", "artifacts"), join(symWt2, ".orca", "artifacts", "REVIEW.md")).ok,
+      assertDotOrcaThrew,
+      bindDotOrcaThrew,
+      clearDotOrcaThrew,
+      readdirSync(extDir2).length,
+    ],
+    [false, true, true, true, 0]);
+});
+
+// ---------------------------------------------------------------------------
 (async () => {
   const t0 = Date.now();
   for (const s of scenarios) {

@@ -15,7 +15,7 @@
 //
 // Zero external dependencies (Node builtins only).
 
-import { existsSync, readFileSync, statSync, lstatSync, copyFileSync, renameSync, rmSync, utimesSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, statSync, lstatSync, realpathSync, copyFileSync, renameSync, rmSync, utimesSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -441,7 +441,7 @@ function lstatSafe(p) {
   try { return lstatSync(p); } catch { return null; }
 }
 
-function resolveTrustedWalkRoot(artDir, gitDir = null, wtRootDir = null) {
+export function resolveTrustedWalkRoot(artDir, gitDir = null, wtRootDir = null) {
   const artAbs = resolve(artDir);
   if (wtRootDir) {
     const wtAbs = resolve(wtRootDir);
@@ -507,6 +507,91 @@ export function isStrictlyInsideDir(rootDir, targetPath) {
   return true;
 }
 
+function sameResolvedPath(a, b) {
+  return (process.platform === "win32" || process.platform === "darwin")
+    ? a.toLowerCase() === b.toLowerCase()
+    : a === b;
+}
+
+/**
+ * P0-01b: Verify lexical containment (`containerDir` inside/equal `trustedRootDir`, `targetPath`
+ * strictly inside `containerDir`), walk EVERY segment from `trustedRootDir` down to `targetPath`
+ * via `lstatSync` to reject any symlink (`.orca`, `artifacts`, nested subdirs, or leaf), AND
+ * verify physical `realpathSync` containment of the deepest existing ancestor inside `trustedRootDir`
+ * BEFORE any filesystem mutation (`mkdirSync`, `rmSync`, `writeFileSync`, `copyFileSync`)!
+ */
+export function verifySafePathFromRoot(trustedRootDir, containerDir, targetPath) {
+  if (!trustedRootDir || !containerDir || !targetPath) {
+    return { ok: false, reason: "missing root/container/target path for containment verification" };
+  }
+  const rootAbs = resolve(trustedRootDir);
+  const containerAbs = resolve(containerDir);
+  const targetAbs = resolve(targetPath);
+  if (!sameResolvedPath(rootAbs, containerAbs) && !isStrictlyInsideDir(rootAbs, containerAbs)) {
+    return { ok: false, reason: `container path "${containerAbs}" escapes trusted root "${rootAbs}"` };
+  }
+  if (!isStrictlyInsideDir(containerAbs, targetAbs)) {
+    return { ok: false, reason: `target path "${targetAbs}" escapes container directory "${containerAbs}"` };
+  }
+  const sym = hasSymlinkInPath(rootAbs, targetAbs);
+  if (sym.bad) {
+    return { ok: false, reason: sym.reason };
+  }
+  if (existsSync(rootAbs)) {
+    let realRoot;
+    try {
+      realRoot = realpathSync(rootAbs);
+    } catch (e) {
+      return { ok: false, reason: `failed to resolve realpath of trusted root "${rootAbs}": ${e?.message || e}` };
+    }
+    let anc = targetAbs;
+    while (!sameResolvedPath(anc, rootAbs) && !lstatSafe(anc)) {
+      const parent = dirname(anc);
+      if (parent === anc) break;
+      anc = parent;
+    }
+    const ancLst = lstatSafe(anc);
+    if (ancLst && ancLst.isSymbolicLink()) {
+      return { ok: false, reason: `symlink rejected in physical path (${anc})` };
+    }
+    if (existsSync(anc)) {
+      let realAnc;
+      try {
+        realAnc = realpathSync(anc);
+      } catch (e) {
+        return { ok: false, reason: `failed to resolve realpath of ancestor "${anc}": ${e?.message || e}` };
+      }
+      if (!sameResolvedPath(realAnc, realRoot) && !isStrictlyInsideDir(realRoot, realAnc)) {
+        return { ok: false, reason: `physical path "${realAnc}" escapes trusted root "${realRoot}"` };
+      }
+      if (existsSync(containerAbs)) {
+        let realContainer;
+        try {
+          realContainer = realpathSync(containerAbs);
+        } catch (e) {
+          return { ok: false, reason: `failed to resolve realpath of container "${containerAbs}": ${e?.message || e}` };
+        }
+        if (!sameResolvedPath(realContainer, realRoot) && !isStrictlyInsideDir(realRoot, realContainer)) {
+          return { ok: false, reason: `physical container "${realContainer}" escapes trusted root "${realRoot}"` };
+        }
+        if (sameResolvedPath(anc, containerAbs) || isStrictlyInsideDir(containerAbs, anc)) {
+          if (!sameResolvedPath(realAnc, realContainer) && !isStrictlyInsideDir(realContainer, realAnc)) {
+            return { ok: false, reason: `physical path "${realAnc}" escapes container "${realContainer}"` };
+          }
+        }
+      }
+    }
+  }
+  return { ok: true, reason: null };
+}
+
+export function assertSafePathFromRoot(trustedRootDir, containerDir, targetPath, errPrefix = "[gate-verify]") {
+  const check = verifySafePathFromRoot(trustedRootDir, containerDir, targetPath);
+  if (!check.ok) {
+    throw new Error(`${errPrefix} ${check.reason}`);
+  }
+}
+
 /**
  * Full artifact check for a pipeline step: strict directory containment (`artDir` & `.dispatch-<id>`),
  * symlink rejection from trusted worktree root, existence, minBytes, writer-attested per-dispatch
@@ -534,9 +619,15 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
   }
 
   const walkRoot = resolveTrustedWalkRoot(artDir, gitDir, opts.wtRootDir || null);
-  const artRootCheck = hasSymlinkInPath(walkRoot, artDir);
-  if (artRootCheck.bad) {
-    return { ok: false, reason: artRootCheck.reason };
+  const canonRootCheck = verifySafePathFromRoot(walkRoot, artDir, canonicalPath);
+  if (!canonRootCheck.ok) {
+    return { ok: false, reason: canonRootCheck.reason };
+  }
+  if (dispatchScopedDir && dispatchScopedPath) {
+    const scopedRootCheck = verifySafePathFromRoot(walkRoot, dispatchScopedDir, dispatchScopedPath);
+    if (!scopedRootCheck.ok) {
+      return { ok: false, reason: scopedRootCheck.reason };
+    }
   }
 
   const thresholdMs = (opts.fsEpochMtimeMs != null && Number.isFinite(opts.fsEpochMtimeMs))

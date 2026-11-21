@@ -6,7 +6,7 @@ import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, r
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, join, resolve } from "node:path";
-import { extractWriterAttestedDispatchIds, hasSymlinkInPath, isStrictlyInsideDir } from "./gate-verify.mjs";
+import { assertSafePathFromRoot, extractWriterAttestedDispatchIds, hasSymlinkInPath, isStrictlyInsideDir, resolveTrustedWalkRoot, verifySafePathFromRoot } from "./gate-verify.mjs";
 
 export const WORKTREES_MANIFEST = "WORKTREES.json";
 export const DISPATCH_GATE_CLAIMS_FILE = ".dispatch-gate-claims.json";
@@ -170,10 +170,14 @@ export function recordMergedAfterContract(artDir, wtDir) {
   writeWorktreesManifest(artDir, manifest);
 }
 
-function readGateClaims(artDir) {
+function readGateClaims(artDir, wtRootDir = null) {
+  const walkRoot = resolveTrustedWalkRoot(artDir, null, wtRootDir);
   const p = join(artDir, DISPATCH_GATE_CLAIMS_FILE);
+  if (!verifySafePathFromRoot(walkRoot, artDir, p).ok) return {};
   if (!existsSync(p)) return {};
   try {
+    const lst = lstatSync(p);
+    if (lst.isSymbolicLink() || !lst.isFile()) return {};
     const parsed = JSON.parse(readFileSync(p, "utf8"));
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
@@ -181,20 +185,27 @@ function readGateClaims(artDir) {
   }
 }
 
-function writeGateClaims(artDir, claims) {
+function writeGateClaims(artDir, claims, wtRootDir = null) {
+  const walkRoot = resolveTrustedWalkRoot(artDir, null, wtRootDir);
+  const target = join(artDir, DISPATCH_GATE_CLAIMS_FILE);
+  assertSafePathFromRoot(walkRoot, artDir, target, "[worktree-isolation]");
   mkdirSync(artDir, { recursive: true });
+  assertSafePathFromRoot(walkRoot, artDir, target, "[worktree-isolation]");
   const tmp = join(artDir, `${DISPATCH_GATE_CLAIMS_FILE}.tmp.${process.pid}.${Date.now()}`);
   writeFileSync(tmp, JSON.stringify(claims, null, 2) + "\n", "utf8");
   try {
-    rmSync(join(artDir, DISPATCH_GATE_CLAIMS_FILE), { force: true });
-  } catch {}
-  copyFileSync(tmp, join(artDir, DISPATCH_GATE_CLAIMS_FILE));
-  try { rmSync(tmp, { force: true }); } catch {}
+    renameSync(tmp, target);
+  } finally {
+    try { rmSync(tmp, { force: true }); } catch {}
+  }
 }
 
-function sampleFsEpochMtimeMs(dir) {
-  mkdirSync(dir, { recursive: true });
+function sampleFsEpochMtimeMs(dir, wtRootDir = null) {
+  const walkRoot = resolveTrustedWalkRoot(dir, null, wtRootDir);
   const canary = join(dir, `.orca-fs-epoch-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`);
+  assertSafePathFromRoot(walkRoot, dir, canary, "[worktree-isolation]");
+  mkdirSync(dir, { recursive: true });
+  assertSafePathFromRoot(walkRoot, dir, canary, "[worktree-isolation]");
   try {
     writeFileSync(canary, "", "utf8");
     const ms = statSync(canary).mtimeMs;
@@ -218,17 +229,20 @@ export function dispatchIsolatedArtifactRel(dispatchId, writes) {
 export function bindStepArtifactDispatchClaim(wtDir, artDirRel, step, { dispatchId, taskId = null, fsEpochMtimeMs = null, clearedAtMs = null } = {}) {
   if (!step || !step.writes) return;
   const artDir = join(wtDir, artDirRel);
-  if (!isStrictlyInsideDir(artDir, join(artDir, step.writes))) {
-    throw new Error(`[worktree-isolation] step "${step.id}" writes path "${step.writes}" escapes artifact directory`);
-  }
+  const canonTarget = join(artDir, step.writes);
+  const claimsTarget = join(artDir, DISPATCH_GATE_CLAIMS_FILE);
+  // P0-01b: Verify lexical, full symlink-walk from `wtDir`, AND physical `realpathSync` containment
+  // BEFORE ANY `mkdirSync`, `readGateClaims`, or `writeGateClaims`!
+  assertSafePathFromRoot(wtDir, artDir, canonTarget, "[worktree-isolation]");
+  assertSafePathFromRoot(wtDir, artDir, claimsTarget, "[worktree-isolation]");
   if (dispatchId) {
     const scopeDir = join(artDir, `.dispatch-${String(dispatchId).replace(/[^A-Za-z0-9._-]+/g, "_")}`);
-    if (!isStrictlyInsideDir(scopeDir, join(scopeDir, step.writes))) {
-      throw new Error(`[worktree-isolation] step "${step.id}" writes path "${step.writes}" escapes dispatch scope directory`);
-    }
+    const scopedTarget = join(scopeDir, step.writes);
+    assertSafePathFromRoot(wtDir, scopeDir, scopedTarget, "[worktree-isolation]");
     mkdirSync(scopeDir, { recursive: true });
+    assertSafePathFromRoot(wtDir, scopeDir, scopedTarget, "[worktree-isolation]");
   }
-  const claims = readGateClaims(artDir);
+  const claims = readGateClaims(artDir, wtDir);
   claims[step.writes] = {
     stepId: step.id,
     writes: step.writes,
@@ -240,7 +254,7 @@ export function bindStepArtifactDispatchClaim(wtDir, artDirRel, step, { dispatch
     clearedAtMs: clearedAtMs ?? Date.now(),
     boundAt: new Date().toISOString(),
   };
-  writeGateClaims(artDir, claims);
+  writeGateClaims(artDir, claims, wtDir);
 }
 
 /**
@@ -253,20 +267,28 @@ export function clearStaleStepArtifact(step, wtDir, stepWtDir, artDirRel) {
   if (!step || !step.writes) return { cleared: true, clearedAtMs: Date.now(), fsEpochMtimeMs: Date.now(), targets: [] };
   const artDir = join(wtDir, artDirRel);
   const mainTarget = join(wtDir, artDirRel, step.writes);
-  if (!isStrictlyInsideDir(artDir, mainTarget)) {
-    throw new Error(`[worktree-isolation] step "${step.id}" writes path "${step.writes}" escapes artifact directory`);
-  }
+  // P0-01b: Walk every segment from `wtDir` (and `stepWtDir` when isolated) and verify physical
+  // `realpathSync` containment BEFORE ANY `rmSync`, `sampleFsEpochMtimeMs`, or `writeGateClaims`!
+  assertSafePathFromRoot(wtDir, artDir, mainTarget, "[worktree-isolation]");
+  assertSafePathFromRoot(wtDir, artDir, join(artDir, DISPATCH_GATE_CLAIMS_FILE), "[worktree-isolation]");
   const targets = [mainTarget];
   if (stepWtDir && !samePath(stepWtDir, wtDir)) {
     const isoArtDir = join(stepWtDir, artDirRel);
     const isoTarget = join(isoArtDir, step.writes);
-    if (!isStrictlyInsideDir(isoArtDir, isoTarget)) {
-      throw new Error(`[worktree-isolation] step "${step.id}" writes path "${step.writes}" escapes isolated artifact directory`);
-    }
+    assertSafePathFromRoot(stepWtDir, isoArtDir, isoTarget, "[worktree-isolation]");
     targets.push(isoTarget);
   }
   for (const p of targets) {
-    if (!existsSync(p)) continue;
+    let lst = null;
+    try { lst = lstatSync(p); } catch (e) {
+      if (e && e.code !== "ENOENT") {
+        throw new Error(`[worktree-isolation] failed to stat stale step artifact "${p}": ${e?.message || e}`);
+      }
+    }
+    if (!lst) continue;
+    if (lst.isSymbolicLink()) {
+      throw new Error(`[worktree-isolation] refusing to follow or unlink symlinked step artifact "${p}"`);
+    }
     try {
       rmSync(p, { force: false });
     } catch (e) {
@@ -279,9 +301,11 @@ export function clearStaleStepArtifact(step, wtDir, stepWtDir, artDirRel) {
     }
   }
   const clearedAtMs = Date.now();
-  const sampleDir = (stepWtDir && !samePath(stepWtDir, wtDir)) ? join(stepWtDir, artDirRel) : artDir;
-  const fsEpochMtimeMs = sampleFsEpochMtimeMs(sampleDir);
-  const claims = readGateClaims(artDir);
+  const useIsoSample = Boolean(stepWtDir && !samePath(stepWtDir, wtDir));
+  const sampleDir = useIsoSample ? join(stepWtDir, artDirRel) : artDir;
+  const sampleRoot = useIsoSample ? stepWtDir : wtDir;
+  const fsEpochMtimeMs = sampleFsEpochMtimeMs(sampleDir, sampleRoot);
+  const claims = readGateClaims(artDir, wtDir);
   claims[step.writes] = {
     stepId: step.id,
     writes: step.writes,
@@ -293,7 +317,7 @@ export function clearStaleStepArtifact(step, wtDir, stepWtDir, artDirRel) {
     clearedAtMs,
     boundAt: null,
   };
-  writeGateClaims(artDir, claims);
+  writeGateClaims(artDir, claims, wtDir);
   return { cleared: true, clearedAtMs, fsEpochMtimeMs, targets };
 }
 
@@ -305,6 +329,7 @@ export function syncInputsToIsolatedWorktree({ step, wtDir, stepWtDir, artDirRel
   if (!stepWtDir || samePath(stepWtDir, wtDir)) return;
   const srcArt = join(wtDir, artDirRel);
   const dstArt = join(stepWtDir, artDirRel);
+  if (hasSymlinkInPath(wtDir, srcArt).bad || hasSymlinkInPath(stepWtDir, dstArt).bad) return;
   mkdirSync(dstArt, { recursive: true });
 
   const filesToCopy = new Set();
@@ -322,14 +347,25 @@ export function syncInputsToIsolatedWorktree({ step, wtDir, stepWtDir, artDirRel
 
   for (const fname of filesToCopy) {
     const src = join(srcArt, fname);
+    const dst = join(dstArt, fname);
+    if (!verifySafePathFromRoot(wtDir, srcArt, src).ok) continue;
+    if (!verifySafePathFromRoot(stepWtDir, dstArt, dst).ok) continue;
     if (existsSync(src)) {
-      try { copyFileSync(src, join(dstArt, fname)); } catch { /* best-effort */ }
+      try {
+        mkdirSync(dirname(dst), { recursive: true });
+        copyFileSync(src, dst);
+      } catch { /* best-effort */ }
     }
   }
   // Also sync Playwright screenshots dir when present (helpful on visual-gate retry).
   const srcShots = join(srcArt, "screenshots");
-  if (existsSync(srcShots)) {
-    try { cpSync(srcShots, join(dstArt, "screenshots"), { recursive: true, force: true }); } catch { /* best-effort */ }
+  const dstShots = join(dstArt, "screenshots");
+  if (
+    verifySafePathFromRoot(wtDir, srcArt, srcShots).ok &&
+    verifySafePathFromRoot(stepWtDir, dstArt, dstShots).ok &&
+    existsSync(srcShots)
+  ) {
+    try { cpSync(srcShots, dstShots, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
 }
 
@@ -342,7 +378,8 @@ export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDir
   if (!stepWtDir || samePath(stepWtDir, wtDir)) return;
   const srcArt = join(stepWtDir, artDirRel);
   const dstArt = join(wtDir, artDirRel);
-  if (hasSymlinkInPath(wtDir, dstArt).bad) return;
+  if (!verifySafePathFromRoot(wtDir, dstArt, join(dstArt, WORKTREES_MANIFEST)).ok) return;
+  if (!verifySafePathFromRoot(stepWtDir, srcArt, join(srcArt, WORKTREES_MANIFEST)).ok) return;
   mkdirSync(dstArt, { recursive: true });
   const safeDisp = dispatchId ? String(dispatchId).replace(/[^A-Za-z0-9._-]+/g, "_") : null;
   const scopedWriteRel = (safeDisp && step.writes) ? dispatchIsolatedArtifactRel(dispatchId, step.writes) : null;
@@ -356,11 +393,8 @@ export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDir
     const src = join(srcArt, fname);
     try {
       const isScopedWrite = Boolean(scopedWriteRel && fname === scopedWriteRel);
-      // P0-01: Enforce strict containment inside `srcArt` (and `.dispatch-<id>` when scoped) BEFORE touching filesystem!
-      if (!isStrictlyInsideDir(srcArt, src)) continue;
-      if (isScopedWrite && !isStrictlyInsideDir(join(srcArt, `.dispatch-${safeDisp}`), src)) continue;
-      // Walk the ENTIRE source path from `stepWtDir` down to `src` to reject parent or leaf symlinks!
-      if (hasSymlinkInPath(stepWtDir, src).bad) continue;
+      const srcContainer = isScopedWrite ? join(srcArt, `.dispatch-${safeDisp}`) : srcArt;
+      if (!verifySafePathFromRoot(stepWtDir, srcContainer, src).ok) continue;
       const st = lstatSync(src);
       if (st.isSymbolicLink() || !st.isFile()) continue;
       const isCanonicalWrite = Boolean(step.writes && fname === step.writes);
@@ -393,10 +427,10 @@ export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDir
       }
 
       const dst = join(dstArt, dstRel);
-      if (!isStrictlyInsideDir(dstArt, dst)) continue;
-      if (dstRel === scopedWriteRel && safeDisp && !isStrictlyInsideDir(join(dstArt, `.dispatch-${safeDisp}`), dst)) continue;
-      if (hasSymlinkInPath(wtDir, dst).bad) continue;
+      const dstContainer = (dstRel === scopedWriteRel && safeDisp) ? join(dstArt, `.dispatch-${safeDisp}`) : dstArt;
+      if (!verifySafePathFromRoot(wtDir, dstContainer, dst).ok) continue;
       mkdirSync(dirname(dst), { recursive: true });
+      if (!verifySafePathFromRoot(wtDir, dstContainer, dst).ok) continue;
       const tmpDst = join(dirname(dst), `.tmp-${basename(dst)}-sync-${process.pid}-${Date.now()}`);
       copyFileSync(src, tmpDst);
       try { utimesSync(tmpDst, st.atime, st.mtime); } catch {}

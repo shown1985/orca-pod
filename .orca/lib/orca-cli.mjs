@@ -416,14 +416,49 @@ export function collectAllReleaseStatuses(rawJson, resJson = null) {
   };
 }
 
+export function hasUnconfirmedHelper(rawJson, resJson = null) {
+  const rj = resJson || res(rawJson);
+  const lists = [
+    ...(Array.isArray(rj?.helpers) ? rj.helpers : []),
+    ...(Array.isArray(rawJson?.helpers) ? rawJson.helpers : []),
+  ];
+  if (lists.length === 0) return false;
+  for (const h of lists) {
+    if (!h || typeof h !== "object") return true;
+    if (
+      h.keptOpen === true ||
+      h.kept_open === true ||
+      h.retained === true ||
+      h.running === true
+    ) {
+      return true;
+    }
+    const hStates = [
+      h.status, h.state, h.stopStatus, h.stop_status, h.workerState, h.worker_state,
+    ]
+      .filter((v) => typeof v === "string" && v.trim())
+      .map((v) => v.trim().toLowerCase());
+    if (hStates.length === 0 || hStates.some((s) => !CONFIRMED_STOP_STATES.has(s))) {
+      return true;
+    }
+    const hActions = [h.processAction, h.process_action]
+      .filter((v) => typeof v === "string" && v.trim())
+      .map((v) => v.trim().toLowerCase());
+    if (hActions.some((a) => REJECTED_PROC_ACTIONS.has(a))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * P0-01: Stop & release verification for caller-created MANUAL terminal dispatches:
  *   Per `orca orchestration worker-stop --help` & `worker-release --help`, a dispatch created by
  *   `orchestration dispatch` reports `fenced` on `worker-stop` and `retained` on `worker-release`.
  *   Therefore:
- *     1) Fence via `worker-stop` (unanimous `fenced` or confirmed stop states across ALL fields, zero live helpers);
+ *     1) Fence via `worker-stop` (mutually exclusive unanimous `fenced` OR confirmed stop states across ALL fields, zero unconfirmed helpers);
  *     2) Explicitly close the manual terminal via `verifyManualTerminalClosed` (requiring positive close confirmation!);
- *     3) Release via `worker-release` (unanimous `retained` / `released` / `already_released` across ALL fields ONLY AFTER step 2 proved terminal closure!).
+ *     3) Release via `worker-release` (mutually exclusive unanimous `retained` OR unanimous `released`/`already_released`/`closed`/`not_found` across ALL fields ONLY AFTER step 2 proved terminal closure — contradictory mixes like `action=released, releaseStatus=retained` are REJECTED!).
  */
 export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle) {
   if (!termHandle || !String(termHandle).trim()) {
@@ -433,16 +468,12 @@ export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle
     const stopRes = orcaFn(["orchestration", "worker-stop", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
     const stopJson = res(stopRes.json);
     const stopDispIds = collectReceiptDispatchIds(stopRes.json, stopJson);
-    const { states: stopStates, procActions } = collectAllStopStates(stopRes.json, stopJson);
-    const helpers = Array.isArray(stopJson.helpers) ? stopJson.helpers : [];
-    const liveHelper = helpers.some((h) => h && (
-      h.keptOpen === true ||
-      h.running === true ||
-      /^(running|starting|pending|stop_unknown|unknown)$/i.test(String(h.status || h.state || ""))
-    ));
+    const { states: stopStates, procActions, hasBooleanRetained: stopRetained } = collectAllStopStates(stopRes.json, stopJson);
+    const liveHelper = hasUnconfirmedHelper(stopRes.json, stopJson);
     const idMatchedStop = stopDispIds.length > 0 && stopDispIds.every((id) => id === dispatchId);
-    const unanimousFence = (stopStates.length > 0 || stopJson.fenced === true) &&
-      stopStates.every((s) => CONFIRMED_MANUAL_FENCE_STATES.has(s)) &&
+    const pureFenced = stopStates.length > 0 ? stopStates.every((s) => s === "fenced") : stopJson.fenced === true;
+    const pureStopped = !stopRetained && stopStates.length > 0 && stopStates.every((s) => CONFIRMED_STOP_STATES.has(s));
+    const unanimousFence = (pureFenced || pureStopped) &&
       procActions.every((a) => a !== "stop_unknown" && a !== "failed" && a !== "kept_open");
     const fencedOk = Boolean(
       stopRes.ok &&
@@ -473,9 +504,11 @@ export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle
     const relRes = orcaFn(["orchestration", "worker-release", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
     const relJson = res(relRes.json);
     const relDispIds = collectReceiptDispatchIds(relRes.json, relJson);
-    const { statuses: relStatuses } = collectAllReleaseStatuses(relRes.json, relJson);
+    const { statuses: relStatuses, hasBooleanRetained: relRetained } = collectAllReleaseStatuses(relRes.json, relJson);
     const idMatchedRel = relDispIds.length > 0 && relDispIds.every((id) => id === dispatchId);
-    const unanimousManualRel = relStatuses.length > 0 && relStatuses.every((s) => CONFIRMED_MANUAL_RELEASE_STATES.has(s));
+    const pureRetained = relStatuses.length > 0 && relStatuses.every((s) => s === "retained");
+    const pureReleased = !relRetained && relStatuses.length > 0 && relStatuses.every((s) => CONFIRMED_RELEASE_STATES.has(s));
+    const unanimousManualRel = pureRetained || pureReleased;
     const relOk = Boolean(
       relRes.ok &&
       relRes.json &&
@@ -497,7 +530,8 @@ export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle
 
 /**
  * P0-01: Require explicit UNANIMOUS stop AND release confirmation across ALL fields for SUPERVISED (`cold`) `dispatchId`:
- *   - `worker-stop` MUST confirm an actual stopped state across ALL state/status fields (`state=stopped, status=running` is REJECTED!);
+ *   - `worker-stop` MUST confirm an actual stopped state across ALL state/status fields (`state=stopped, status=running` is REJECTED!)
+ *     and across ALL helper status/state fields (`helpers: [{ status: "stopped", state: "running" }]` is REJECTED!);
  *     `"fenced"` or bare `processAction` without a confirmed stop state is REJECTED!
  *   - `worker-release` MUST return a non-empty confirmed release state across ALL action/status/releaseStatus fields
  *     (`action=released, releaseStatus=retained` is REJECTED!).
@@ -510,12 +544,7 @@ export function verifyStopAndReleaseReceipt(orcaFn, dispatchId) {
   const stopJson = res(stopRes.json);
   const stopDispIds = collectReceiptDispatchIds(stopRes.json, stopJson);
   const { states: stopStates, procActions, hasBooleanRetained: stopRetained } = collectAllStopStates(stopRes.json, stopJson);
-  const helpers = Array.isArray(stopJson.helpers) ? stopJson.helpers : [];
-  const liveHelper = helpers.some((h) => h && (
-    h.keptOpen === true ||
-    h.running === true ||
-    /^(running|starting|pending|stop_unknown|unknown)$/i.test(String(h.status || h.state || ""))
-  ));
+  const liveHelper = hasUnconfirmedHelper(stopRes.json, stopJson);
   const idMatchedStop = stopDispIds.length > 0 && stopDispIds.every((id) => id === dispatchId);
   const unanimousStopped = stopStates.length > 0 &&
     stopStates.every((s) => CONFIRMED_STOP_STATES.has(s)) &&

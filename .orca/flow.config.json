@@ -27,7 +27,9 @@
     "protectedBranches": [
       "main",
       "master"
-    ]
+    ],
+    "turnStartWindowMs": 120000,
+    "turnStartEscalateMs": 600000
   },
   "skills": {
     "triage-po": {
@@ -134,7 +136,11 @@
         "code-review"
       ],
       "onFailGoto": null,
-      "spec": "You are the Track 1 Release Reviewer. Based on {reads}: (1) verify current branch is a `feat/<slug>` or `fix/<slug>` branch (NEVER push directly to `{protectedBranches}` and NEVER auto-merge into `{protectedBranches}`); (2) commit clean changes (never commit .orca/artifacts/), push with `git push -u origin HEAD`, create/update a Pull Request targeting `{targetBranch}` (`--base {targetBranch}`), and once CI + Visual Gate + Code Review are green on non-protected `{targetBranch}` (e.g. `dev`), merge into `{targetBranch}`; (3) write PR URL, merge commit SHA, and verification checklist to {out}."
+      "spec": "You are the Track 1 Release Reviewer. Based on {reads}: (1) verify current branch is a `feat/<slug>` or `fix/<slug>` branch (NEVER push directly to `{protectedBranches}` and NEVER auto-merge into `{protectedBranches}`); (2) commit clean changes (never commit .orca/artifacts/), push with `git push -u origin HEAD`, create/update a Pull Request targeting `{targetBranch}` (`--base {targetBranch}`), and once CI + Visual Gate + Code Review are green on non-protected `{targetBranch}` (e.g. `dev`), merge into `{targetBranch}`; (3) write PR URL, merge commit SHA, and verification checklist to {out}. Merge Danger / One-Way Door Guard — follow the engine pre-check strictly:\n{mergeDangerReport}\nAlways record explicit lines `Door: one-way` or `Door: two-way` and `Merge-Status: MERGED` or `Merge-Status: PENDING_HUMAN_MERGE`, and end {out} with the final non-empty line strictly as `VERDICT: PASS`.",
+      "verify": {
+        "requireVerdict": "PASS",
+        "mergeDangerCheck": true
+      }
     }
   ]
 }

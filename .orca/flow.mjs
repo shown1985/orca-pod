@@ -67,11 +67,20 @@ import {
   clearStaleStepArtifact, recordVerifiedContractCommit, recordMergedAfterContract,
   knownIsolatedWorktreePaths,
 } from "./worktree-isolation.mjs";
+import { classifyMergeDanger, formatMergeDangerPromptBlock, snapshotTargetRefs, validateMergeDangerConfig, verifyMergeDangerGate } from "./merge-danger.mjs";
+import { initMemberHealth, evaluateMemberHealth } from "./health.mjs";
+import { createRunLedger, acquireRunLock, releaseRunLock, snapshotBranchShas } from "./ledger.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Live-page accumulator: null until the status section assigns it (before any
 // run starts). `die` uses it to leave a final state on the status page.
 let STATUS = null;
+let LEDGER = null;
+let LOCK_CTX = null;
+let LAST_MERGE_DANGER = null;
+let PENDING_HUMAN_MERGE = false;
+let ATTEMPT_SEQ = 0;
+const PRE_STEP_TARGET_REFS = {};
 // Run-history latch: set when the startup chooser already archived/restored
 // the previous run's artifacts — the archive call site must then skip, or a
 // resumed run would snapshot the very state it just restored.
@@ -99,12 +108,26 @@ const die = (m) => {
     // delivery is synchronous; never masks the real error.
     try { notifyRun(STATUS.overall); } catch { }
   }
+  if (LEDGER) {
+    try {
+      LEDGER.reconcileCloseout({
+        wtDir: WT_PATH || ".",
+        artDirRel: ART_DIR,
+        overall: STATUS?.overall || "failed",
+        mergeDanger: LAST_MERGE_DANGER,
+      });
+    } catch { }
+  }
+  if (LOCK_CTX) {
+    try { releaseRunLock(LOCK_CTX); } catch { }
+    LOCK_CTX = null;
+  }
   process.exit(1);
 };
 
 // --- Parse argv: flags + objective ---
 const argv = process.argv.slice(2);
-const opt = { from: null, only: null, dryRun: false, config: null, agentOverrides: {}, grillMe: undefined, worktree: null, createWorktree: false, noOpenStatus: false, statusPreview: false, newRun: false };
+const opt = { from: null, only: null, dryRun: false, config: null, agentOverrides: {}, grillMe: undefined, worktree: null, createWorktree: false, noOpenStatus: false, statusPreview: false, newRun: false, allowOneWayMerge: false, dedupKey: null, ledgerHome: null };
 const rest = [];
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -122,6 +145,9 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--no-open-status") opt.noOpenStatus = true;
   else if (a === "--status-preview") opt.statusPreview = true;
   else if (a === "--new") opt.newRun = true;
+  else if (a === "--allow-one-way-merge") opt.allowOneWayMerge = true;
+  else if (a === "--dedup-key") opt.dedupKey = argv[++i];
+  else if (a === "--ledger-home") opt.ledgerHome = argv[++i];
   else if (a === "--agent") {
     const [step, ag] = argv[++i].split("=");
     if (step && ag) opt.agentOverrides[step] = ag;
@@ -205,6 +231,38 @@ const wtFixHint = () =>
 // Soft mode (dry-run) degrades to run-scope reads if the runtime is down.
 // --status-preview stays CLI-free: it renders its fixture and exits below,
 // before this block — exactly the pre-hoist ordering.
+const EARLY_RUN_KEY = `${wtStamp()}-${slugify(objective || CONFIG_FILE).slice(0, 24)}-${process.pid}`;
+const EARLY_LEDGER_HOME = opt.ledgerHome || cfg.defaults?.ledgerHome || null;
+if (!opt.statusPreview && !opt.dryRun && opt.dedupKey) {
+  let lockRes;
+  try {
+    lockRes = acquireRunLock({
+      dedupKey: opt.dedupKey,
+      runKey: EARLY_RUN_KEY,
+      repoDir: process.cwd(),
+      objective,
+      ledgerHome: EARLY_LEDGER_HOME,
+    });
+  } catch (e) {
+    die(`[ledger] lock init failed: ${e.message}`);
+  }
+  if (!lockRes.acquired) {
+    console.error(
+      `[orca-flow] DUPLICATE RUN BLOCKED: dedup-key "${opt.dedupKey}" is already held by live PID ${lockRes.holder?.pid} (run=${lockRes.holder?.runKey}).`
+    );
+    process.exit(2);
+  }
+  LOCK_CTX = { dedupKey: opt.dedupKey, runKey: EARLY_RUN_KEY, repoDir: process.cwd(), ledgerHome: EARLY_LEDGER_HOME };
+  if (lockRes.reclaimedStale) {
+    warn(`[ledger] reclaimed stale lock for dedup-key "${opt.dedupKey}" (previous PID ${lockRes.holder?.reclaimedStaleFromPid} is no longer running).`);
+  }
+  process.on("exit", () => {
+    if (LOCK_CTX) {
+      try { releaseRunLock(LOCK_CTX); } catch { }
+      LOCK_CTX = null;
+    }
+  });
+}
 if (!opt.statusPreview) {
   ORCA = resolveOrca();
   await ensureWorktree();   // may create + pin a worktree when auto-detect fails
@@ -363,6 +421,23 @@ const TARGET_BRANCH = cfg.defaults?.targetBranch || "dev";
 const PROTECTED_BRANCHES = cfg.defaults?.protectedBranches || ["main", "master"];
 if (PROTECTED_BRANCHES.includes(TARGET_BRANCH))
   die(`defaults: targetBranch "${TARGET_BRANCH}" is listed in protectedBranches (${PROTECTED_BRANCHES.join(", ")}) — refusing to target a protected branch.`);
+const TURN_START_WINDOW_MS = cfg.defaults?.turnStartWindowMs ?? 120000;
+const TURN_START_ESCALATE_MS = cfg.defaults?.turnStartEscalateMs ?? 600000;
+if (!Number.isInteger(TURN_START_WINDOW_MS) || TURN_START_WINDOW_MS <= 0)
+  die(`defaults: turnStartWindowMs must be a positive integer (got ${JSON.stringify(TURN_START_WINDOW_MS)}).`);
+if (!Number.isInteger(TURN_START_ESCALATE_MS) || TURN_START_ESCALATE_MS < TURN_START_WINDOW_MS)
+  die(`defaults: turnStartEscalateMs must be an integer >= turnStartWindowMs (got ${JSON.stringify(TURN_START_ESCALATE_MS)}).`);
+for (const s of allSteps) {
+  const sw = s.turnStartWindowMs ?? TURN_START_WINDOW_MS;
+  const se = s.turnStartEscalateMs ?? TURN_START_ESCALATE_MS;
+  if (!Number.isInteger(sw) || sw <= 0)
+    die(`step "${s.id}": turnStartWindowMs must be a positive integer (got ${JSON.stringify(s.turnStartWindowMs)}).`);
+  if (!Number.isInteger(se) || se < sw)
+    die(`step "${s.id}": turnStartEscalateMs must be an integer >= turnStartWindowMs (got ${JSON.stringify(s.turnStartEscalateMs)}).`);
+}
+validateMergeDangerConfig(cfg.defaults?.mergeDanger, die);
+const MERGE_DANGER_THRESHOLDS = cfg.defaults?.mergeDanger || null;
+const LEDGER_HOME_CFG = opt.ledgerHome || cfg.defaults?.ledgerHome || null;
 const isolatedState = {};
 
 // A step's reads. Steps in this run always count. Steps NOT part of this run
@@ -398,13 +473,26 @@ function renderSpec(step, stepCtx = null) {
     ? "\n\nINTERACTIVE SESSION (manual mode): this pipeline runs with user oversight — ALIGN WITH THE USER before finalizing. Interview protocol, follow exactly: (1) Ask ONE question at a time in this terminal and WAIT for the answer; never batch questions. (2) Cover, roughly in order: alignment with the functional requirements and scope; non-functional requirements; performance targets and expected load; security and compliance constraints; scalability and growth expectations; database and persistence choices; technology constraints and team preferences; deployment and operations. (3) Prefer multiple choice; open-ended only when options would bias the answer. (4) After each answer, restate your understanding in one short line so the user can correct you early. (5) Finish with a numbered DECISIONS list (decision + rationale) and get the user's confirmation on each before writing {out}. Include the confirmed decisions and any remaining open points in {out}."
     : "";
   const wtNote = renderIsolatedWorktreeNote(stepCtx, outPath(step.writes));
-  return (objectiveLine + (step.spec || "") + autonomy + interview + wtNote)
-    .replaceAll("{out}", outPath(step.writes))
-    .replaceAll("{tasks}", step.progress ? outPath(step.progress) : "{tasks}")
-    .replaceAll("{reads}", readList)
-    .replaceAll("{targetBranch}", TARGET_BRANCH)
-    .replaceAll("{protectedBranches}", PROTECTED_BRANCHES.join(", "))
-    .replaceAll("{worktreesManifest}", outPath(WORKTREES_MANIFEST));
+  let mergeDangerBlock = "";
+  if (step.verify?.mergeDangerCheck) {
+    const mdDir = stepCtx?.isolated ? stepCtx.dir : (resolveWorktreePath(true) || ".");
+    const pinnedBase = PRE_STEP_TARGET_REFS[step.id]?.localSha || PRE_STEP_TARGET_REFS[step.id]?.originSha || TARGET_BRANCH;
+    const cls = classifyMergeDanger(mdDir, pinnedBase, { thresholds: MERGE_DANGER_THRESHOLDS });
+    if (!opt.dryRun) LAST_MERGE_DANGER = cls;
+    mergeDangerBlock = formatMergeDangerPromptBlock(cls, TARGET_BRANCH, opt.allowOneWayMerge);
+  }
+  const hasPlaceholder = (step.spec || "").includes("{mergeDangerReport}");
+  const mdSuffix = (!hasPlaceholder && mergeDangerBlock) ? `\n\nMERGE DANGER PRE-CHECK:\n${mergeDangerBlock}` : "";
+  const rep = (str, tok, val) => str.replaceAll(tok, () => val);
+  let rendered = objectiveLine + (step.spec || "") + autonomy + interview + wtNote + mdSuffix;
+  rendered = rep(rendered, "{mergeDangerReport}", mergeDangerBlock || "(no merge-danger check configured)");
+  rendered = rep(rendered, "{out}", outPath(step.writes));
+  rendered = rep(rendered, "{tasks}", step.progress ? outPath(step.progress) : "{tasks}");
+  rendered = rep(rendered, "{reads}", readList);
+  rendered = rep(rendered, "{targetBranch}", TARGET_BRANCH);
+  rendered = rep(rendered, "{protectedBranches}", PROTECTED_BRANCHES.join(", "));
+  rendered = rep(rendered, "{worktreesManifest}", outPath(WORKTREES_MANIFEST));
+  return rendered;
 }
 
 // --- Orca CLI (argv-safe, no shell to avoid mangling special characters) ---
@@ -1916,7 +2004,8 @@ function coldStart(step, taskId, wtSelector = null) {
     const result = res(r.json);
     const dispatchId = pick(result, ["dispatchId", "dispatch_id"]);
     const state = pick(result, ["state"]);
-    if (r.ok && (state === "ready" || !state)) return { dispatchId, terminal: null };
+    const receiptTurnStart = pick(result, ["turnStart", "turn_start"]) || null;
+    if (r.ok && (state === "ready" || !state)) return { dispatchId, terminal: null, dispatchState: state || null, receiptTurnStart };
 
     const lastError = pick(result, ["lastError"]) || r.stderr || "unknown error";
     const failedStage = pick(result, ["failedStage", "stage"]);
@@ -2051,6 +2140,57 @@ if (opt.dryRun) { log("Dry-run — no agents called."); process.exit(0); }
 resolveWorktree();          // hard-fail here if still unresolved
 const WT_DIR = resolveWorktreePath();
 if (!WT_DIR) die(`Could not resolve the path of worktree ${WT} (orca worktree show failed). Fix/remove it, then re-run.`);
+
+const runKey = EARLY_RUN_KEY;
+
+const cleanupOnSignal = (sig) => {
+  if (LEDGER) {
+    try {
+      LEDGER.reconcileCloseout({
+        wtDir: WT_DIR || ".",
+        artDirRel: ART_DIR,
+        overall: "interrupted",
+        mergeDanger: LAST_MERGE_DANGER,
+      });
+    } catch { }
+  }
+  if (LOCK_CTX) {
+    try { releaseRunLock(LOCK_CTX); } catch { }
+    LOCK_CTX = null;
+  }
+  process.exit(sig === "SIGINT" ? 130 : 143);
+};
+process.on("SIGINT", () => cleanupOnSignal("SIGINT"));
+process.on("SIGTERM", () => cleanupOnSignal("SIGTERM"));
+process.on("exit", () => {
+  if (LOCK_CTX) {
+    try { releaseRunLock(LOCK_CTX); } catch { }
+    LOCK_CTX = null;
+  }
+});
+
+// M2 FIX: Snapshot protected branch SHAs (local + origin) BEFORE any run mutation.
+const initialProtectedShas = snapshotBranchShas(WT_DIR || ".", PROTECTED_BRANCHES);
+
+// Initialize out-of-repo durable Run Ledger (refuses paths inside any repo worktree/git-dir)
+try {
+  LEDGER = createRunLedger({
+    runKey,
+    repoDir: WT_DIR || ".",
+    ledgerHome: LEDGER_HOME_CFG,
+    objective,
+    configFile: CONFIG_FILE,
+    targetBranch: TARGET_BRANCH,
+    protectedBranches: PROTECTED_BRANCHES,
+    dedupKey: opt.dedupKey,
+    initialProtectedShas,
+    warn,
+  });
+  log(`[ledger] out-of-repo run ledger: ${LEDGER.summaryPath}`);
+} catch (e) {
+  die(`[ledger] failed to initialize out-of-repo ledger: ${e.message}`);
+}
+
 mkdirSync(join(WT_DIR || ".", ART_DIR), { recursive: true });
 if (!HISTORY_ARCHIVE_DONE) archiveCurrentRun();
 // Crash recovery: a previous run killed between materialize and restore leaves
@@ -2069,6 +2209,7 @@ if (!runResp.ok) die(`run-create failed: ${runResp.stderr || runResp.raw}`);
 RUN_ID = pick(res(runResp.json).run || {}, ["id"]) || pick(res(runResp.json), ["runId", "run_id"]);
 if (!RUN_ID) die(`Could not read Run ID from run-create. Output: ${runResp.raw}`);
 log(`Run: ${RUN_ID}`);
+LEDGER.setOrcaRunId(RUN_ID);
 initStatus();
 
 // Create a task per step, keep taskId for reuse on retries
@@ -2118,7 +2259,7 @@ function outcomeOf(done) {
 // lastOutputAt serve as fallback when no preview is available. Settlement:
 // dispatch.status failed => "failed"; completed => the task record's outcome.
 function workerVitals(taskId, terminal, dispatchId) {
-  const v = { status: null, settled: false, outcome: null, lastBusyMs: 0, heartbeatMs: 0, preview: null };
+  const v = { status: null, settled: false, outcome: null, lastBusyMs: 0, heartbeatMs: 0, preview: null, agentWait: null };
   const d = orca(["orchestration", "dispatch-show", "--task", taskId]);
   const dd = pick(res(d.json), ["dispatch"]) || {};
   v.status = pick(dd, ["status"]);
@@ -2132,7 +2273,9 @@ function workerVitals(taskId, terminal, dispatchId) {
   if (terminal) {
     tinfo = pick(res(orca(["terminal", "show", "--terminal", terminal]).json), ["terminal"]) || {};
   } else if (dispatchId) {
-    tinfo = pick(res(orca(["orchestration", "worker-show", "--dispatch", dispatchId]).json), ["terminal"]) || {};
+    const ws = res(orca(["orchestration", "worker-show", "--dispatch", dispatchId]).json);
+    tinfo = pick(ws, ["terminal"]) || {};
+    v.agentWait = pick(ws, ["agentWait", "agent_wait"]) ?? pick(tinfo, ["agentWait", "agent_wait"]) ?? null;
   }
   v.lastBusyMs = Math.max(v.lastBusyMs, pick(tinfo, ["lastOutputAt"]) || 0);
   v.preview = pick(tinfo, ["preview"]) ?? null;
@@ -2307,20 +2450,66 @@ function nudgePoll(m) {
 // Budgets mirror the sequential semantics exactly (manual-mode interactive
 // steps get the raised silence/hard caps).
 function launchMember(step, stepCtx = null) {
+  // M10 + m6 FIX: Snapshot pre-step target refs ONCE per step id BEFORE ensureTask/renderSpec.
+  if (step.verify?.mergeDangerCheck && !PRE_STEP_TARGET_REFS[step.id]) {
+    PRE_STEP_TARGET_REFS[step.id] = snapshotTargetRefs(stepCtx?.isolated ? stepCtx.dir : (WT_DIR || "."), TARGET_BRANCH);
+  }
+  const preRefs = PRE_STEP_TARGET_REFS[step.id] || { localSha: null, originSha: null, remoteSha: null, remoteError: null, hasOrigin: false, headSha: null };
+  const preStepTargetSha = preRefs.localSha;
+  const preStepOriginTargetSha = preRefs.originSha;
+  const preStepRemoteTargetSha = preRefs.remoteSha;
+  const preStepRemoteError = preRefs.remoteError;
+  const preStepHasOrigin = preRefs.hasOrigin;
+  const preStepHeadSha = preRefs.headSha;
   const taskId = ensureTask(step, stepCtx);
   const wtTag = stepCtx?.isolated ? `, worktree=${stepCtx.wtName}, branch=${stepCtx.branch}` : "";
   log(`> ${step.title}  (agent=${agentOf(step)}, task=${taskId}${wtTag})`);
-  const { dispatchId, terminal } = startWorker(step, taskId, stepCtx?.selector || null);
+  const requestId = `req-${++ATTEMPT_SEQ}-${step.id}`;
+  if (LEDGER) {
+    LEDGER.recordIntent({
+      requestId,
+      stepId: step.id,
+      title: step.title,
+      agent: agentOf(step),
+      model: effectiveModel(step),
+      attempt: ATTEMPT_SEQ,
+      worktree: stepCtx?.isolated ? stepCtx.wtName : (WT || "integration"),
+      branch: stepCtx?.isolated ? stepCtx.branch : null,
+    });
+  }
+  const launchedAt = Date.now();
+  const started = startWorker(step, taskId, stepCtx?.selector || null);
+  const dispatchedAt = Date.now();
+  const { dispatchId, terminal } = started;
+  const receiptTurnStart = started.receiptTurnStart || (terminal ? "observed" : null);
+  const health = initMemberHealth({
+    startedAt: launchedAt,
+    dispatchedAt,
+    receiptTurnStart,
+    turnStartWindowMs: step.turnStartWindowMs ?? TURN_START_WINDOW_MS,
+    turnStartEscalateMs: step.turnStartEscalateMs ?? TURN_START_ESCALATE_MS,
+  });
+  if (LEDGER) {
+    LEDGER.recordDispatchResult({
+      requestId,
+      stepId: step.id,
+      dispatchId,
+      terminal,
+      turnStart: health.turnStart,
+      state: started.dispatchState || (terminal ? "manual" : "ready"),
+    });
+  }
+  statusSet(step.id, { health: health.state, turnStart: health.turnStart });
   const interactiveNow = !AUTO_RUN && step.interactive;
   const baseIdleMs = timeoutOf(step);
   const baseHardMs = step.hardTimeoutMs ?? cfg.defaults?.hardTimeoutMs ?? 4 * baseIdleMs;
   const maxIdleMs = interactiveNow ? Math.max(baseIdleMs, 3600000) : baseIdleMs;
   return {
-    step, ctx: stepCtx, taskId, dispatchId, terminal,
+    step, ctx: stepCtx, taskId, dispatchId, terminal, requestId, preStepTargetSha, preStepOriginTargetSha, preStepRemoteTargetSha, preStepRemoteError, preStepHasOrigin, preStepHeadSha, health,
     maxIdleMs,
     hardCapMs: interactiveNow ? Math.max(baseHardMs, 14400000) : baseHardMs,
-    sliceMs: Math.min(120000, maxIdleMs),
-    startedAt: Date.now(), lastBusy: Date.now(), lastPreview: undefined,
+    sliceMs: Math.min(120000, maxIdleMs, health.turnStartWindowMs, health.turnStartEscalateMs),
+    startedAt: launchedAt, lastBusy: launchedAt, lastPreview: undefined,
     quietWarned: false, parkedSeen: new Set(), parkedLabel: null, settled: false, done: null, note: "", outcome: null,
     nudge: { left: nudgeRetriesOf(step), phase: null, sentAt: 0, count: 0, outcome: null, done: null },
   };
@@ -2426,6 +2615,10 @@ function runGroup(members) {
       if (wd) {
         if (m.ctx?.isolated)
           syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: WT_DIR || ".", artDirRel: ART_DIR });
+        if (m.health) {
+          evaluateMemberHealth(m.health, { startedAt: m.startedAt, workerDone: true });
+          statusSet(m.step.id, { health: m.health.state, turnStart: m.health.turnStart });
+        }
         const out = outcomeOf(wd) || "unknown";
         if (!holdForNudge(m, out, wd)) settleMember(m, m.outcome || out, wd);
         continue;
@@ -2452,9 +2645,10 @@ function runGroup(members) {
       // 3) Liveness/freshness per member (identical to the sequential loop):
       // a CHANGING preview proves the TUI is working; a frozen preview for
       // maxIdleMs = hung / parked (timestamps are fallback only).
+      const previewSeenBefore = m.lastPreview !== undefined;
       let previewChanged = false;
       if (v.preview != null) {
-        previewChanged = m.lastPreview === undefined || v.preview !== m.lastPreview;
+        previewChanged = !previewSeenBefore || v.preview !== m.lastPreview;
         if (previewChanged) {
           m.lastPreview = v.preview;
           m.lastBusy = Date.now();
@@ -2479,6 +2673,69 @@ function runGroup(members) {
       }
       maybeNudgeMidRun(m, v);
       const silenceMs = Date.now() - m.lastBusy;
+      // 3c) Start-proof (turnStart: observed) + 5-state Health evaluation
+      if (m.health) {
+        const stepArtPath = join(m.ctx?.isolated ? m.ctx.dir : (WT_DIR || "."), ART_DIR, m.step.writes || "");
+        let artSize = 0;
+        if (m.step.writes && existsSync(stepArtPath)) {
+          try { artSize = statSync(stepArtPath).size; } catch { artSize = 0; }
+        }
+        const hres = evaluateMemberHealth(m.health, {
+          startedAt: m.startedAt,
+          dispatchStatus: v.status,
+          heartbeatMs: v.heartbeatMs,
+          previewChanged,
+          previewSeenBefore,
+          parkedLabel: m.parkedLabel,
+          agentWait: v.agentWait,
+          artifactSize: artSize,
+          silenceMs,
+          maxIdleMs: m.maxIdleMs,
+        });
+        statusSet(m.step.id, { health: hres.state, turnStart: hres.turnStart });
+        if (hres.changed && LEDGER) {
+          LEDGER.recordHealth({
+            stepId: m.step.id,
+            state: hres.state,
+            turnStart: hres.turnStart,
+            signals: hres.signals,
+            note: hres.note,
+          });
+        }
+        if (hres.turnStartWarnDue) {
+          warn(`[health:unknown] "${m.step.title}" has turnStart=unobserved after ${Math.round((Date.now() - m.startedAt) / 1000)}s (state=ready is not start proof).`);
+          if (!m.parkedSeen.size) statusSet(m.step.id, { note: hres.note });
+        }
+        if (hres.state === "lost") {
+          const drainLost = orca(["orchestration", "check", "--run", RUN_ID, "--types", "worker_done"]);
+          const dl = res(drainLost.json);
+          const dlid = pick(dl, ["deliveryId", "delivery_id"]) ?? pick(dl.delivery || {}, ["id"]);
+          const dlMsgs = pick(dl, ["messages", "msgs"]) || [];
+          const lostDone = dlMsgs
+            .find((msg) => pick(msg, ["type"]) === "worker_done" && taskOfMsg(msg) === m.taskId) || null;
+          // R2-M2 FIX: Only ack when this member is the sole remaining unsettled member (or delivery has no sibling msgs),
+          // so we NEVER drop another parallel worker's worker_done message!
+          const hasSiblingMsg = dlMsgs.some((msg) => taskOfMsg(msg) && taskOfMsg(msg) !== m.taskId);
+          if (dlid && !hasSiblingMsg) orca(["orchestration", "check", "--run", RUN_ID, "--ack", dlid]);
+          if (lostDone) {
+            evaluateMemberHealth(m.health, { startedAt: m.startedAt, workerDone: true });
+            statusSet(m.step.id, { health: m.health.state, turnStart: m.health.turnStart });
+            const out = outcomeOf(lostDone) || "unknown";
+            if (!holdForNudge(m, out, lostDone)) settleMember(m, m.outcome || out, lostDone);
+            continue;
+          }
+          warn(`[health:lost] "${m.step.title}" dispatch terminated (${v.status}) without worker_done — stopping without blind retry.`);
+          m.note = hres.note || `dispatch lost (${v.status})`;
+          settleMember(m, "unknown", null);
+          continue;
+        }
+        if (hres.turnStartEscalateDue) {
+          warn(`[health:unknown] "${m.step.title}" never proved turnStart=observed within ${Math.round(m.health.turnStartEscalateMs / 1000)}s — stopping cleanly instead of waiting to hard cap.`);
+          m.note = hres.note || `turnStart unobserved after ${Math.round((Date.now() - m.startedAt) / 1000)}s`;
+          settleMember(m, "still-running", null);
+          continue;
+        }
+      }
       // Hard cap first: absolute per-member limit, busy or quiet.
       if (Date.now() - m.startedAt >= m.hardCapMs) {
         const mins = Math.round((Date.now() - m.startedAt) / 60000);
@@ -2742,9 +2999,22 @@ while (gi < groups.length) {
   // (die / retry jump) wins; a retry re-runs the whole group anyway.
   let jumped = false;
   for (const r of results) {
+    let vres = null;
     if (r.outcome === "succeeded" && r.step.verify) {
       const checkDir = r.ctx?.isolated ? r.ctx.dir : (WT_DIR || ".");
-      const vres = verifyStepArtifact(r.step, join(WT_DIR || ".", ART_DIR), checkDir, READINESS_MIN_BYTES, { mode: "settlement" });
+      vres = verifyStepArtifact(r.step, join(WT_DIR || ".", ART_DIR), checkDir, READINESS_MIN_BYTES, {
+        mode: "settlement",
+        targetBranch: TARGET_BRANCH,
+        allowOneWayMerge: opt.allowOneWayMerge,
+        preStepTargetSha: r.preStepTargetSha,
+        preStepOriginTargetSha: r.preStepOriginTargetSha,
+        preStepRemoteTargetSha: r.preStepRemoteTargetSha,
+        preStepRemoteError: r.preStepRemoteError,
+        preStepHasOrigin: r.preStepHasOrigin,
+        preStepHeadSha: r.preStepHeadSha,
+        mergeDangerThresholds: MERGE_DANGER_THRESHOLDS,
+      });
+      if (vres.mergeDanger) LAST_MERGE_DANGER = vres.mergeDanger;
       if (!vres.ok) {
         warn(`[gate-verify] "${r.step.title}" failed hard gate verification: ${vres.reason} — overriding outcome to failed.`);
         r.outcome = "failed";
@@ -2755,6 +3025,97 @@ while (gi < groups.length) {
           recordVerifiedContractCommit(join(WT_DIR || ".", ART_DIR), vres.contractCommit, WT_DIR || ".");
         if (r.step.verify.requireMergedTasks)
           recordMergedAfterContract(join(WT_DIR || ".", ART_DIR), WT_DIR || ".");
+        if (vres.pendingHumanMerge) {
+          PENDING_HUMAN_MERGE = true;
+          statusSet(r.step.id, { note: `ONE-WAY DOOR: PR held open for human merge (${(vres.mergeDanger?.triggers || []).join(", ")})` });
+          if (LEDGER) {
+            LEDGER.recordPendingHumanMerge({
+              targetBranch: TARGET_BRANCH,
+              door: "one-way",
+              triggers: vres.mergeDanger?.triggers || [],
+              artifact: outPath(r.step.writes),
+              headSha: headSha(),
+            });
+          }
+        }
+      }
+    }
+    // F1 FIX: Unconditionally enforce rogue target-ref mutation detection on EVERY
+    // mergeDangerCheck step (whether non-succeeded, early-failed on missing/bad VERDICT,
+    // or failed inside verifyStepArtifact). Check structured mdCheck.targetRefMoved
+    // directly (never regex-matching prose) and die() immediately — never retry after
+    // an unauthorized one-way target-branch mutation!
+    if (r.step.verify?.mergeDangerCheck && !opt.allowOneWayMerge) {
+      let mdCheck = vres?.mergeDangerResult || null;
+      if (!mdCheck) {
+        const checkDir = r.ctx?.isolated ? r.ctx.dir : (WT_DIR || ".");
+        const artPath = join(WT_DIR || ".", ART_DIR, r.step.writes || "");
+        const artText = (r.step.writes && existsSync(artPath)) ? readFileSync(artPath, "utf8") : "";
+        mdCheck = verifyMergeDangerGate({
+          text: artText,
+          gitDir: checkDir,
+          targetBranch: TARGET_BRANCH,
+          allowOneWayMerge: false,
+          preStepTargetSha: r.preStepTargetSha,
+          preStepOriginTargetSha: r.preStepOriginTargetSha,
+          preStepRemoteTargetSha: r.preStepRemoteTargetSha,
+          preStepRemoteError: r.preStepRemoteError,
+          preStepHasOrigin: r.preStepHasOrigin,
+          preStepHeadSha: r.preStepHeadSha,
+          thresholds: MERGE_DANGER_THRESHOLDS,
+        });
+        if (mdCheck.classification) LAST_MERGE_DANGER = mdCheck.classification;
+      }
+      if (!mdCheck.ok && mdCheck.door === "one-way" && mdCheck.targetRefMoved) {
+        const msg = `[merge-danger] CRITICAL VIOLATION on step "${r.step.title}": ${mdCheck.reason}`;
+        warn(msg);
+        r.outcome = "failed";
+        r.note = r.note ? `${r.note}; ${mdCheck.reason}` : mdCheck.reason;
+        statusSet(r.step.id, { status: "failed", note: r.note });
+        if (LEDGER) {
+          LEDGER.recordStepSettled({
+            stepId: r.step.id,
+            outcome: "failed",
+            note: r.note,
+            verifyOk: false,
+            verifyReason: mdCheck.reason,
+            contractCommit: vres?.contractCommit || null,
+          });
+        }
+        die(msg);
+      }
+    }
+    if (LEDGER) {
+      LEDGER.recordStepSettled({
+        stepId: r.step.id,
+        outcome: r.outcome,
+        note: r.note || null,
+        verifyOk: vres ? vres.ok : null,
+        verifyReason: vres ? vres.reason : null,
+        contractCommit: vres?.contractCommit || null,
+      });
+      if (r.outcome === "succeeded") {
+        LEDGER.updateIntegrationHead(WT_DIR || ".");
+        const isImplStep = Boolean(
+          r.ctx?.isolated
+          || /(?:worker|coding|impl|fix|integration)/i.test(r.step.id)
+        );
+        if (isImplStep && r.step.writes) {
+          const ev = r.ctx?.isolated
+            ? `worktree:${r.ctx.wtName}@${r.ctx.branch}#${outPath(r.step.writes)}`
+            : `artifact:${outPath(r.step.writes)}@HEAD=${headSha() || "uncommitted"}`;
+          LEDGER.recordAcceptanceLevel("implemented", { status: true, evidenceRef: ev, detail: `step ${r.step.id} succeeded` });
+        }
+        if (r.step.verify?.requireMergedTasks) {
+          const curHead = headSha();
+          if (curHead) {
+            LEDGER.recordAcceptanceLevel("integrated", {
+              status: true,
+              evidenceRef: `gate:requireMergedTasks@HEAD=${curHead}`,
+              detail: `step ${r.step.id} merged & verified isolated task branches`,
+            });
+          }
+        }
       }
     }
     if (r.outcome === "succeeded") {
@@ -2808,9 +3169,39 @@ while (gi < groups.length) {
   gi++;
 }
 
-finishStatus("succeeded");
-log("Pipeline COMPLETE. Artifacts in " + ART_DIR + ":");
+const finalStatus = PENDING_HUMAN_MERGE ? "pending-human-merge" : "succeeded";
+let closeout = null;
+if (LEDGER) {
+  try {
+    closeout = LEDGER.reconcileCloseout({
+      wtDir: WT_DIR || ".",
+      artDirRel: ART_DIR,
+      overall: finalStatus,
+      mergeDanger: LAST_MERGE_DANGER,
+    });
+  } catch (e) {
+    die(`[ledger] closeout failed (refusing fail-open completion): ${e.message}`);
+  }
+}
+if (closeout?.protectedViolations?.length) {
+  die(`[closeout] PROTECTED BRANCH VIOLATION: ${closeout.protectedViolations.map((v) => `${v.branch} (${(v.before ?? "∅").slice(0, 8)} -> ${(v.after ?? "∅").slice(0, 8)})`).join(", ")}`);
+}
+finishStatus(finalStatus);
+if (PENDING_HUMAN_MERGE) {
+  log("Pipeline HELD (PENDING HUMAN MERGE — One-Way Door). Artifacts in " + ART_DIR + ":");
+} else {
+  log("Pipeline COMPLETE. Artifacts in " + ART_DIR + ":");
+}
 for (const s of steps) log(`  ${s.title.padEnd(26)} -> ${s.writes}`);
+if (closeout) {
+  const acc = closeout.acceptance;
+  log(`[acceptance] implemented=${acc.implemented.status} integrated=${acc.integrated.status} merged=${acc.merged.status} synced=${acc.synced.status}`);
+  log(`[closeout] ledger=${LEDGER.summaryPath} protectedUntouched=${closeout.protectedViolations.length === 0}`);
+  if (closeout.pendingHumanMerge) {
+    log(`[one-way-door] PR held open for human review & merge into "${TARGET_BRANCH}". After merging manually, reconcile closeout with:`);
+    log(`  node .orca/ledger.mjs closeout --run ${LEDGER.runKey} --repo "${WT_DIR || "."}" --target-branch ${TARGET_BRANCH}`);
+  }
+}
 if (CREATED_WORKTREE)
   log(`[worktree] created by this run: name:${CREATED_WORKTREE} — remove later with: orca worktree rm name:${CREATED_WORKTREE}`);
 try { reportUsage(); } catch (e) { warn(`[usage] report skipped (${e.message})`); }

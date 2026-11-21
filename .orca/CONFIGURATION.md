@@ -703,3 +703,56 @@ node .orca/gate-verify.mjs --artifact .orca/artifacts/CONTRACT_REVIEW.md --requi
 Configure in `defaults`:
 - `defaults.targetBranch` (default `"dev"`): injected as `{targetBranch}` in step specs for Reviewer PR creation and merge.
 - `defaults.protectedBranches` (default `["main", "master"]`): injected as `{protectedBranches}` — pipelines never push directly to or auto-merge protected branches.
+
+---
+
+## orca-pod Governance Extensions (v0.3.0)
+
+### 4. One-Way Door / Merge Danger Guard (`verify.mergeDangerCheck`)
+
+Release steps (`pr-release-dev` / `pr-submit`) declare `"verify": { "requireVerdict": "PASS", "mergeDangerCheck": true }`.
+`.orca/merge-danger.mjs` inspects the real `git diff` against `{targetBranch}` across 9 authoritative one-way-door trigger categories:
+1. `schema_migration` (migrations, `.sql`, `DROP/ALTER TABLE`, `DELETE FROM`)
+2. `breaking_api` (removed/altered public API routes/exports)
+3. `auth_secrets` (auth, RBAC, OAuth, credentials, `.env`, secrets)
+4. `billing_pricing` (billing, Stripe, payments, subscriptions)
+5. `deploy_infra` (CI workflows, Docker, Terraform, K8s, Nginx)
+6. `irreversible_side_effect` (purge/backfill/prod bulk-action scripts)
+7. `feature_removal` (large file/line deletions)
+8. `major_dependency_upgrade` (major semver jumps in manifests)
+9. `broad_blast_radius` (diff exceeding `defaults.mergeDanger.maxFiles` / `maxChangedLines`)
+
+- Fail-closed: unresolvable `baseRef` classifies as `one-way` (`uncertain_diff`).
+- When `one-way` is triggered (and `--allow-one-way-merge` was NOT passed), `{mergeDangerReport}` instructs the Release Reviewer to open the PR and **stop without merging** (`Door: one-way`, `Merge-Status: PENDING_HUMAN_MERGE`).
+- At settlement, `.orca/gate-verify.mjs` hard-blocks contradicting `Door: two-way` claims or unauthorized merges into `{targetBranch}`, and records `pending_type: human_merge` in the out-of-repo Run Ledger.
+
+Standalone CLI:
+```bash
+node .orca/merge-danger.mjs --base dev --dir . --artifact .orca/artifacts/EPIC_RELEASE_GATE.md --json
+```
+
+### 5. `turnStart: observed` Start Proof & 5-State Worker Health (`.orca/health.mjs`)
+
+- `worker-start` returning `state: ready` is **not** proof of a started turn (`turnStart: unobserved`).
+- `turnStart` upgrades to `observed` only on positive evidence: explicit receipt `turnStart: observed`, terminal preview redraw after initial render, fresh dispatch heartbeat newer than launch time, active dispatch status (`running`/`working`/`completed`), artifact creation/growth, or `worker_done`.
+- Evaluates 5 worst-of health states (`lost > blocked > unknown > degraded > healthy`):
+  - `turnStartWindowMs` (default `120000` ms): warns `health:unknown` if `turnStart` stays unobserved.
+  - `turnStartEscalateMs` (default `600000` ms): stops cleanly instead of burning `hardTimeoutMs` on a dead/proxy-refused CLI.
+  - `lost`: dispatch terminated without `worker_done` → stops cleanly without blind retry.
+  - `blocked`: parked permission/trust dialog or Orca `agentWait` object.
+
+### 6. Out-of-Repo Run Ledger, 4-Level Acceptance, 8-Row Closeout & Bot Dedup Lock (`.orca/ledger.mjs`)
+
+- Stored strictly **outside** every git repository (`ORCA_POD_LEDGER_HOME`, default `~/.orca/pod-ledger`; paths inside the target repo are rejected).
+- Records append-only JSONL events (`run_start`, `intent` before dispatch, `result` after dispatch, `health`, `acceptance`, `pending`, `closeout`) and an atomic `fsync`'d summary file.
+- Tracks **4 independent acceptance levels** (each requiring explicit `evidenceRef`): `implemented`, `integrated`, `merged`, `synced`.
+- Runs an **8-row authoritative Closeout** at completion (including verifying `protectedBranches` SHAs did NOT mutate during the run!).
+- Supports **Bot anti-collision dedup locks** via `--dedup-key <key>` (blocks duplicate live runners with exit code `2`; auto-reclaims stale dead-PID locks).
+
+Standalone CLI:
+```bash
+node .orca/ledger.mjs status --repo . --json
+node .orca/ledger.mjs pending --repo .
+node .orca/ledger.mjs check-lock --dedup-key gh:owner/repo#42
+node .orca/ledger.mjs closeout --run <runKey> --repo . --target-branch dev
+```

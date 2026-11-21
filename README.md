@@ -2,7 +2,7 @@
 
 [中文](README.md) | [English](README.en.md) · [中文使用文档](README-CUSTOM.md) | [English Usage Guide](README-CUSTOM.en.md)
 
-**基于开源项目 [`vankhangfet/orca-sdlc-kit`](https://github.com/vankhangfet/orca-sdlc-kit) 定制增强的个人工程编排脚手架（MIT License）。** 在保持核心引擎 `.orca/flow.mjs` 与 `.orca/agent-config.mjs` **上游原版零修改**的前提下，全面扩展了 **三轨工作流（3-Track Workflow）**、**多模型池与推理强度（Reasoning Effort）路由**、**前端 Stitch / Open Design MCP 视觉验收闭环**、**跨家族写审分离与 2 轮熔断**，以及 **GitHub / Gitea + 腾讯 TokenHub API 无头审 PR 模板**。
+**基于开源项目 [`vankhangfet/orca-sdlc-kit`](https://github.com/vankhangfet/orca-sdlc-kit) 深度演进的工程编排脚手架（v0.3.0，MIT License）。** 在三轨工作流与跨家族写审分离的基础上，新增引擎级 **单步隔离 Worktree 并发（`worktree-isolation.mjs`）**、**内容级硬门禁校验（`gate-verify.mjs`）**、**9 类单向门 / Merge Danger 防护（`merge-danger.mjs`）**、**`turnStart: observed` 启动证据 + 5 态健康状态机（`health.mjs`）**，以及 **仓外不可变运行账本 + 四层独立验收 + 8 项 Closeout 结算 + Bot 防撞车锁（`ledger.mjs`）**。
 
 ![Orca Flow Kit highlights](img/banner-animation.gif)
 

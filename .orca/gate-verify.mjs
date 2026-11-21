@@ -19,9 +19,10 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { verifyMergeDangerGate } from "./merge-danger.mjs";
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
-const ALLOWED_VERIFY_KEYS = new Set(["requireVerdict", "requireContractCommit", "requireMergedTasks"]);
+const ALLOWED_VERIFY_KEYS = new Set(["requireVerdict", "requireContractCommit", "requireMergedTasks", "mergeDangerCheck"]);
 
 export function validateVerifyConfig(step, die) {
   if (step.verify == null) return;
@@ -46,6 +47,9 @@ export function validateVerifyConfig(step, die) {
   }
   if (step.verify.requireMergedTasks !== undefined && typeof step.verify.requireMergedTasks !== "boolean") {
     die(`step "${step.id}": verify.requireMergedTasks must be a boolean.`);
+  }
+  if (step.verify.mergeDangerCheck !== undefined && typeof step.verify.mergeDangerCheck !== "boolean") {
+    die(`step "${step.id}": verify.mergeDangerCheck must be a boolean.`);
   }
   if (!step.writes) {
     die(`step "${step.id}": verify requires a non-empty "writes" artifact filename.`);
@@ -113,7 +117,7 @@ function readManifestSafe(artDir) {
  *  - artDir: artifacts directory (used to consult WORKTREES.json)
  *  - mode: "settlement" (strict HEAD match) | "readiness" (allows post-merge ancestor match)
  */
-export function verifyArtifactContent(text, verify, { gitDir = null, artDir = null, mode = "settlement" } = {}) {
+export function verifyArtifactContent(text, verify, { gitDir = null, artDir = null, mode = "settlement", targetBranch = "dev", allowOneWayMerge = false, preStepTargetSha = null, preStepOriginTargetSha = null, preStepRemoteTargetSha = null, preStepRemoteError = null, preStepHasOrigin = false, preStepHeadSha = null, mergeDangerThresholds = null } = {}) {
   if (!verify || typeof verify !== "object") {
     return { ok: true, reason: null, verdict: null, contractCommit: null, expectedCommit: null };
   }
@@ -265,13 +269,47 @@ export function verifyArtifactContent(text, verify, { gitDir = null, artDir = nu
     }
   }
 
-  return { ok: true, reason: null, verdict: foundVerdict, contractCommit: foundCommit, expectedCommit };
+  let mergeDanger = null;
+  let mergeDangerResult = null;
+  let pendingHumanMerge = false;
+  if (verify.mergeDangerCheck && mode === "settlement") {
+    const md = verifyMergeDangerGate({
+      text,
+      gitDir,
+      targetBranch,
+      allowOneWayMerge,
+      preStepTargetSha,
+      preStepOriginTargetSha,
+      preStepRemoteTargetSha,
+      preStepRemoteError,
+      preStepHasOrigin,
+      preStepHeadSha,
+      thresholds: mergeDangerThresholds,
+    });
+    mergeDanger = md.classification;
+    mergeDangerResult = md;
+    pendingHumanMerge = Boolean(md.pendingHumanMerge);
+    if (!md.ok) {
+      return {
+        ok: false,
+        reason: md.reason,
+        verdict: foundVerdict,
+        contractCommit: foundCommit,
+        expectedCommit,
+        mergeDanger,
+        mergeDangerResult,
+        pendingHumanMerge: false,
+      };
+    }
+  }
+
+  return { ok: true, reason: null, verdict: foundVerdict, contractCommit: foundCommit, expectedCommit, mergeDanger, mergeDangerResult, pendingHumanMerge };
 }
 
 /**
  * Full artifact check for a pipeline step: existence, minBytes, and verify rules.
  */
-export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, { mode = "settlement" } = {}) {
+export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = {}) {
   if (!step || !step.writes) return { ok: true, reason: null };
   const filePath = join(artDir, step.writes);
   if (!existsSync(filePath)) {
@@ -287,7 +325,7 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, { mode 
   }
   let text = "";
   try { text = readFileSync(filePath, "utf8"); } catch (e) { return { ok: false, reason: `read failed: ${e.message}` }; }
-  return verifyArtifactContent(text, step.verify, { gitDir, artDir, mode });
+  return verifyArtifactContent(text, step.verify, { gitDir, artDir, mode: opts.mode || "settlement", targetBranch: opts.targetBranch || "dev", allowOneWayMerge: Boolean(opts.allowOneWayMerge), preStepTargetSha: opts.preStepTargetSha || null, preStepOriginTargetSha: opts.preStepOriginTargetSha || null, preStepRemoteTargetSha: opts.preStepRemoteTargetSha || null, preStepRemoteError: opts.preStepRemoteError || null, preStepHasOrigin: Boolean(opts.preStepHasOrigin), preStepHeadSha: opts.preStepHeadSha || null, mergeDangerThresholds: opts.mergeDangerThresholds || null });
 }
 
 export function formatVerifySummary(verify) {
@@ -296,6 +334,7 @@ export function formatVerifySummary(verify) {
   if (verify.requireVerdict) parts.push(`verdict:${verify.requireVerdict}`);
   if (verify.requireContractCommit) parts.push(`commit:${verify.requireContractCommit}`);
   if (verify.requireMergedTasks) parts.push("merged-tasks");
+  if (verify.mergeDangerCheck) parts.push("merge-danger");
   return parts.join(",");
 }
 

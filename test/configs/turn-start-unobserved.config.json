@@ -1,0 +1,27 @@
+{
+  "name": "test-turn-start",
+  "defaults": {
+    "agent": "codex",
+    "model": "default",
+    "timeoutMs": 5000,
+    "hardTimeoutMs": 30000,
+    "targetBranch": "dev",
+    "protectedBranches": [
+      "main",
+      "master"
+    ],
+    "turnStartWindowMs": 120,
+    "turnStartEscalateMs": 380
+  },
+  "pipeline": [
+    {
+      "id": "worker",
+      "title": "Slow Boot Worker",
+      "enabled": true,
+      "writes": "OUT.md",
+      "reads": [],
+      "spec": "Do work into {out}.",
+      "agent": "codex"
+    }
+  ]
+}

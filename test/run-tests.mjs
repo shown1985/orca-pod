@@ -1693,6 +1693,366 @@ scenario("P7 post-merge retry loop succeeds without Contract-Commit deadlock + p
 });
 
 // ---------------------------------------------------------------------------
+// P8 — One-Way Door / Merge Danger Guard (real git repo with main + dev)
+// ---------------------------------------------------------------------------
+scenario("P8 Merge Danger Guard blocks one-way contradictions & rogue dev merges, holds PENDING_HUMAN_MERGE", async () => {
+  const { execFileSync, spawnSync } = await import("node:child_process");
+  const initRepoWithDiff = (dir, addFile, content) => {
+    execFileSync("git", ["init", "-b", "main"], { cwd: dir });
+    execFileSync("git", ["config", "user.email", "test@orca.local"], { cwd: dir });
+    execFileSync("git", ["config", "user.name", "Orca Test"], { cwd: dir });
+    writeFileSync(join(dir, "README.md"), "base\n");
+    execFileSync("git", ["add", "."], { cwd: dir });
+    execFileSync("git", ["commit", "-m", "init"], { cwd: dir });
+    execFileSync("git", ["branch", "dev"], { cwd: dir });
+    execFileSync("git", ["checkout", "-b", "epic/test-door", "dev"], { cwd: dir });
+    mkdirSync(dirname(join(dir, addFile)), { recursive: true });
+    writeFileSync(join(dir, addFile), content);
+    execFileSync("git", ["add", "."], { cwd: dir });
+    execFileSync("git", ["commit", "-m", "feature change"], { cwd: dir });
+  };
+
+  // Helper: run flow against a custom real-git wtDir by pre-seeding via ORCA_FAKE_WT override
+  const runInGitRepo = async (tag, addFile, fileContent, extraEnv = {}, extraArgs = []) => {
+    const dir = mkdtempSync(join(tmpdir(), `orca-p8-${tag}-`));
+    dirsOfCurrentScenario.push(dir);
+    const wt = join(dir, "repo");
+    const ledger = join(dir, "ledger");
+    mkdirSync(wt, { recursive: true });
+    initRepoWithDiff(wt, addFile, fileContent);
+    const r = await runFlow({
+      name: `p8-${tag}`,
+      config: "../test/configs/merge-danger.config.json",
+      scenario: "merge-danger-report.cjs",
+      args: ["--ledger-home", ledger, ...extraArgs],
+      env: { ...extraEnv },
+      budgetMs: 30000,
+    });
+    return { r, wt, ledger, dir };
+  };
+
+  // Direct test via standalone merge-danger CLI + flow with real git worktree
+  const repoDir = mkdtempSync(join(tmpdir(), "orca-p8-git-"));
+  dirsOfCurrentScenario.push(repoDir);
+  initRepoWithDiff(repoDir, "migrations/001_init.sql", "CREATE TABLE grades(id INT);\nALTER TABLE grades ADD COLUMN tier TEXT;\n");
+  const ledgerDir = mkdtempSync(join(tmpdir(), "orca-p8-ledger-"));
+  dirsOfCurrentScenario.push(ledgerDir);
+
+  const mdCli = spawnSync(NODE, [join(REPO, ".orca", "merge-danger.mjs"), "--base", "dev", "--dir", repoDir, "--json"], { encoding: "utf8" });
+  eq("P8 CLI detects schema_migration exit", mdCli.status, 0);
+  const mdJson = JSON.parse(mdCli.stdout);
+  eq("P8 CLI classified .sql migration as one-way", mdJson.door, "one-way");
+  ok("P8 CLI triggered schema_migration", mdJson.classification.triggers.includes("schema_migration"));
+
+  // Run flow with ORCA_MERGE_DANGER_MOCK=one-way (contradicted two-way claim -> must FAIL)
+  const filler = "Release details line.\n".repeat(15);
+  const badTwoWay = await runFlow({
+    name: "p8-contradict",
+    config: "../test/configs/merge-danger.config.json",
+    scenario: "merge-danger-report.cjs",
+    args: ["--ledger-home", ledgerDir],
+    env: {
+      ORCA_MERGE_DANGER_MOCK: JSON.stringify({ door: "one-way", triggers: ["schema_migration"] }),
+      ORCA_FAKE_RELEASE_BODY: `# Release\nDoor: two-way\nMerge-Status: MERGED\n${filler}VERDICT: PASS\n`,
+    },
+  });
+  ok("P8 contradicted two-way claim hard-blocked", badTwoWay.code !== 0 && /merge-danger contradiction/.test(badTwoWay.out + badTwoWay.err));
+
+  // Unauthorized MERGED on one-way door -> must FAIL
+  const badMerged = await runFlow({
+    name: "p8-unauth-merge",
+    config: "../test/configs/merge-danger.config.json",
+    scenario: "merge-danger-report.cjs",
+    args: ["--ledger-home", ledgerDir],
+    env: {
+      ORCA_MERGE_DANGER_MOCK: JSON.stringify({ door: "one-way", triggers: ["auth_secrets"] }),
+      ORCA_FAKE_RELEASE_BODY: `# Release\nDoor: one-way\nMerge-Status: MERGED\n${filler}VERDICT: PASS\n`,
+    },
+  });
+  ok("P8 unauthorized Merge-Status: MERGED hard-blocked", badMerged.code !== 0 && /one-way door violation/.test(badMerged.out + badMerged.err));
+
+  // Lawful one-way door hold -> exits 0 with pending-human-merge recorded in out-of-repo ledger
+  const held = await runFlow({
+    name: "p8-hold",
+    config: "../test/configs/merge-danger.config.json",
+    scenario: "merge-danger-report.cjs",
+    args: ["--ledger-home", ledgerDir],
+    env: {
+      ORCA_MERGE_DANGER_MOCK: JSON.stringify({ door: "one-way", triggers: ["schema_migration", "deploy_infra"] }),
+      ORCA_FAKE_RELEASE_BODY: `# Release\nDoor: one-way\nMerge-Status: PENDING_HUMAN_MERGE\n${filler}VERDICT: PASS\n`,
+    },
+  });
+  eq("P8 lawful one-way door hold exits cleanly", held.code, 0);
+  eq("P8 status overall is pending-human-merge", held.status?.overall, "pending-human-merge");
+  ok("P8 printed PENDING HUMAN MERGE banner", /PENDING HUMAN MERGE/.test(held.out));
+  const pendCli = spawnSync(NODE, [join(REPO, ".orca", "ledger.mjs"), "pending", "--ledger-home", ledgerDir, "--json"], { encoding: "utf8" });
+  const pendData = JSON.parse(pendCli.stdout);
+  ok("P8 ledger pending CLI lists unresolved human_merge", pendData.pending.length >= 1 && pendData.pending[0].pending.triggers.includes("schema_migration"));
+
+  // Explicit --allow-one-way-merge authorization allows one-way merge
+  const allowed = await runFlow({
+    name: "p8-allow",
+    config: "../test/configs/merge-danger.config.json",
+    scenario: "merge-danger-report.cjs",
+    args: ["--ledger-home", ledgerDir, "--allow-one-way-merge"],
+    env: {
+      ORCA_MERGE_DANGER_MOCK: JSON.stringify({ door: "one-way", triggers: ["schema_migration"] }),
+      ORCA_FAKE_RELEASE_BODY: `# Release\nDoor: one-way\nMerge-Status: MERGED\n${filler}VERDICT: PASS\n`,
+    },
+  });
+  eq("P8 --allow-one-way-merge permits merge", allowed.code, 0);
+  eq("P8 authorized merge overall succeeded", allowed.status?.overall, "succeeded");
+
+  // Clean two-way diff in real git repo
+  const cleanDir = mkdtempSync(join(tmpdir(), "orca-p8-clean-"));
+  dirsOfCurrentScenario.push(cleanDir);
+  initRepoWithDiff(cleanDir, "src/helper.js", "export const x = 42;\n");
+  const cleanCli = spawnSync(NODE, [join(REPO, ".orca", "merge-danger.mjs"), "--base", "dev", "--dir", cleanDir, "--json"], { encoding: "utf8" });
+  eq("P8 clean diff classified as two-way", JSON.parse(cleanCli.stdout).door, "two-way");
+
+  // B1/B2: Rogue worker runs `git branch -f dev HEAD` on a one-way diff -> pinned preStepTargetSha STILL catches it!
+  const { pathToFileURL } = await import("node:url");
+  const { snapshotTargetRefs, verifyMergeDangerGate, classifyMergeDanger } = await import(pathToFileURL(join(REPO, ".orca", "merge-danger.mjs")).href);
+  const preRefs = snapshotTargetRefs(repoDir, "dev");
+  const epicSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+  execFileSync("git", ["branch", "-f", "dev", epicSha], { cwd: repoDir }); // rogue merge/move of dev!
+  const b1Check = verifyMergeDangerGate({
+    text: `# Release\nDoor: one-way\nMerge-Status: PENDING_HUMAN_MERGE\n${filler}VERDICT: PASS\n`,
+    gitDir: repoDir,
+    targetBranch: "dev",
+    allowOneWayMerge: false,
+    preStepTargetSha: preRefs.localSha,
+    preStepOriginTargetSha: preRefs.originSha,
+  });
+  eq("P8 B1/B2 rogue git branch -f dev HEAD hard-blocked", b1Check.ok, false);
+  ok("P8 B1/B2 reported target ref moved violation", /moved from/.test(b1Check.reason || ""));
+
+  // R2-B1: Rogue worker moves dev -> epicSha AND resets HEAD back to preRefs.localSha (making pinned...HEAD empty!)
+  execFileSync("git", ["reset", "--hard", preRefs.localSha], { cwd: repoDir });
+  const r2b1Check = verifyMergeDangerGate({
+    text: `# Release\nDoor: two-way\nMerge-Status: MERGED\n${filler}VERDICT: PASS\n`,
+    gitDir: repoDir,
+    targetBranch: "dev",
+    allowOneWayMerge: false,
+    preStepTargetSha: preRefs.localSha,
+    preStepOriginTargetSha: preRefs.originSha,
+    preStepHeadSha: preRefs.headSha,
+  });
+  eq("P8 R2-B1 rogue merge+reset-HEAD hide trick STILL blocked", r2b1Check.ok, false);
+  ok("P8 R2-B1 classified hidden one-way content as one-way", r2b1Check.door === "one-way");
+  // F1: Lying "Door: two-way" must NEVER mask targetRefMoved violation!
+  ok("P8 F1 structured targetRefMoved exposed despite lying Door: two-way", Boolean(r2b1Check.targetRefMoved) && Array.isArray(r2b1Check.movedRefs) && r2b1Check.movedRefs.length >= 1);
+  ok("P8 F1 reason reports targetRefMoved violation (not contradiction)", /one-way door violation.*moved from/.test(r2b1Check.reason || ""));
+
+  // M9: Renaming auth/login.ts -> lib/helper.ts MUST still trigger auth_secrets
+  const renDir = mkdtempSync(join(tmpdir(), "orca-p8-ren-"));
+  dirsOfCurrentScenario.push(renDir);
+  execFileSync("git", ["init", "-b", "main"], { cwd: renDir });
+  execFileSync("git", ["config", "user.email", "test@orca.local"], { cwd: renDir });
+  execFileSync("git", ["config", "user.name", "Orca Test"], { cwd: renDir });
+  mkdirSync(join(renDir, "auth"), { recursive: true });
+  writeFileSync(join(renDir, "auth", "login.ts"), "export function login() { return true; }\n");
+  execFileSync("git", ["add", "."], { cwd: renDir });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: renDir });
+  execFileSync("git", ["branch", "dev"], { cwd: renDir });
+  execFileSync("git", ["checkout", "-b", "epic/ren", "dev"], { cwd: renDir });
+  mkdirSync(join(renDir, "lib"), { recursive: true });
+  execFileSync("git", ["mv", "auth/login.ts", "lib/helper.ts"], { cwd: renDir });
+  execFileSync("git", ["commit", "-m", "rename out of auth"], { cwd: renDir });
+  const renCls = classifyMergeDanger(renDir, "dev");
+  eq("P8 M9 rename out of auth/ still triggers one-way", renCls.door, "one-way");
+  ok("P8 M9 rename triggered auth_secrets", renCls.triggers.includes("auth_secrets"));
+});
+
+// ---------------------------------------------------------------------------
+// P9 — turnStart: observed Start Proof & 5-State Health State Machine
+// ---------------------------------------------------------------------------
+scenario("P9 turnStart unobserved triggers unknown warning & early stop + health:lost stops without blind retry", async () => {
+  const t0 = Date.now();
+  const r = await runFlow({
+    name: "p9-unobserved",
+    config: "../test/configs/turn-start-unobserved.config.json",
+    scenario: "turn-start-unobserved.cjs",
+    budgetMs: 15000,
+  });
+  const dt = Date.now() - t0;
+  ok("P9 not hung", !r.hung);
+  eq("P9 exit code (stopped cleanly)", r.code, 1);
+  ok("P9 stopped far earlier than 30s hardTimeoutMs", dt < 8000);
+  ok("P9 logged turnStart unobserved warning", /turnStart=unobserved/.test(r.out + r.err));
+  eq("P9 status step health is unknown", r.status?.steps[0]?.health, "unknown");
+  eq("P9 status step turnStart is unobserved", r.status?.steps[0]?.turnStart, "unobserved");
+  eq("P9 overall is still-running (resume hint)", r.status?.overall, "still-running");
+
+  // Dispatch lost without worker_done -> health:lost -> stops as unknown without retry
+  const lost = await runFlow({
+    name: "p9-lost",
+    config: "../test/configs/turn-start-unobserved.config.json",
+    scenario: "dispatch-lost.cjs",
+    budgetMs: 15000,
+  });
+  ok("P9 lost not hung", !lost.hung);
+  eq("P9 lost exit code", lost.code, 1);
+  ok("P9 lost logged health:lost", /\[health:lost\]/.test(lost.out + lost.err));
+  eq("P9 lost never blind-retried (1 worker-start)", lost.by("orchestration worker-start").length, 1);
+  eq("P9 lost step health is lost", lost.status?.steps[0]?.health, "lost");
+});
+
+// ---------------------------------------------------------------------------
+// P10 — Out-of-Repo Ledger, In-Repo Path Refusal, 4-Level Acceptance & Closeout Reconcile
+// ---------------------------------------------------------------------------
+scenario("P10 out-of-repo ledger refuses in-repo paths, tracks 4-level acceptance & reconciles closeout after human merge", async () => {
+  const { execFileSync, spawnSync } = await import("node:child_process");
+  const { pathToFileURL } = await import("node:url");
+  const { createRunLedger, assertOutOfRepoPath } = await import(pathToFileURL(join(REPO, ".orca", "ledger.mjs")).href);
+
+  const root = mkdtempSync(join(tmpdir(), "orca-p10-"));
+  dirsOfCurrentScenario.push(root);
+  const repoDir = join(root, "repo");
+  const outLedger = join(root, "pod-ledger");
+  mkdirSync(repoDir, { recursive: true });
+  execFileSync("git", ["init", "-b", "main"], { cwd: repoDir });
+  execFileSync("git", ["config", "user.email", "test@orca.local"], { cwd: repoDir });
+  execFileSync("git", ["config", "user.name", "Orca Test"], { cwd: repoDir });
+  writeFileSync(join(repoDir, "app.txt"), "v1\n");
+  execFileSync("git", ["add", "."], { cwd: repoDir });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: repoDir });
+  execFileSync("git", ["branch", "dev"], { cwd: repoDir });
+  execFileSync("git", ["checkout", "-b", "epic/demo", "dev"], { cwd: repoDir });
+  mkdirSync(join(repoDir, "migrations"), { recursive: true });
+  writeFileSync(join(repoDir, "migrations", "001.sql"), "CREATE TABLE t(id INT);\n");
+  execFileSync("git", ["add", "."], { cwd: repoDir });
+  execFileSync("git", ["commit", "-m", "add migration"], { cwd: repoDir });
+  const epicHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+
+  // Refuses ledger inside git repo
+  let threwInRepo = false;
+  try { assertOutOfRepoPath(join(repoDir, ".orca", "ledger"), repoDir); } catch { threwInRepo = true; }
+  ok("P10 refuses ledgerHome inside git repo", threwInRepo);
+
+  // Create out-of-repo ledger, record implemented + pending_human_merge
+  const ledger = createRunLedger({
+    runKey: "p10-run",
+    repoDir,
+    ledgerHome: outLedger,
+    objective: "demo migration",
+    targetBranch: "dev",
+    protectedBranches: ["main"],
+  });
+  let threwNoEv = false;
+  try { ledger.recordAcceptanceLevel("implemented", { status: true, evidenceRef: "" }); } catch { threwNoEv = true; }
+  ok("P10 acceptance level refuses status=true without evidenceRef", threwNoEv);
+
+  ledger.recordAcceptanceLevel("implemented", { status: true, evidenceRef: `commit:${epicHead}` });
+  ledger.recordPendingHumanMerge({ targetBranch: "dev", door: "one-way", triggers: ["schema_migration"], headSha: epicHead });
+  const c1 = ledger.reconcileCloseout({ wtDir: repoDir, overall: "pending-human-merge" });
+  eq("P10 initial closeout overall pending-human-merge", c1.overall, "pending-human-merge");
+  eq("P10 initial implemented=true", c1.acceptance.implemented.status, true);
+  eq("P10 initial merged=false before human merge", c1.acceptance.merged.status, false);
+  eq("P10 initial synced=false before human merge", c1.acceptance.synced.status, false);
+  eq("P10 protected branch main untouched", c1.protectedViolations.length, 0);
+
+  // M7: Checking out dev BEFORE merging epic/demo MUST NOT falsely mark merged=true!
+  execFileSync("git", ["checkout", "dev"], { cwd: repoDir });
+  const preMergeCli = spawnSync(NODE, [
+    join(REPO, ".orca", "ledger.mjs"), "closeout",
+    "--run", "p10-run", "--repo", repoDir, "--target-branch", "dev", "--ledger-home", outLedger, "--json",
+  ], { encoding: "utf8" });
+  const preMergeJson = JSON.parse(preMergeCli.stdout);
+  eq("P10 M7 checkout on dev before merge stays merged=false", preMergeJson.acceptance.merged.status, false);
+  eq("P10 M7 checkout on dev before merge stays pendingResolved=false", preMergeJson.pendingResolved, false);
+
+  // M3: Symlinked ledgerHome/runs pointing inside repo MUST be refused
+  const { symlinkSync } = await import("node:fs");
+  const symLedger = join(root, "sym-ledger");
+  mkdirSync(symLedger, { recursive: true });
+  symlinkSync(join(repoDir, ".git"), join(symLedger, "runs"));
+  let threwSym = false;
+  try { assertOutOfRepoPath(symLedger, repoDir); } catch { threwSym = true; }
+  ok("P10 M3 symlinked runs/ pointing into repo refused", threwSym);
+
+  // Now simulate human merging epic/demo into dev (main untouched!)
+  execFileSync("git", ["checkout", "dev"], { cwd: repoDir });
+  execFileSync("git", ["merge", "--no-ff", "epic/demo", "-m", "human merge"], { cwd: repoDir });
+  execFileSync("git", ["checkout", "epic/demo"], { cwd: repoDir });
+
+  // Run standalone ledger.mjs closeout CLI
+  const cCli = spawnSync(NODE, [
+    join(REPO, ".orca", "ledger.mjs"), "closeout",
+    "--run", "p10-run", "--repo", repoDir, "--target-branch", "dev", "--ledger-home", outLedger, "--json",
+  ], { encoding: "utf8" });
+  eq("P10 closeout CLI exits 0 after human merge", cCli.status, 0);
+  const c2 = JSON.parse(cCli.stdout);
+  eq("P10 closeout resolved pending human merge", c2.pendingResolved, true);
+  eq("P10 closeout merged=true", c2.acceptance.merged.status, true);
+  eq("P10 closeout synced=true", c2.acceptance.synced.status, true);
+  eq("P10 closeout main untouched", c2.protectedViolations.length, 0);
+
+  // Now simulate rogue mutation of main -> closeout MUST detect violation and exit 1!
+  execFileSync("git", ["branch", "-f", "main", "dev"], { cwd: repoDir });
+  const badMain = spawnSync(NODE, [
+    join(REPO, ".orca", "ledger.mjs"), "closeout",
+    "--run", "p10-run", "--repo", repoDir, "--target-branch", "dev", "--ledger-home", outLedger, "--json",
+  ], { encoding: "utf8" });
+  eq("P10 closeout CLI fails (exit 1) if protected branch main mutated", badMain.status, 1);
+  ok("P10 closeout reports main violation", JSON.parse(badMain.stdout).protectedViolations.some((v) => v.branch === "main"));
+});
+
+// ---------------------------------------------------------------------------
+// P11 — Bot Anti-Collision Dedup Lock & Installer v0.3.0 Engine Upgrade
+// ---------------------------------------------------------------------------
+scenario("P11 Bot anti-collision --dedup-key lock blocks live dup, reclaims stale lock, and installer ships v0.3.0 modules", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { pathToFileURL } = await import("node:url");
+  const { acquireRunLock, checkRunLock } = await import(pathToFileURL(join(REPO, ".orca", "ledger.mjs")).href);
+
+  const root = mkdtempSync(join(tmpdir(), "orca-p11-"));
+  dirsOfCurrentScenario.push(root);
+  const ledgerDir = join(root, "ledger");
+
+  // Hold a live lock with current process.pid
+  const lock1 = acquireRunLock({ dedupKey: "gh:shown1985/sxcj#101", runKey: "holder-run", repoDir: REPO, ledgerHome: ledgerDir });
+  eq("P11 first lock acquired", lock1.acquired, true);
+
+  // CLI check-lock reports ACTIVE (exit 2)
+  const chk = spawnSync(NODE, [
+    join(REPO, ".orca", "ledger.mjs"), "check-lock", "--dedup-key", "gh:shown1985/sxcj#101", "--ledger-home", ledgerDir, "--json",
+  ], { encoding: "utf8" });
+  eq("P11 check-lock exits 2 on live lock", chk.status, 2);
+  eq("P11 check-lock locked=true", JSON.parse(chk.stdout).locked, true);
+
+  // Second flow invocation with same --dedup-key MUST exit 2 without dispatching any worker
+  const dup = await runFlow({
+    name: "p11-dup",
+    config: "../test/configs/cold.config.json",
+    args: ["--dedup-key", "gh:shown1985/sxcj#101", "--ledger-home", ledgerDir],
+  });
+  eq("P11 duplicate runner blocked with exit 2", dup.code, 2);
+  ok("P11 duplicate runner printed DUPLICATE RUN BLOCKED", /DUPLICATE RUN BLOCKED/.test(dup.err));
+  eq("P11 duplicate runner dispatched zero workers", dup.by("orchestration worker-start").length, 0);
+
+  // Overwrite lock with a definitely-dead PID -> next flow run auto-reclaims stale lock and succeeds!
+  writeFileSync(lock1.file, JSON.stringify({ dedupKey: "gh:shown1985/sxcj#101", runKey: "dead-run", pid: 99999999, startedAt: new Date().toISOString() }));
+  const staleChk = checkRunLock({ dedupKey: "gh:shown1985/sxcj#101", repoDir: REPO, ledgerHome: ledgerDir });
+  eq("P11 dead PID detected as stale", staleChk.stale, true);
+
+  const reclaimed = await runFlow({
+    name: "p11-reclaim",
+    config: "../test/configs/cold.config.json",
+    args: ["--dedup-key", "gh:shown1985/sxcj#101", "--ledger-home", ledgerDir],
+  });
+  eq("P11 reclaimed stale lock and succeeded", reclaimed.code, 0);
+  ok("P11 logged stale lock reclamation", /reclaimed stale lock/.test(reclaimed.out + reclaimed.err));
+
+  // Verify bin/init.mjs installs & upgrades all 3 new v0.3.0 modules
+  const inst = await runInit({ name: "p11-init" });
+  eq("P11 init exit 0", inst.code, 0);
+  ok("P11 installed merge-danger.mjs", existsSync(join(inst.dir, ".orca", "merge-danger.mjs")));
+  ok("P11 installed health.mjs", existsSync(join(inst.dir, ".orca", "health.mjs")));
+  ok("P11 installed ledger.mjs", existsSync(join(inst.dir, ".orca", "ledger.mjs")));
+});
+
+// ---------------------------------------------------------------------------
 (async () => {
   const t0 = Date.now();
   for (const s of scenarios) {

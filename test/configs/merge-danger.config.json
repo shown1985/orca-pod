@@ -1,0 +1,30 @@
+{
+  "name": "test-merge-danger",
+  "defaults": {
+    "agent": "codex",
+    "model": "default",
+    "timeoutMs": 5000,
+    "targetBranch": "dev",
+    "protectedBranches": [
+      "main",
+      "master"
+    ],
+    "turnStartWindowMs": 120000,
+    "turnStartEscalateMs": 600000
+  },
+  "pipeline": [
+    {
+      "id": "pr-release-dev",
+      "title": "Release Gate",
+      "enabled": true,
+      "writes": "RELEASE.md",
+      "reads": [],
+      "verify": {
+        "requireVerdict": "PASS",
+        "mergeDangerCheck": true
+      },
+      "spec": "Release check.\n{mergeDangerReport}\nWrite {out}.",
+      "agent": "codex"
+    }
+  ]
+}

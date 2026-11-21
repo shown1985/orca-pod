@@ -26,7 +26,9 @@
     "protectedBranches": [
       "main",
       "master"
-    ]
+    ],
+    "turnStartWindowMs": 120000,
+    "turnStartEscalateMs": 600000
   },
   "skills": {
     "senior-auditor": {
@@ -84,7 +86,11 @@
         "diff-audit"
       ],
       "onFailGoto": null,
-      "spec": "You are the Track 0 Release Reviewer. Based on {reads}: (1) re-verify local unit tests are green; (2) ensure HEAD is on a `hotfix/<slug>` branch (NEVER push directly to `{protectedBranches}` and NEVER auto-merge into `{protectedBranches}`); (3) commit clean changes if uncommitted (exclude .orca/artifacts/), push (`git push -u origin HEAD`), create/update a Pull Request targeting `{targetBranch}` (`--base {targetBranch}`), and once CI/audit is green on non-protected `{targetBranch}` (e.g. `dev`), merge into `{targetBranch}`; (4) summarize the PR URL, merge commit, and CI status in {out}."
+      "spec": "You are the Track 0 Release Reviewer. Based on {reads}: (1) re-verify local unit tests are green; (2) ensure HEAD is on a `hotfix/<slug>` branch (NEVER push directly to `{protectedBranches}` and NEVER auto-merge into `{protectedBranches}`); (3) commit clean changes if uncommitted (exclude .orca/artifacts/), push (`git push -u origin HEAD`), create/update a Pull Request targeting `{targetBranch}` (`--base {targetBranch}`), and once CI/audit is green on non-protected `{targetBranch}` (e.g. `dev`), merge into `{targetBranch}`; (4) summarize the PR URL, merge commit, and CI status in {out}. Merge Danger / One-Way Door Guard — follow the engine pre-check strictly:\n{mergeDangerReport}\nAlways record explicit lines `Door: one-way` or `Door: two-way` and `Merge-Status: MERGED` or `Merge-Status: PENDING_HUMAN_MERGE`, and end {out} with the final non-empty line strictly as `VERDICT: PASS`.",
+      "verify": {
+        "requireVerdict": "PASS",
+        "mergeDangerCheck": true
+      }
     }
   ]
 }

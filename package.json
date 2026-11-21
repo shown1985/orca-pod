@@ -1,6 +1,6 @@
 {
   "name": "orca-pod",
-  "version": "0.2.0-custom.1",
+  "version": "0.3.0-custom.1",
   "description": "Customized 3-Track Orca SDLC Flow Kit — extends vankhangfet/orca-sdlc-kit with Track 0/1/2 pipelines, personal model-pool & reasoning-effort routing, AGENTS.md, Stitch-compatible DESIGN.md, custom prompts, and GitHub/Gitea TokenHub CI templates.",
   "license": "MIT",
   "repository": {
@@ -18,6 +18,9 @@
     ".orca/flow.mjs",
     ".orca/agent-config.mjs",
     ".orca/worktree-isolation.mjs",
+    ".orca/ledger.mjs",
+    ".orca/health.mjs",
+    ".orca/merge-danger.mjs",
     ".orca/gate-verify.mjs",
     ".orca/designer.mjs",
     ".orca/designer.html",

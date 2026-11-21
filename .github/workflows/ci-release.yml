@@ -9,52 +9,152 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   verify:
-    name: Auto-Detect Stack Verification (Python / Node / Go / Rust / Docker)
+    name: "Auto-Detect Stack Verification (Python / Node / Go / Rust / Docker)"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Go (when go.mod exists)
+        if: hashFiles('**/go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
 
       - name: Verify Node.js projects (root / frontend)
         run: |
+          set -euo pipefail
           for dir in . frontend web client ui; do
             if [ -f "$dir/package.json" ]; then
               echo "=== Node verify: $dir ==="
-              (cd "$dir" && ( [ -f pnpm-lock.yaml ] && corepack enable && pnpm install --frozen-lockfile || ([ -f package-lock.json ] && npm ci || npm install) ) && npm run --if-present lint && npm run --if-present typecheck && npm test --if-present && npm run --if-present build)
+              (
+                cd "$dir"
+                if [ -f pnpm-lock.yaml ]; then
+                  corepack enable
+                  pnpm install --frozen-lockfile
+                  pnpm run --if-present lint
+                  pnpm run --if-present typecheck
+                  pnpm test --if-present
+                  pnpm run --if-present build
+                elif [ -f yarn.lock ]; then
+                  corepack enable
+                  yarn install --frozen-lockfile
+                  yarn run --if-present lint
+                  yarn run --if-present typecheck
+                  yarn test --if-present
+                  yarn run --if-present build
+                elif [ -f package-lock.json ]; then
+                  npm ci
+                  npm run --if-present lint
+                  npm run --if-present typecheck
+                  npm test --if-present
+                  npm run --if-present build
+                else
+                  npm install
+                  npm run --if-present lint
+                  npm run --if-present typecheck
+                  npm test --if-present
+                  npm run --if-present build
+                fi
+              )
             fi
           done
 
       - name: Verify Python projects (root / backend)
         run: |
+          set -euo pipefail
           for dir in . backend server api; do
             if [ -f "$dir/pyproject.toml" ] || [ -f "$dir/requirements.txt" ]; then
               echo "=== Python verify: $dir ==="
-              (cd "$dir" && python3 -m pip install --upgrade pip && ([ -f requirements.txt ] && pip install -r requirements.txt || true) && ([ -f requirements-dev.txt ] && pip install -r requirements-dev.txt || true) && (python3 -c 'import pytest' 2>/dev/null && pytest -q || python3 -m compileall -q .))
+              (
+                cd "$dir"
+                python3 -m pip install --upgrade pip
+                if [ -f requirements.txt ]; then
+                  python3 -m pip install -r requirements.txt
+                fi
+                if [ -f requirements-dev.txt ]; then
+                  python3 -m pip install -r requirements-dev.txt
+                elif [ -f pyproject.toml ]; then
+                  python3 -m pip install -e .
+                fi
+                has_py_tests=0
+                if [ -f pytest.ini ] || [ -d tests ] || [ -d test ] || find . -maxdepth 3 \( -name 'test_*.py' -o -name '*_test.py' \) | grep -q .; then
+                  has_py_tests=1
+                fi
+                if python3 -c "import pytest" >/dev/null 2>&1 && { [ "$has_py_tests" -eq 1 ] || grep -qi "pytest" pyproject.toml requirements*.txt 2>/dev/null; }; then
+                  python3 -m pytest -q
+                elif [ "$has_py_tests" -eq 1 ]; then
+                  if grep -qi "pytest" pyproject.toml requirements*.txt 2>/dev/null; then
+                    python3 -m pip install pytest
+                    python3 -m pytest -q
+                  else
+                    python3 -m unittest discover -q
+                  fi
+                else
+                  echo "No Python test suite configured in $dir; running compileall syntax check"
+                  python3 -m compileall -q .
+                fi
+              )
+            fi
+          done
+
+      - name: Verify Go projects (if present)
+        run: |
+          set -euo pipefail
+          for dir in . backend server cmd; do
+            if [ -f "$dir/go.mod" ]; then
+              echo "=== Go verify: $dir ==="
+              (cd "$dir" && go vet ./... && go test ./...)
+            fi
+          done
+
+      - name: Verify Rust projects (if present)
+        run: |
+          set -euo pipefail
+          for dir in . backend server; do
+            if [ -f "$dir/Cargo.toml" ]; then
+              echo "=== Rust verify: $dir ==="
+              (cd "$dir" && cargo check --all-targets && cargo test)
             fi
           done
 
       - name: Validate Docker Compose (if present)
         run: |
-          for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+          set -euo pipefail
+          for f in docker-compose.prod.yml docker-compose.prod.yaml compose.prod.yml compose.prod.yaml docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
             if [ -f "$f" ]; then docker compose -f "$f" config --quiet; fi
           done
 
   tokenhub-pr-review:
-    name: Headless PR Risk Summary (TokenHub API)
+    name: "Headless PR Risk Summary (TokenHub API)"
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     needs: verify
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Generate Chinese PR Risk Summary via TokenHub API
         env:
@@ -75,10 +175,13 @@ jobs:
           const apiKey = process.env.TOKENHUB_API_KEY;
           const baseUrl = process.env.TOKENHUB_BASE_URL.replace(/\/+$/, "");
           const model = process.env.TOKENHUB_MODEL;
-          const diff = execSync(
-            `git diff "${process.env.BASE_SHA}...${process.env.HEAD_SHA}" -- . ':(exclude)*.lock' ':(exclude)package-lock.json'`,
+          const rawDiff = execSync(
+            `git diff "${process.env.BASE_SHA}...${process.env.HEAD_SHA}" -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)*.pem' ':(exclude).env*'`,
             { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }
           ).slice(0, 40000);
+          const diff = rawDiff
+            .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, "[REDACTED_PRIVATE_KEY]")
+            .replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[0-9A-Z]{16})\b/g, "[REDACTED_TOKEN]");
           if (!diff.trim()) process.exit(0);
           (async () => {
             const resp = await fetch(`${baseUrl}/chat/completions`, {
@@ -88,7 +191,7 @@ jobs:
                 model,
                 temperature: 0.2,
                 messages: [
-                  { role: "system", content: "你是无头 CI PR 风险审查助手。请用简洁中文输出：1) 变更概述；2) 潜在风险点（按高/中/低标注）；3) 合并前人工确认建议。控制在 300 字以内。" },
+                  { role: "system", content: "你是无头 CI PR 风险审查助手。请用简洁中文输出：1) 变更概述；2) 潜在风险点（按高/中/低标注）；3) 合并前人工确认建议。控制在 300 字以内，切勿回显任何密钥或邮箱。" },
                   { role: "user", content: `请审查以下 Pull Request Diff：\n\n${diff}` }
                 ]
               })

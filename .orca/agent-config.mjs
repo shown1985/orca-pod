@@ -33,11 +33,16 @@ const SECTION_RX = new RegExp(
 //   ruleDir:       cursor-style .mdc rule files
 //   skillSection:  markdown file that receives a marker-delimited skills section
 const ADAPTERS = {
-  claude:   { mcpFile: ".mcp.json",             mcpKey: "mcpServers", skillDir: ".claude/skills", ruleDir: null,          skillSection: null },
-  cursor:   { mcpFile: ".cursor/mcp.json",      mcpKey: "mcpServers", skillDir: null,             ruleDir: ".cursor/rules", skillSection: null },
-  gemini:   { mcpFile: ".gemini/settings.json", mcpKey: "mcpServers", skillDir: null,             ruleDir: null,          skillSection: "GEMINI.md" },
-  opencode: { mcpFile: "opencode.json",         mcpKey: "mcp",        skillDir: null,             ruleDir: null,          skillSection: "AGENTS.md" },
-  codex:    { mcpFile: null,                    mcpKey: null,         skillDir: null,             ruleDir: null,          skillSection: "AGENTS.md" },
+  claude:      { mcpFile: ".mcp.json",                mcpKey: "mcpServers", skillDir: ".claude/skills", ruleDir: null,            skillSection: null },
+  cursor:      { mcpFile: ".cursor/mcp.json",         mcpKey: "mcpServers", skillDir: null,             ruleDir: ".cursor/rules", skillSection: null },
+  gemini:      { mcpFile: ".gemini/settings.json",    mcpKey: "mcpServers", skillDir: null,             ruleDir: null,            skillSection: "GEMINI.md" },
+  agy:         { mcpFile: ".agents/mcp_config.json",  mcpKey: "mcpServers", skillDir: ".agents/skills", ruleDir: null,            skillSection: null },
+  antigravity: { mcpFile: ".agents/mcp_config.json",  mcpKey: "mcpServers", skillDir: ".agents/skills", ruleDir: null,            skillSection: null },
+  opencode:    { mcpFile: "opencode.json",            mcpKey: "mcp",        skillDir: null,             ruleDir: null,            skillSection: "AGENTS.md" },
+  opencode2:   { mcpFile: "opencode.json",            mcpKey: "mcp",        skillDir: null,             ruleDir: null,            skillSection: "AGENTS.md" },
+  zcode:       { mcpFile: null,                       mcpKey: null,         skillDir: null,             ruleDir: null,            skillSection: "AGENTS.md" },
+  kimi:        { mcpFile: null,                       mcpKey: null,         skillDir: null,             ruleDir: null,            skillSection: "AGENTS.md" },
+  codex:       { mcpFile: null,                       mcpKey: null,         skillDir: null,             ruleDir: null,            skillSection: "AGENTS.md" },
 };
 
 const harnessOf = (agent) => String(agent || "").trim().split(/\s+/)[0] || "";
@@ -172,14 +177,14 @@ function pathSkillText(def, configDir, die) {
 }
 
 // --- Materialize: union of the group's refs per harness -> worktree files ---
-export function materializeAgentConfig({ worktree, members, cfg, configDir, die, warn }) {
+export function materializeAgentConfig({ worktree, members, cfg, configDir, die, warn, quietRestore = false }) {
   // Self-heal first: a manifest left by a crashed previous group must never be
   // overwritten (its created/modified entries would be lost). If the restore
   // could not fully complete (manifest kept), die — materializing on top would
   // snapshot orca-authored content as the user's "original" and bury the
   // un-restored entries for good.
   if (existsSync(join(worktree, MANIFEST_FILE))) {
-    warn("[agent-config] found a leftover manifest — restoring before materializing.");
+    if (!quietRestore) warn("[agent-config] found a leftover manifest — restoring before materializing.");
     restoreAgentConfig({ worktree, warn });
     if (existsSync(join(worktree, MANIFEST_FILE)))
       die("[agent-config] the previous run's leftover manifest could not be fully restored (see warnings above) — resolve the worktree files manually or re-run after fixing, then start a new run.");

@@ -50,7 +50,11 @@ function main(argv) {
   const c = {
     state, flags, rest, key,
     id: () => String(state.nextId++),
-    pushDone: (task, outcome) => state.pendingDone.push({ task, outcome }),
+    pushDone: (task, outcome, dispatchId = null) => {
+      const ds = Object.values(state.dispatches).filter((d) => d.task === task);
+      const effDisp = dispatchId || (ds.length ? ds[ds.length - 1].id : null);
+      state.pendingDone.push({ task, outcome, dispatchId: effDisp });
+    },
     materialize: (task, outcome, wtDirOverride = null) => {
       // Shared with scenario handlers that override worker-start wholesale:
       // leave the step's artifact behind on success, like a real worker.
@@ -79,7 +83,10 @@ function main(argv) {
     ok: (j) => save(0, { result: j ?? {} }),
     fail: (msg, code = 1) => save(code, { error: msg }),
   };
-  const dispatchOfTask = (task) => Object.values(state.dispatches).find((d) => d.task === task);
+  const dispatchOfTask = (task) => {
+    const ds = Object.values(state.dispatches).filter((d) => d.task === task);
+    return ds.filter((d) => d.status !== "stopped" && !d.fenced).pop() || ds[ds.length - 1];
+  };
 
   const DEFAULTS = {
     "status": () => c.ok({}),
@@ -133,7 +140,7 @@ function main(argv) {
     },
     "orchestration dispatch-show": () => {
       const d = dispatchOfTask(flags.task);
-      c.ok({ dispatch: { status: (d || {}).status || "dispatching", last_heartbeat_at: new Date().toISOString() } });
+      c.ok({ dispatch: { id: (d || {}).id || null, status: (d || {}).status || "dispatching", last_heartbeat_at: new Date().toISOString() } });
     },
     // scenario.outcomeOf(task, ctx) may override the completion outcome ("succeeded" | "failed" | null = unknown).
     // Consulted ONLY by this default worker-start handler — a scenario that defines its own
@@ -141,24 +148,36 @@ function main(argv) {
     "orchestration worker-start": () => {
       const id = "disp-" + c.id();
       const wtDir = (state.extra.worktreePaths || {})[flags.worktree] || env.ORCA_FAKE_WT || ".";
-      state.dispatches[id] = { id, task: flags.task, worktree: flags.worktree || null, wtDir, status: "dispatching", created: Date.now() };
+      state.dispatches[id] = { id, task: flags.task, worktree: flags.worktree || null, wtDir, status: "dispatching", retryOf: flags["retry-of"] || null, created: Date.now() };
       const task = state.tasks[flags.task] || {};
       const outcome = scenario.outcomeOf ? scenario.outcomeOf(task, c) : "succeeded";
       c.materialize(task, outcome, wtDir);
-      c.pushDone(flags.task, outcome);
+      c.pushDone(flags.task, outcome, id);
       c.ok({ dispatchId: id, state: "ready" });
     },
     "orchestration worker-show": () => {
       const d = state.dispatches[flags.dispatch] || {};
       c.ok({ terminal: { lastOutputAt: d.created || Date.now() } });
     },
-    "orchestration worker-release": () => c.ok({}),
+    "orchestration worker-stop": () => {
+      const d = state.dispatches[flags.dispatch];
+      if (d) { d.status = "stopped"; d.fenced = true; d.stoppedAt = Date.now(); }
+      (state.extra.stoppedDispatches ??= []).push(flags.dispatch);
+      c.ok({ dispatchId: flags.dispatch, state: "stopped", processAction: "closed_agent_terminal" });
+    },
+    "orchestration worker-release": () => {
+      const d = state.dispatches[flags.dispatch];
+      if (d) { d.released = true; }
+      (state.extra.releasedDispatches ??= []).push(flags.dispatch);
+      c.ok({ dispatchId: flags.dispatch, status: "released" });
+    },
     "orchestration check": () => {
       if (flags.ack !== undefined) return c.ok({});
       const done = state.pendingDone.shift();
       if (!done) return c.ok({ messages: [] });
       c.ok({ deliveryId: "dlv-" + c.id(),
         messages: [{ type: "worker_done", taskId: done.task,
+          ...(done.dispatchId ? { dispatchId: done.dispatchId } : {}),
           payload: JSON.stringify(done.outcome == null ? {} : { outcome: done.outcome }) }] });
     },
     "orchestration gate-create": () => {

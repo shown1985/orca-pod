@@ -1,6 +1,6 @@
 {
   "name": "orca-pod",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Lightweight, governance-hardened multi-agent SDLC orchestrator for Orca ADE — 3-Track pipelines, activity-aware Watchdog supervisor, primary/fallback pre-flight auto-downgrade + agy worktree trust, GitHub/Gitea Issue-to-PR traceability, stack-aware CI & intranet Self-Hosted CD generator, isolated worktrees, hard gates, and out-of-repo run ledger.",
   "license": "MIT",
   "repository": {
@@ -31,6 +31,7 @@
     ".orca/ci-generator.mjs",
     ".orca/ledger.mjs",
     ".orca/lib/orca-cli.mjs",
+    ".orca/lib/sanitize.mjs",
     ".orca/lib/status.mjs",
     ".orca/lib/status-template.html",
     ".orca/lib/usage.mjs",

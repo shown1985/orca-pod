@@ -1,10 +1,11 @@
 // Live status dashboard writer, artifact JSONP snapshots, progress parser,
 // run history archiving/listing, and --status-preview fixture renderer.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, copyFileSync, statSync, rmdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, copyFileSync, statSync, rmdirSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { sanitizeText } from "./sanitize.mjs";
 
 const LIB_DIR = dirname(fileURLToPath(import.meta.url));
 export const STATUS_HTML = readFileSync(join(LIB_DIR, "status-template.html"), "utf8");
@@ -106,8 +107,15 @@ export function createStatusManager({
     const { runsRoot, name } = nextRunDirName();
     const dest = join(runsRoot, name);
     const n = copyRunFiles(dir, dest, "(archive)");
-    if (n > 0) log(`[history] archived previous run's artifacts -> ${artDir}/runs/${name}/ (${n} files)`);
-    else { try { rmdirSync(dest); } catch {} }
+    if (n > 0) {
+      log(`[history] archived previous run's artifacts -> ${artDir}/runs/${name}/ (${n} files)`);
+      // Prevent stale ISSUES.json / ISSUES.md from a prior run in this worktree leaking into a fresh run
+      if (!opt.from) {
+        for (const stale of ["ISSUES.json", "ISSUES.md"]) {
+          try { rmSync(join(dir, stale), { force: true }); } catch {}
+        }
+      }
+    } else { try { rmdirSync(dest); } catch {} }
   }
 
   function listRuns() {
@@ -147,11 +155,11 @@ export function createStatusManager({
     const st = statusOf(id);
     if (!st) return;
     st.status = outcome === "succeeded" ? "succeeded"
-      : outcome === "failed" ? "failed"
+      : (outcome === "failed" || outcome === "blocked") ? "failed"
       : outcome === "still-running" ? "running" : "unknown";
     st.endedAt = Date.now();
     if (st.startedAt) st.durationMs = st.endedAt - st.startedAt;
-    st.note = note || null;
+    st.note = note ? sanitizeText(note, { maxLen: 280 }) : null;
     writeStatus();
   }
 
@@ -178,7 +186,17 @@ export function createStatusManager({
         const cur = statusOf(ps.id);
         if (!cur) continue;
         if (cur.status === "skipped" && TERMINAL_STATUSES.has(ps.status)) {
-          Object.assign(cur, { status: ps.status, attempt: Math.max(cur.attempt, ps.attempt || 0), startedAt: ps.startedAt ?? null, endedAt: ps.endedAt ?? null, durationMs: ps.durationMs ?? null, note: ps.note ?? null });
+          Object.assign(cur, {
+            status: ps.status,
+            agent: ps.agent || cur.agent,
+            model: ps.model || cur.model || null,
+            family: ps.family || cur.family || null,
+            attempt: Math.max(cur.attempt, ps.attempt || 0),
+            startedAt: ps.startedAt ?? null,
+            endedAt: ps.endedAt ?? null,
+            durationMs: ps.durationMs ?? null,
+            note: ps.note ?? null,
+          });
         } else if (cur.status === "pending" && prev.overall !== "succeeded") {
           cur.attempt = Math.max(cur.attempt, ps.attempt || 0);
         }

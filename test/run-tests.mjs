@@ -1277,7 +1277,7 @@ scenario("I1 installer (empty project: every whitelisted file lands)", async () 
   for (const f of [
     "flow.mjs", "agent-config.mjs", "agent-scanner.mjs", "strategy-wizard.mjs",
     "gate-verify.mjs", "worktree-isolation.mjs", "merge-danger.mjs", "health.mjs", "watchdog.mjs", "preflight.mjs", "issue-tracker.mjs", "ci-generator.mjs", "ledger.mjs",
-    "lib/orca-cli.mjs", "lib/status.mjs", "lib/status-template.html", "lib/usage.mjs", "lib/notify.mjs", "lib/nudge.mjs", "lib/runner.mjs",
+    "lib/orca-cli.mjs", "lib/sanitize.mjs", "lib/status.mjs", "lib/status-template.html", "lib/usage.mjs", "lib/notify.mjs", "lib/nudge.mjs", "lib/runner.mjs",
     "flow.config.json", "flow-hotfix.json", "flow-feature.json", "flow-epic.json",
     "CONFIGURATION.md", "README.md", "notify.json",
   ])
@@ -2074,17 +2074,22 @@ scenario("V1 Watchdog (active extension, dead-loop, trust-prompt, gateway fallba
       budgetMs: 45000,
     });
     eq("V1c gateway fallback succeeded", rGw.code, 0);
-    ok("V1c logged watchdog gateway_disconnect", /[watchdog:gateway_disconnect]/.test(rGw.out + rGw.err));
-    ok("V1c logged fallback to agy", /[fallback].*downgrading from "opencode2" to "agy"/.test(rGw.out + rGw.err));
+    ok("V1c logged watchdog gateway_disconnect", /\[watchdog:gateway_disconnect\]/.test(rGw.out + rGw.err));
+    ok("V1c logged fallback to agy", /\[fallback\].*downgrading from "opencode2" to "agy"/.test(rGw.out + rGw.err));
     const starts = rGw.state?.extra?.starts || [];
-    eq("V1c dispatched primary then fallback", starts.map((s) => s.agent), ["opencode2", "agy"]);
+    eq("V1c dispatched primary then normalized antigravity fallback", starts.map((s) => s.agent), ["opencode2", "antigravity"]);
     eq("V1c fallback received model claude-sonnet-5-5", starts[1]?.model, "claude-sonnet-5-5");
     eq("V1c fallback received effort medium", starts[1]?.effort, "medium");
+    eq("V1c fallback used --retry-of pointing to stopped primary dispatch", starts[1]?.retryOf, starts[0]?.id);
+    eq("V1c called worker-stop on broken primary dispatch before fallback", rGw.state?.extra?.stoppedDispatches, [starts[0]?.id]);
+    ok("V1c ignored stale worker_done from superseded primary dispatch", /\[stale-dispatch\] ignoring late worker_done/.test(rGw.out + rGw.err));
+    ok("V1c redacted Bearer token from logs", !(rGw.out + rGw.err).includes("sk-secret1234567890abcdef"));
     const { listLedgerSummaries } = await import(join(REPO, ".orca", "ledger.mjs"));
     const sumsC = listLedgerSummaries({ ledgerHome: ledgerC });
     ok("V1c ledger recorded fallback event", (sumsC[0]?.fallbacks?.length || 0) >= 1);
     eq("V1c ledger fallback toAgent=agy", sumsC[0]?.fallbacks?.[0]?.toAgent, "agy");
     ok("V1c ledger recorded watchdog gateway_disconnect", sumsC[0]?.watchdogEvents?.some((e) => e.kind === "gateway_disconnect"));
+    ok("V1c ledger redacted Bearer token", !JSON.stringify(sumsC[0]).includes("sk-secret1234567890abcdef"));
   } finally {
     for (const f of [activeCfgPath, loopCfgPath, gwCfgPath]) { try { rmSync(f, { force: true }); } catch {} }
   }
@@ -2360,6 +2365,827 @@ scenario("V4 CI/CD Generator (hybrid Python+Vue+Docker CI + Self-Hosted Intranet
   const tailoredCi = readFileSync(join(tmpV4Init, ".github", "workflows", "ci-release.yml"), "utf8");
   ok("V4 init auto-tailored CI for Python backend", tailoredCi.includes("verify-python-backend:"));
   ok("V4 init created cd-selfhosted.yml", existsSync(join(tmpV4Init, ".github", "workflows", "cd-selfhosted.yml")));
+});
+
+// ---------------------------------------------------------------------------
+// V5 — P0-01 + P1-04 + P2-01: Safe Stop Verification, Partial ColdStart Cleanup,
+// Windows agy Settings File, and Accurate Multi-Hop Ledger Routing
+// ---------------------------------------------------------------------------
+scenario("V5 Safe stop verification, Windows agy settings file & accurate fallback ledger", async () => {
+  const { buildAgySettingsArg, normalizeOrcaWorkerAgent } = await import(join(REPO, ".orca", "lib", "orca-cli.mjs"));
+  const { listLedgerSummaries } = await import(join(REPO, ".orca", "ledger.mjs"));
+
+  // 1) Agent alias normalization & Windows session settings file
+  eq("V5 normalizeOrcaWorkerAgent maps agy -> antigravity", normalizeOrcaWorkerAgent("agy"), "antigravity");
+  eq("V5 normalizeOrcaWorkerAgent keeps codex", normalizeOrcaWorkerAgent("codex"), "codex");
+
+  const tmpV5 = mkdtempSync(join(tmpdir(), "orca-v5-"));
+  dirsOfCurrentScenario.push(tmpV5);
+  const winSettingsDir = join(tmpV5, "win-settings");
+  const winArg = buildAgySettingsArg(["C:\\Users\\Dev User\\wt-backend"], { isWin: true, settingsDir: winSettingsDir });
+  const winFileMatch = winArg.match(/^--settings "([^"]+)"$/);
+  ok("V5 Windows agy settings uses quoted file path without inner escaped quotes", Boolean(winFileMatch));
+  const winSettingsJson = JSON.parse(readFileSync(winFileMatch[1], "utf8"));
+  eq("V5 Windows agy settings file stores exact trustedWorkspaces path with spaces", winSettingsJson.trustedWorkspaces, ["C:\\Users\\Dev User\\wt-backend"]);
+
+  // 2) Unconfirmed worker-stop (`stop_unknown`) MUST refuse blind fallback onto same worktree
+  const stopCfgPath = join(REPO, ".orca", "_tmp-v5-stop.config.json");
+  const multiCfgPath = join(REPO, ".orca", "_tmp-v5-multihop.config.json");
+  try {
+    writeFileSync(stopCfgPath, JSON.stringify({
+      defaults: {
+        timeoutMs: 4000,
+        hardTimeoutMs: 15000,
+        preflight: { enabled: false },
+        watchdog: { enabled: true, fallbackOnGatewayError: true },
+      },
+      skills: {
+        "clean-check": { description: "Cleanup check", prompt: "Verify finally restores worktree." },
+      },
+      pipeline: [{
+        id: "backend",
+        title: "Backend Worker",
+        agent: "claude",
+        skills: ["clean-check"],
+        fallback: { agent: "codex" },
+        spec: "Write {out}.",
+        writes: "BACKEND.md",
+      }],
+    }));
+    const rStop = await runFlow({
+      name: "v5-stop-unconfirmed",
+      config: "_tmp-v5-stop.config.json",
+      scenario: "v51-stop-unconfirmed.cjs",
+      args: ["--ledger-home", join(tmpV5, "ledger-stop")],
+      budgetMs: 30000,
+    });
+    eq("V5 unconfirmed stop exits non-zero (still-running)", rStop.code, 1);
+    eq("V5 refused to launch fallback candidate when worker-stop failed", (rStop.state?.extra?.starts || []).length, 1);
+    ok("V5 logged refusal to reuse worktree", /could not prove old worker stopped.*pausing without reusing worktree/.test(rStop.out + rStop.err));
+    ok("V5 runGroup finally restored .claude/skills cleanly", !existsSync(join(rStop.wt, ".orca-agent-config.json")) && !existsSync(join(rStop.wt, ".claude", "skills", "clean-check")));
+
+    // 3) P2-01: Multi-hop fallback (watchdog -> dead preflight hop -> default-model fallback) records both hops & model="default"
+    const net = await import("node:net");
+    const deadPort = await new Promise((resPort) => {
+      const s = net.createServer();
+      s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => resPort(p)); });
+    });
+    writeFileSync(multiCfgPath, JSON.stringify({
+      defaults: {
+        timeoutMs: 4000,
+        hardTimeoutMs: 20000,
+        preflight: { enabled: true, timeoutMs: 400 },
+        watchdog: { enabled: true, fallbackOnGatewayError: true },
+      },
+      pipeline: [{
+        id: "backend",
+        title: "Backend Worker",
+        agent: "opencode2",
+        model: "magpie/deepseek-v4.1-flash",
+        preflight: { enabled: false },
+        fallbacks: [
+          { agent: "zcode", model: "glm-5.3", preflight: { tcp: `127.0.0.1:${deadPort}`, timeoutMs: 400 } },
+          { agent: "agy", model: "default" },
+        ],
+        spec: "Write {out}.",
+        writes: "BACKEND.md",
+      }],
+    }));
+    const ledgerMulti = join(tmpV5, "ledger-multi");
+    const rMulti = await runFlow({
+      name: "v5-multihop",
+      config: "_tmp-v5-multihop.config.json",
+      scenario: "v5-watchdog-gw-fallback.cjs",
+      args: ["--ledger-home", ledgerMulti],
+      budgetMs: 45000,
+    });
+    eq("V5 multi-hop fallback succeeded", rMulti.code, 0);
+    const sumMulti = listLedgerSummaries({ ledgerHome: ledgerMulti })[0];
+    eq("V5 ledger recorded both watchdog hop and preflight hop", sumMulti?.fallbacks?.map((f) => f.phase), ["watchdog", "preflight"]);
+    eq("V5 ledger final step model is 'default' (did NOT leak primary's magpie model)", sumMulti?.steps?.backend?.model, "default");
+  } finally {
+    for (const f of [stopCfgPath, multiCfgPath]) { try { rmSync(f, { force: true }); } catch {} }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// V6 — P0-03 + sxcj #2: Hard Cross-Family Review Isolation (Static, Mid-Run Fallback & Resume)
+// ---------------------------------------------------------------------------
+scenario("V6 Hard Cross-Family Review Isolation (blocks author-family fallback & preserves across --from resume)", async () => {
+  const { classifyModelFamily, buildCandidateChain, filterCrossFamilyCandidates } = await import(join(REPO, ".orca", "preflight.mjs"));
+  const { applyStrategyToProject } = await import(join(REPO, ".orca", "strategy-wizard.mjs"));
+  const { listLedgerSummaries } = await import(join(REPO, ".orca", "ledger.mjs"));
+
+  // 1) Model family classification
+  eq("V6 agy + claude-sonnet-5-5 -> anthropic", classifyModelFamily("agy", "claude-sonnet-5-5"), "anthropic");
+  eq("V6 claude + claude-opus-5-5 -> anthropic", classifyModelFamily("claude", "claude-opus-5-5"), "anthropic");
+  eq("V6 agy + gpt-5.4 -> openai", classifyModelFamily("agy", "gpt-5.4"), "openai");
+  eq("V6 agy default -> google", classifyModelFamily("agy", null), "google");
+  eq("V6 opencode2 + magpie/deepseek-v4.1 -> deepseek", classifyModelFamily("opencode2", "magpie/remote/deepseek-v4.1"), "deepseek");
+  eq("V6 zcode -> zhipu", classifyModelFamily("zcode", null), "zhipu");
+  eq("V6 codex -> openai", classifyModelFamily("codex", "gpt-6.2-sol"), "openai");
+
+  // 2) Review step never inherits unrestricted global defaults.fallback
+  const revChain = buildCandidateChain(
+    { id: "contract-review", agent: "codex", crossFamilyWith: ["contract-architecture"], verify: { requireVerdict: "PASS" } },
+    { defaults: { fallback: { agent: "gemini" } } }
+  );
+  eq("V6 contract-review ignores global defaults.fallback", revChain.map((c) => c.agent), ["codex"]);
+
+  const filtered = filterCrossFamilyCandidates(
+    [
+      { agent: "codex", model: "gpt-6.2-sol", family: "openai", isPrimary: true },
+      { agent: "claude", model: "claude-opus-5-5", family: "anthropic", isPrimary: false },
+    ],
+    new Map([["anthropic", [{ stepId: "coding", agent: "agy", model: "claude-sonnet-5-5" }]]])
+  );
+  eq("V6 filterCrossFamilyCandidates strips anthropic fallback", filtered.allowed.map((c) => c.agent), ["codex"]);
+  eq("V6 filterCrossFamilyCandidates records rejected anthropic candidate", filtered.rejected.length, 1);
+
+  // 3) Strategy wizard scopes fallback via agentFallbacks and never overrides reviewer into coordinator/coder
+  const wizInit = await runInit({ name: "v6-wiz", args: ["--no-interactive"] });
+  applyStrategyToProject(wizInit.dir, {
+    defaultTrack: "flow-epic.json",
+    targetBranch: "dev",
+    protectedBranches: ["main", "master"],
+    fallbackAgent: "agy",
+    roles: { coordinator: "agy", visual: "agy", coder: "opencode2", coderAlt: "zcode", reviewer: "codex", release: "codex" },
+  });
+  const wizEpic = JSON.parse(readFileSync(join(wizInit.dir, ".orca", "flow-epic.json"), "utf8"));
+  eq("V6 strategy-wizard did NOT write unrestricted defaults.fallback", wizEpic.defaults.fallback, undefined);
+  eq("V6 strategy-wizard scoped fallback to coder in agentFallbacks", wizEpic.defaults.agentFallbacks?.opencode2?.[0]?.agent, "agy");
+  eq("V6 strategy-wizard did NOT attach agy fallback to codex reviewer", wizEpic.defaults.agentFallbacks?.codex, undefined);
+
+  // 4) E2E sxcj #2 scenario: coder falls back mid-run `opencode2 -> agy(claude-sonnet-5-5)` [anthropic];
+  //    reviewer primary `codex` fails, fallback `claude(claude-opus-5-5)` [anthropic] MUST BE REJECTED & BLOCKED!
+  const tmpV6 = mkdtempSync(join(tmpdir(), "orca-v6-"));
+  dirsOfCurrentScenario.push(tmpV6);
+  const cfCfgPath = join(REPO, ".orca", "_tmp-v6-crossfamily.config.json");
+  try {
+    writeFileSync(cfCfgPath, JSON.stringify({
+      defaults: {
+        timeoutMs: 4000,
+        hardTimeoutMs: 20000,
+        startRetries: 0,
+        preflight: { enabled: false },
+        watchdog: { enabled: true, fallbackOnGatewayError: true },
+      },
+      skills: {
+        "fe-check": { description: "Frontend skill", prompt: "Follow DESIGN.md." },
+      },
+      pipeline: [
+        {
+          id: "coding",
+          title: "Coding",
+          agent: "opencode2",
+          model: "magpie/deepseek-v4.1-flash",
+          skills: ["fe-check"],
+          fallback: { agent: "agy", model: "claude-sonnet-5-5", effort: "medium" },
+          spec: "Implement feature in {out}.",
+          writes: "CHANGES.md",
+        },
+        {
+          id: "code-review",
+          title: "Cross-Family Code Review",
+          agent: "codex",
+          model: "gpt-6.2-sol",
+          crossFamilyWith: ["coding"],
+          fallback: { agent: "claude", model: "claude-opus-5-5", effort: "high" },
+          reads: ["coding"],
+          onFailGoto: "coding",
+          verify: { requireVerdict: "PASS" },
+          spec: "Review {reads} into {out}.",
+          writes: "REVIEW.md",
+        },
+      ],
+    }));
+
+    const ledgerV6 = join(tmpV6, "ledger");
+    const rCf = await runFlow({
+      name: "v6-midrun-cf",
+      config: "_tmp-v6-crossfamily.config.json",
+      scenario: "v51-midrun-crossfamily.cjs",
+      args: ["--ledger-home", ledgerV6],
+      budgetMs: 45000,
+    });
+    eq("V6 mid-run self-review fallback blocked (exit 1)", rCf.code, 1);
+    eq("V6 coding fallback mounted .agents/skills/fe-check for agy", rCf.state?.extra?.agySkillMountedDuringFallback, true);
+    ok("V6 .agents/skills cleaned up after group exit", !existsSync(join(rCf.wt, ".agents", "skills", "fe-check")));
+    const cfStarts = rCf.state?.extra?.starts || [];
+    ok("V6 claude-opus-5-5 was NEVER dispatched for code-review", !cfStarts.some((s) => s.agent === "claude" || s.model === "claude-opus-5-5"));
+    ok("V6 logged explicit cross-family violation diagnostic", /\[cross-family\].*family "anthropic" matches upstream author coding\[agy:claude-sonnet-5-5\]/.test(rCf.out + rCf.err));
+
+    // 5) Resume with `--from code-review` in the same worktree/ledger: must STILL remember coding ran as anthropic!
+    const rResume = await runFlow({
+      name: "v6-resume-cf",
+      config: "_tmp-v6-crossfamily.config.json",
+      scenario: "v51-midrun-crossfamily.cjs",
+      reuseDir: rCf.dir,
+      args: ["--from", "code-review", "--ledger-home", ledgerV6],
+      budgetMs: 30000,
+    });
+    eq("V6 --from resume still blocks anthropic self-review", rResume.code, 1);
+    ok("V6 --from resume rejected claude-opus-5-5 against persisted coding family", /\[cross-family\].*family "anthropic" matches upstream author coding/.test(rResume.out + rResume.err));
+    const sumsV6 = listLedgerSummaries({ ledgerHome: ledgerV6 });
+    ok("V6 ledger persisted step family=anthropic on coding", sumsV6.some((s) => s.steps?.coding?.family === "anthropic"));
+  } finally {
+    try { rmSync(cfCfgPath, { force: true }); } catch {}
+  }
+});
+
+// ---------------------------------------------------------------------------
+// V7 — P1-01 + P1-02 + P1-03: Watchdog Precision, Content-Hashed Fingerprints,
+// Strict maxRuntimeMs Ceiling, JSONC/IPv6/Port Preflight & HTTP Body Cleanup
+// ---------------------------------------------------------------------------
+scenario("V7 Watchdog precision, content-hashed git fingerprint, maxRuntimeMs ceiling & preflight IPv6/JSONC/HTTP", async () => {
+  const {
+    detectPromptBlocked,
+    detectOutputLoop,
+    probeWorktreeActivity,
+    createWatchdogTracker,
+    evaluateWatchdog,
+  } = await import(join(REPO, ".orca", "watchdog.mjs"));
+  const {
+    discoverOpencodeLocalEndpoints,
+    parseHostPort,
+    checkCandidateHealth,
+    probeHttp,
+  } = await import(join(REPO, ".orca", "preflight.mjs"));
+  const { spawnSync } = await import("node:child_process");
+
+  // 1) P1-01: Tail-only gateway error scan + recovery + dedup + approval vs trust + exact loopThreshold=4
+  const wt0 = 2000000;
+  const tracker = createWatchdogTracker({
+    step: { watchdog: { loopThreshold: 4, fallbackOnGatewayError: true, fallbackOnPromptBlocked: true } },
+    startedAt: wt0,
+    probeFn: () => ({ gitFingerprint: "fp1", gitOk: true, artifactFingerprint: "af1", artifactSize: 0 }),
+  });
+  const gw1 = evaluateWatchdog(tracker, {
+    now: wt0 + 1000,
+    preview: "Connecting...\nError: connect ECONNREFUSED 127.0.0.1:3425",
+    previewChanged: true,
+    previewSeenBefore: false,
+    fallbackAvailable: false,
+  });
+  eq("V7 initial ECONNREFUSED triggers gateway_disconnect", gw1.kind, "gateway_disconnect");
+  eq("V7 first anomaly is not deduplicated", gw1.deduplicated, false);
+
+  // Historic ECONNREFUSED still in scrollback, but new lines show recovery + git fingerprint advanced!
+  const gwRecovered = evaluateWatchdog(tracker, {
+    now: wt0 + 3000,
+    preview: "Connecting...\nError: connect ECONNREFUSED 127.0.0.1:3425\nReconnected to backup!\nEdited handler.py and passed 12 tests.",
+    previewChanged: true,
+    previewSeenBefore: true,
+    fallbackAvailable: true,
+    probeOverride: { gitFingerprint: "fp2", gitOk: true, artifactFingerprint: "af1", artifactSize: 0 },
+  });
+  eq("V7 historic ECONNREFUSED after recovery + git progress stays healthy (no false fallback)", gwRecovered.status, "healthy");
+
+  // Human approval (`user_approval` / permission prompt) blocks instead of falling back!
+  const waitApproval = evaluateWatchdog(tracker, {
+    now: wt0 + 4000,
+    preview: "Running deployment...",
+    previewChanged: false,
+    previewSeenBefore: true,
+    agentWait: { kind: "user_approval", reason: "Approve command?" },
+    fallbackAvailable: true,
+    probeOverride: { gitFingerprint: "fp2", gitOk: true, artifactFingerprint: "af1", artifactSize: 0 },
+  });
+  eq("V7 user_approval sets action=block (NEVER fallback)", waitApproval.action, "block");
+  const waitApprovalDup = evaluateWatchdog(tracker, {
+    now: wt0 + 5000,
+    preview: "Running deployment...",
+    previewChanged: false,
+    previewSeenBefore: true,
+    agentWait: { kind: "user_approval", reason: "Approve command?" },
+    fallbackAvailable: true,
+    probeOverride: { gitFingerprint: "fp2", gitOk: true, artifactFingerprint: "af1", artifactSize: 0 },
+  });
+  eq("V7 repeated user_approval anomaly is deduplicated", waitApprovalDup.deduplicated, true);
+
+  const trustPb = detectPromptBlocked("Do you trust the contents of this project?\n[y/N]");
+  const permPb = detectPromptBlocked("Do you want to proceed?\n[y/N]");
+  eq("V7 workspace trust has trustBlock=true", trustPb?.trustBlock, true);
+  eq("V7 normal permission prompt has trustBlock=false (humanApproval=true)", [permPb?.trustBlock, permPb?.humanApproval], [false, true]);
+
+  // Exact loopThreshold=4 triggers on 4 identical consecutive lines (not 5!)
+  const exact4 = detectOutputLoop([], [
+    "Retrying broken schema tool call...",
+    "Retrying broken schema tool call...",
+    "Retrying broken schema tool call...",
+    "Retrying broken schema tool call...",
+  ], { threshold: 4 });
+  eq("V7 detectOutputLoop triggers at exact 4 repeats for threshold=4", exact4?.repeats, 4);
+
+  // Static unchanged preview does NOT trigger output_loop in evaluateWatchdog
+  const staticLoopCheck = evaluateWatchdog(tracker, {
+    now: wt0 + 6000,
+    preview: Array.from({ length: 5 }, () => "Retrying broken schema tool call...").join("\n"),
+    previewChanged: false,
+    previewSeenBefore: true,
+    fallbackAvailable: false,
+    probeOverride: { gitFingerprint: "fp2", gitOk: true, artifactFingerprint: "af1", artifactSize: 0 },
+  });
+  eq("V7 unchanged static preview does not fire output_loop", staticLoopCheck.status, "healthy");
+
+  // 2) P1-02: Real git content-hash fingerprinting + non-git unknown + sharedWorktree isolation + maxRuntimeMs ceiling
+  const tmpGit = mkdtempSync(join(tmpdir(), "orca-v7-git-"));
+  const tmpNonGit = mkdtempSync(join(tmpdir(), "orca-v7-nongit-"));
+  dirsOfCurrentScenario.push(tmpGit, tmpNonGit);
+  eq("V7 non-git dir returns gitFingerprint=null (unknown)", probeWorktreeActivity(tmpNonGit).gitFingerprint, null);
+
+  spawnSync("git", ["init", tmpGit], { encoding: "utf8" });
+  spawnSync("git", ["-C", tmpGit, "config", "user.email", "test@local"], { encoding: "utf8" });
+  spawnSync("git", ["-C", tmpGit, "config", "user.name", "Tester"], { encoding: "utf8" });
+  writeFileSync(join(tmpGit, "app.py"), "x = 1\ny = 2\n");
+  spawnSync("git", ["-C", tmpGit, "add", "app.py"], { encoding: "utf8" });
+  spawnSync("git", ["-C", tmpGit, "commit", "-m", "init"], { encoding: "utf8" });
+
+  writeFileSync(join(tmpGit, "app.py"), "x = 2\ny = 2\n");
+  const fpEdit1 = probeWorktreeActivity(tmpGit).gitFingerprint;
+  writeFileSync(join(tmpGit, "app.py"), "x = 3\ny = 2\n"); // Same line count & diff shortstat!
+  const fpEdit2 = probeWorktreeActivity(tmpGit).gitFingerprint;
+  ok("V7 content hash catches equal-line-count edit (x=2 -> x=3)", Boolean(fpEdit1 && fpEdit2 && fpEdit1 !== fpEdit2));
+
+  writeFileSync(join(tmpGit, "untracked.py"), "step = 1\n");
+  const fpUntracked1 = probeWorktreeActivity(tmpGit).gitFingerprint;
+  writeFileSync(join(tmpGit, "untracked.py"), "step = 2\nmore = True\n");
+  const fpUntracked2 = probeWorktreeActivity(tmpGit).gitFingerprint;
+  ok("V7 content hash catches repeated writes to same untracked file", fpUntracked1 !== fpUntracked2);
+
+  // Shared worktree artifact scoping
+  const sharedArtDir = join(tmpGit, ".orca", "artifacts");
+  mkdirSync(sharedArtDir, { recursive: true });
+  writeFileSync(join(sharedArtDir, "OWN.md"), "initial");
+  writeFileSync(join(sharedArtDir, "SIBLING.md"), "s1");
+  const sfp1 = probeWorktreeActivity(tmpGit, { artifactPath: join(sharedArtDir, "OWN.md"), artDirPath: sharedArtDir, sharedWorktree: true }).artifactFingerprint;
+  writeFileSync(join(sharedArtDir, "SIBLING.md"), "s2-modified-by-other-worker");
+  const sfp2 = probeWorktreeActivity(tmpGit, { artifactPath: join(sharedArtDir, "OWN.md"), artDirPath: sharedArtDir, sharedWorktree: true }).artifactFingerprint;
+  eq("V7 sharedWorktree=true ignores sibling worker artifact edits", sfp1, sfp2);
+
+  // E2E strict maxRuntimeMs ceiling
+  const ceilCfgPath = join(REPO, ".orca", "_tmp-v7-ceil.config.json");
+  try {
+    writeFileSync(ceilCfgPath, JSON.stringify({
+      defaults: {
+        timeoutMs: 1000,
+        hardTimeoutMs: 1500,
+        watchdog: { enabled: true, extendOnActivity: true, extendStepMs: 10000, activityFreshMs: 10000, maxRuntimeMs: 2400 },
+      },
+      pipeline: [{ id: "alpha", title: "Alpha", agent: "stub", spec: "Work {out}.", writes: "A.md" }],
+    }));
+    const rCeil = await runFlow({
+      name: "v7-maxruntime-ceil",
+      config: "_tmp-v7-ceil.config.json",
+      scenario: "v5-watchdog-active.cjs",
+      budgetMs: 25000,
+    });
+    eq("V7 active worker stopped at strict maxRuntimeMs ceiling (exit 1)", rCeil.code, 1);
+    ok("V7 logged maxRuntimeMs ceiling reached", /reached maxRuntimeMs ceiling/.test(rCeil.out + rCeil.err));
+  } finally {
+    try { rmSync(ceilCfgPath, { force: true }); } catch {}
+  }
+
+  // 3) P1-03: JSONC opencode.jsonc, cloud default model skips localhost, IPv6 [::1], invalid port 70000, HTTP body cancel
+  const tmpOc = mkdtempSync(join(tmpdir(), "orca-v7-oc-"));
+  dirsOfCurrentScenario.push(tmpOc);
+  writeFileSync(join(tmpOc, "opencode.jsonc"), `{
+    // Cloud model configured as default
+    "model": "anthropic/claude-sonnet-4-5",
+    "provider": {
+      /* Unused local gateway should NOT be probed when cloud model is active */
+      "magpie": { "options": { "baseURL": "http://[::1]:3425/v1", }, },
+    },
+  }`);
+  const cloudEps = discoverOpencodeLocalEndpoints({ projectDir: tmpOc, model: null });
+  eq("V7 JSONC with default cloud model skips unrelated localhost provider", cloudEps.length, 0);
+  const ipv6Eps = discoverOpencodeLocalEndpoints({ projectDir: tmpOc, model: "magpie/deepseek-v4.1" });
+  eq("V7 bracketed IPv6 [::1] normalized & discovered when magpie model selected", [ipv6Eps.length, ipv6Eps[0]?.host, ipv6Eps[0]?.port], [1, "::1", 3425]);
+  eq("V7 parseHostPort rejects port 70000", parseHostPort("127.0.0.1:70000"), null);
+
+  const badPortHealth = await checkCandidateHealth({ agent: "opencode2", preflight: { tcp: "127.0.0.1:70000" } });
+  eq("V7 out-of-range TCP port returns structured INVALID_ENDPOINT configError without throwing", [badPortHealth.ok, badPortHealth.configError, badPortHealth.code], [false, true, "INVALID_ENDPOINT"]);
+
+  // HTTP probe socket/body release verification against a streaming server that never finishes body
+  let activeSockets = 0;
+  const streamSrv = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.write("header-ok\n");
+    // Deliberately never call res.end() — cancelling resp.body must abort the stream & close socket!
+  });
+  streamSrv.on("connection", (sock) => {
+    activeSockets++;
+    sock.on("close", () => { activeSockets--; });
+  });
+  await new Promise((r) => streamSrv.listen(0, "127.0.0.1", r));
+  const streamPort = streamSrv.address().port;
+  try {
+    const httpRes = await probeHttp(`http://user:supersecret@127.0.0.1:${streamPort}/health?api_key=tok123`, 1500);
+    eq("V7 probeHttp succeeded on headers", httpRes.ok, true);
+    ok("V7 probeHttp sanitized URL credentials & api_key", !httpRes.url.includes("supersecret") && !httpRes.url.includes("tok123"));
+    await new Promise((r) => setTimeout(r, 120));
+    eq("V7 probeHttp cancelled body & closed underlying socket cleanly", activeSockets, 0);
+  } finally {
+    streamSrv.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// V8 — P1-05..P1-08 + sxcj #3: Scoped ISSUES.json, --no-issues Isolation,
+// Hardened Backlog Parser, Safe Label-Only Retry, Atomic Save & dev Close Rule
+// ---------------------------------------------------------------------------
+scenario("V8 Hardened Issue Tracker (fences, CJK, --no-issues, label-only retry, atomic save & dev branch close)", async () => {
+  const {
+    parseBacklogTasks,
+    loadIssueState,
+    saveIssueState,
+    createIssueViaCli,
+    syncPlanIssues,
+    formatIssuePrBlock,
+  } = await import(join(REPO, ".orca", "issue-tracker.mjs"));
+
+  // 1) P1-06: Fenced code blocks, checked [x] items, non-task [bracket] headings, cross-repo #17, CJK short titles
+  const trickyMd = [
+    "# Backlog",
+    "### [Architecture] System Overview",
+    "- [x] T0: Already finished task should be skipped",
+    "```markdown",
+    "### T99: Fake task inside code fence referencing other/repo#17",
+    "- [ ] T98: Another fenced item #88",
+    "```",
+    "### T1: 建表迁移",
+    "- [ ] T2: Adapt parser inspired by upstream/repo#17",
+    "- [ ] T3: Fix local bug #42",
+    "| T4 | 登录页 | frontend |",
+  ].join("\n");
+  const tasks = parseBacklogTasks(trickyMd);
+  eq("V8 parsed only the 4 real open tasks", tasks.map((t) => t.id), ["T1", "T2", "T3", "T4"]);
+  eq("V8 preserved 4-char CJK title '建表迁移' & inferred backend", [tasks[0].title, tasks[0].owner], ["建表迁移", "backend"]);
+  eq("V8 ignored cross-repo upstream/repo#17 as local issue number", tasks[1].number, null);
+  eq("V8 extracted standalone #42 as local issue number", tasks[2].number, 42);
+  eq("V8 preserved 3-char CJK title '登录页' & inferred frontend", [tasks[3].title, tasks[3].owner], ["登录页", "frontend"]);
+
+  // 2) P1-05 & P1-06: Epic number validation, scope mismatch isolation, and mode=false isolation
+  const tmpV8 = mkdtempSync(join(tmpdir(), "orca-v8-"));
+  dirsOfCurrentScenario.push(tmpV8);
+  writeFileSync(join(tmpV8, "ISSUES.json"), JSON.stringify({
+    provider: "gh",
+    repo: "shown1985/sxcj",
+    objective: "Old Run A",
+    epic: { number: -5, title: "Invalid negative epic" },
+    tasks: [{ id: "T1", title: "Old task", number: 77 }],
+  }));
+  const loadedInvalidEpic = loadIssueState(tmpV8);
+  eq("V8 invalid negative epic.number sanitized to null", loadedInvalidEpic.epic, null);
+  eq("V8 loadIssueState returns null when mode===false (--no-issues)", loadIssueState(tmpV8, { mode: false }), null);
+  eq("V8 loadIssueState returns null on different objective", loadIssueState(tmpV8, { provider: "gh", repo: "shown1985/sxcj", objective: "New Run B" }), null);
+  eq("V8 loadIssueState returns null on different repo", loadIssueState(tmpV8, { provider: "gh", repo: "other/repo", objective: "Old Run A" }), null);
+
+  // 3) P1-07: Explicit --repo binding, label-only retry (never on timeout!), and atomic per-issue persistence
+  const cliCalls = [];
+  const labelRetryRes = createIssueViaCli({
+    provider: "gh",
+    bin: "gh",
+    repoDir: tmpV8,
+    repo: "shown1985/sxcj",
+    title: "Test issue",
+    body: "Body",
+    labels: ["missing-label"],
+    execFn: (_bin, args) => {
+      cliCalls.push(args);
+      if (args.includes("--label")) {
+        return { ok: false, status: 1, stdout: "", stderr: "could not add label: 'missing-label' not found", timedOut: false };
+      }
+      return { ok: true, status: 0, stdout: "https://github.com/shown1985/sxcj/issues/55", stderr: "", timedOut: false };
+    },
+  });
+  eq("V8 label error retried without labels & succeeded (#55)", [labelRetryRes.ok, labelRetryRes.number, cliCalls.length], [true, 55, 2]);
+  ok("V8 explicit --repo passed to gh issue create", cliCalls[0].includes("--repo") && cliCalls[0][cliCalls[0].indexOf("--repo") + 1] === "shown1985/sxcj");
+
+  let timeoutAttempts = 0;
+  const timeoutRes = createIssueViaCli({
+    provider: "gh",
+    bin: "gh",
+    repoDir: tmpV8,
+    repo: "shown1985/sxcj",
+    title: "Timeout issue",
+    body: "Body",
+    labels: ["orca-pod"],
+    execFn: () => {
+      timeoutAttempts++;
+      return { ok: false, status: -1, stdout: "", stderr: "request timed out", error: "ETIMEDOUT", timedOut: true };
+    },
+  });
+  eq("V8 timeout NEVER retries (prevents duplicate remote issues)", [timeoutRes.ok, timeoutAttempts], [false, 1]);
+
+  // Mid-batch failure atomic persistence test: Epic + T1 succeed, T2 crashes -> Epic + T1 are already saved on disk!
+  const midArtDir = join(tmpV8, "mid-art");
+  mkdirSync(midArtDir, { recursive: true });
+  const planFile = join(midArtDir, "PLAN.md");
+  writeFileSync(planFile, "### T1: First task\n### T2: Second task crashes\n");
+  let createSeq = 0;
+  try {
+    syncPlanIssues({
+      providerInfo: { enabled: true, provider: "gh", bin: "gh", repo: "shown1985/sxcj", host: "github.com", defaultBranch: "main" },
+      repoDir: tmpV8,
+      artDirAbs: midArtDir,
+      objective: "Atomic Persistence Test",
+      artifactPath: planFile,
+      execFn: (_bin, args) => {
+        if (args[0] === "issue" && args[1] === "create") {
+          createSeq++;
+          if (createSeq === 1) return { ok: true, status: 0, stdout: "https://github.com/shown1985/sxcj/issues/200", stderr: "" };
+          if (createSeq === 2) return { ok: true, status: 0, stdout: "https://github.com/shown1985/sxcj/issues/201", stderr: "" };
+          throw new Error("simulated mid-batch crash on T2");
+        }
+        return { ok: true, status: 0, stdout: "", stderr: "" };
+      },
+    });
+  } catch {}
+  const survivedState = loadIssueState(midArtDir);
+  eq("V8 atomic per-issue persistence saved Epic #200 & T1 #201 before T2 crash", [survivedState?.epic?.number, survivedState?.tasks?.[0]?.number], [200, 201]);
+
+  // 4) P1-08 + sxcj #3: Non-default targetBranch (`dev` != `main`) explicit post-merge gh issue close guidance
+  const devPrFmt = formatIssuePrBlock(
+    { provider: "gh", repo: "shown1985/sxcj", epic: { number: 10 }, tasks: [{ number: 11 }] },
+    { closeOnPr: true, targetBranch: "dev", defaultBranch: "main" }
+  );
+  ok("V8 dev!=main block warns Closes #N only auto-closes on default branch main", devPrFmt.block.includes("default branch (`main`)"));
+  ok("V8 dev!=main block instructs post-merge gh issue close 11", devPrFmt.block.includes('gh issue close 11 --repo "shown1985/sxcj"'));
+
+  // 5) E2E `--no-issues` isolation with pre-seeded stale ISSUES.json in worktree
+  const noIssCfgPath = join(REPO, ".orca", "_tmp-v8-noissues.config.json");
+  try {
+    writeFileSync(noIssCfgPath, JSON.stringify({
+      defaults: { timeoutMs: 10000, targetBranch: "dev" },
+      pipeline: [{
+        id: "pr-submit",
+        title: "Submit PR",
+        agent: "stub",
+        linkIssues: true,
+        spec: "Create PR. Trailers: {issueCloses}",
+        writes: "PR.md",
+      }],
+    }));
+    const rNoIss = await runFlow({
+      name: "v8-no-issues",
+      config: "_tmp-v8-noissues.config.json",
+      args: ["--no-issues"],
+      seedArtifacts: [{
+        file: "ISSUES.json",
+        text: JSON.stringify({ provider: "gh", repo: "shown1985/sxcj", epic: { number: 999 }, tasks: [{ id: "T1", title: "Stale", number: 888 }] }),
+      }],
+      budgetMs: 30000,
+    });
+    eq("V8 --no-issues E2E succeeded", rNoIss.code, 0);
+    const prSpec = Object.values(rNoIss.state?.tasks || {})[0]?.spec || "";
+    ok("V8 --no-issues prevented stale #999/#888 from entering PR prompt", !prSpec.includes("#999") && !prSpec.includes("#888") && prSpec.includes("(no linked issues)"));
+  } finally {
+    try { rmSync(noIssCfgPath, { force: true }); } catch {}
+  }
+});
+
+// ---------------------------------------------------------------------------
+// V9 — P0-02 + P1-09..P1-12 + sxcj #1: Real Bash Failing-Pytest Exit Code,
+// YAML Psych Validation, Unique Job IDs, CD Preservation, prod Compose, PII & Gitea API
+// ---------------------------------------------------------------------------
+scenario("V9 CI/CD hardening (real bash pytest failure exit!=0, Psych YAML, cd-selfhosted preservation, prod compose, PII & Gitea API)", async () => {
+  const {
+    detectProjectStacks,
+    generateCiCdFiles,
+    renderCiWorkflow,
+    renderSelfHostedCdWorkflow,
+  } = await import(join(REPO, ".orca", "ci-generator.mjs"));
+  const { sanitizeText } = await import(join(REPO, ".orca", "lib", "sanitize.mjs"));
+  const { spawnSync } = await import("node:child_process");
+
+  // 1) P1-09: Secret & PII redaction unit assertions
+  const dirtyDiag = "POST https://admin:pa55word@intranet.local/v1?api_key=sk-1234567890abcdef failed for student_zhang@university.edu.cn with Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.secret and ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
+  const redacted = sanitizeText(dirtyDiag);
+  ok("V9 redacted URL basic-auth password", !redacted.includes("pa55word"));
+  ok("V9 redacted query api_key", !redacted.includes("sk-1234567890abcdef"));
+  ok("V9 redacted student email PII", !redacted.includes("student_zhang@university.edu.cn") && redacted.includes("[REDACTED_EMAIL]"));
+  ok("V9 redacted Bearer & GitHub PAT tokens", !redacted.includes("eyJhbGciOiJIUzI1NiJ9") && !redacted.includes("ghp_ABCDEF"));
+  eq("V9 preserved git SCP remote git@github.com:org/repo", sanitizeText("git@github.com:shown1985/orca-pod.git"), "git@github.com:shown1985/orca-pod.git");
+
+  // 2) P0-02: REAL executable bash test proving failing pytest exits NON-ZERO in BOTH bundled & generated CI!
+  const extractStepScript = (yml, stepName) => {
+    const lines = yml.split(/\r?\n/);
+    const startIdx = lines.findIndex((l) => l.includes(`- name: ${stepName}`));
+    if (startIdx < 0) return null;
+    let runIdx = -1;
+    for (let i = startIdx + 1; i < Math.min(lines.length, startIdx + 12); i++) {
+      if (/^\s+run:\s*\|\s*$/.test(lines[i])) { runIdx = i; break; }
+    }
+    if (runIdx < 0) return null;
+    const baseIndent = lines[runIdx + 1]?.match(/^(\s*)/)?.[1]?.length || 10;
+    const body = [];
+    for (let i = runIdx + 1; i < lines.length; i++) {
+      const l = lines[i];
+      if (!l.trim()) { body.push(""); continue; }
+      const ind = l.match(/^(\s*)/)[1].length;
+      if (ind < baseIndent) break;
+      body.push(l.slice(baseIndent));
+    }
+    return body.join("\n");
+  };
+
+  const bundledGhCi = readFileSync(join(REPO, ".github", "workflows", "ci-release.yml"), "utf8");
+  const bundledGiteaCi = readFileSync(join(REPO, ".gitea", "workflows", "ci-release.yml"), "utf8");
+  const pyVerifyScript = extractStepScript(bundledGhCi, "Verify Python projects (root / backend)");
+  ok("V9 extracted Python verify bash script from bundled .github/workflows/ci-release.yml", Boolean(pyVerifyScript));
+  eq("V9 bundled Gitea Python verify script matches GitHub", extractStepScript(bundledGiteaCi, "Verify Python projects (root / backend)"), pyVerifyScript);
+
+  const tmpPyFail = mkdtempSync(join(tmpdir(), "orca-v9-pyfail-"));
+  dirsOfCurrentScenario.push(tmpPyFail);
+  const fakeBinDir = join(tmpPyFail, "fake-bin");
+  const projFailDir = join(tmpPyFail, "proj");
+  mkdirSync(fakeBinDir, { recursive: true });
+  mkdirSync(join(projFailDir, "backend", "tests"), { recursive: true });
+  writeFileSync(join(projFailDir, "backend", "requirements.txt"), "pytest==8.3.0\n");
+  writeFileSync(join(projFailDir, "backend", "tests", "test_broken.py"), "def test_fail(): assert 1 == 2\n");
+
+  // Fake python3 shim in PATH: pip succeeds, `import pytest` succeeds, `pytest` exits 1, `compileall` exits 0!
+  // In v0.5.0, `pytest -q || python3 -m compileall -q .` turned exit 1 into exit 0!
+  writeFileSync(join(fakeBinDir, "python3"), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === "-m" && a[1] === "pip") process.exit(0);
+if (a[0] === "-c" && (a[1] || "").includes("import pytest")) process.exit(0);
+if (a[0] === "-m" && a[1] === "pytest") { console.error("FAILED tests/test_broken.py::test_fail"); process.exit(1); }
+if (a[0] === "-m" && a[1] === "unittest") { console.error("FAILED unittest"); process.exit(1); }
+if (a[0] === "-m" && a[1] === "compileall") process.exit(0);
+process.exit(0);
+`, { mode: 0o755 });
+  writeFileSync(join(fakeBinDir, "python"), readFileSync(join(fakeBinDir, "python3")), { mode: 0o755 });
+  writeFileSync(join(fakeBinDir, "pytest"), `#!/usr/bin/env node\nconsole.error("FAILED pytest"); process.exit(1);\n`, { mode: 0o755 });
+
+  const bashEnv = { ...process.env, PATH: `${fakeBinDir}:${process.env.PATH}` };
+  const runBundledFail = spawnSync("bash", ["-c", pyVerifyScript], { cwd: projFailDir, env: bashEnv, encoding: "utf8" });
+  ok("V9 P0-02 REAL BASH TEST: failing pytest in bundled CI exits NON-ZERO (not swallowed by compileall!)", runBundledFail.status !== 0);
+
+  // Also test generated tailored Python job script with failing pytest & failing unittest!
+  const genPyCi = renderCiWorkflow(detectProjectStacks(projFailDir));
+  const tailoredPyScript = extractStepScript(genPyCi, "Run Python lint & tests");
+  const runTailoredFail = spawnSync("bash", ["-c", tailoredPyScript], { cwd: join(projFailDir, "backend"), env: bashEnv, encoding: "utf8" });
+  ok("V9 P0-02 REAL BASH TEST: failing pytest in tailored Python CI exits NON-ZERO", runTailoredFail.status !== 0);
+
+  // Also verify failed pip install exits NON-ZERO!
+  const pipFailBin = join(tmpPyFail, "pipfail-bin");
+  mkdirSync(pipFailBin, { recursive: true });
+  writeFileSync(join(pipFailBin, "python3"), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === "-m" && a[1] === "pip" && a.includes("-r")) { console.error("ERROR: No matching distribution"); process.exit(1); }
+process.exit(0);
+`, { mode: 0o755 });
+  const runPipFail = spawnSync("bash", ["-c", pyVerifyScript], { cwd: projFailDir, env: { ...process.env, PATH: `${pipFailBin}:${process.env.PATH}` }, encoding: "utf8" });
+  ok("V9 P0-02 REAL BASH TEST: failing pip install -r requirements.txt exits NON-ZERO", runPipFail.status !== 0);
+
+  // 3) P1-09 & P1-10: Least-privilege permissions, persist-credentials: false, unique job IDs & Ruby Psych YAML parsing!
+  const topPermSection = bundledGhCi.slice(0, bundledGhCi.indexOf("jobs:"));
+  ok("V9 top-level permissions does NOT grant pull-requests: write", !topPermSection.includes("pull-requests: write") && topPermSection.includes("contents: read"));
+  ok("V9 tokenhub-pr-review job scopes pull-requests: write", bundledGhCi.slice(bundledGhCi.indexOf("tokenhub-pr-review:")).includes("pull-requests: write"));
+  ok("V9 bundled CI sets persist-credentials: false on checkout", bundledGhCi.includes("persist-credentials: false"));
+  ok("V9 bundled generic CI includes Go and Rust verification", bundledGhCi.includes("go.mod") && bundledGhCi.includes("Cargo.toml"));
+
+  const tmpTricky = mkdtempSync(join(tmpdir(), "orca-v9-tricky-"));
+  dirsOfCurrentScenario.push(tmpTricky);
+  mkdirSync(join(tmpTricky, "apps", "front-end"), { recursive: true });
+  mkdirSync(join(tmpTricky, "apps", "front_end"), { recursive: true });
+  mkdirSync(join(tmpTricky, "services", "api: core"), { recursive: true });
+  writeFileSync(join(tmpTricky, "apps", "front-end", "package.json"), JSON.stringify({ name: "fe-dash", scripts: { test: "node -e 0" } }));
+  writeFileSync(join(tmpTricky, "apps", "front_end", "package.json"), JSON.stringify({ name: "fe-under", scripts: { test: "node -e 0" } }));
+  writeFileSync(join(tmpTricky, "services", "api: core", "go.mod"), "module example.com/apicore\n\ngo 1.22\n");
+  writeFileSync(join(tmpTricky, "Cargo.toml"), "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n");
+  writeFileSync(join(tmpTricky, "docker-compose.yml"), "services:\n  dev:\n    image: alpine\n");
+  writeFileSync(join(tmpTricky, "docker-compose.prod.yml"), "services:\n  prod:\n    image: alpine\n");
+
+  const detTricky = detectProjectStacks(tmpTricky);
+  eq("V9 sxcj #1 prioritizes docker-compose.prod.yml over docker-compose.yml", detTricky.composeFile, "docker-compose.prod.yml");
+
+  const trickyCi = renderCiWorkflow(detTricky, { platform: "github" });
+  const trickyGiteaCi = renderCiWorkflow(detTricky, { platform: "gitea" });
+  const trickyCd = renderSelfHostedCdWorkflow(detTricky, {
+    deployBranch: "main",
+    runnerLabels: ["self-hosted", "linux", "zone: intranet"],
+    healthUrl: "http://127.0.0.1:8000/health",
+    deployDir: "/opt/sxcj/prod app",
+  });
+
+  ok("V9 deduplicated apps/front-end and apps/front_end job IDs", trickyCi.includes("verify-node-apps-front-end:") && trickyCi.includes("verify-node-apps-front-end-2:"));
+  ok("V9 CD deploys docker-compose.prod.yml", trickyCd.includes('COMPOSE_FILE: "docker-compose.prod.yml"'));
+  ok("V9 CD enters deployDir in deploy & health steps", (trickyCd.match(/cd "\$DEPLOY_DIR"/g) || []).length >= 2);
+  ok("V9 sxcj #1 PII guard: CD NEVER runs docker compose logs", !/docker compose[^\n]*logs/.test(trickyCd));
+  ok("V9 CD gates on CI workflow_run success", trickyCd.includes("workflow_run:") && trickyCd.includes("workflow_run.conclusion == 'success'"));
+
+  // Validate YAML syntax with Ruby Psych if ruby is present on the host
+  const rubyCheck = spawnSync("ruby", ["-ryaml", "-e", "puts 'ok'"], { encoding: "utf8" });
+  if (!rubyCheck.error && rubyCheck.status === 0) {
+    for (const [label, ymlContent] of [
+      ["bundled .github/workflows/ci-release.yml", bundledGhCi],
+      ["bundled .gitea/workflows/ci-release.yml", bundledGiteaCi],
+      ["generated tricky GitHub CI (colons/spaces/dup-slugs)", trickyCi],
+      ["generated tricky Gitea CI", trickyGiteaCi],
+      ["generated tricky Self-Hosted CD", trickyCd],
+    ]) {
+      const ymlPath = join(tmpTricky, "check.yml");
+      writeFileSync(ymlPath, ymlContent);
+      const parsed = spawnSync("ruby", ["-ryaml", "-e", `d = YAML.load_file(${JSON.stringify(ymlPath)}); raise 'bad' unless d.is_a?(Hash) && d['jobs'].is_a?(Hash)`], { encoding: "utf8" });
+      eq(`V9 Psych YAML parse valid: ${label}`, parsed.status, 0);
+    }
+  }
+
+  // 4) P1-11 + sxcj #1: Preserve existing `.github/workflows/cd-selfhosted.yml` unless `--force` is passed!
+  const customCdText = "# HAND-HARDENED SXCJ INTRANET CD — DO NOT CLOBBER\nname: Custom SXCJ CD\n";
+  mkdirSync(join(tmpTricky, ".github", "workflows"), { recursive: true });
+  writeFileSync(join(tmpTricky, ".github", "workflows", "cd-selfhosted.yml"), customCdText);
+
+  const apiNoForce = generateCiCdFiles(tmpTricky, { writeGithubCi: true, writeSelfHostedCd: true });
+  eq("V9 generateCiCdFiles preserves existing cd-selfhosted.yml by default", readFileSync(join(tmpTricky, ".github", "workflows", "cd-selfhosted.yml"), "utf8"), customCdText);
+  ok("V9 generateCiCdFiles reports cd-selfhosted.yml in skipped", apiNoForce.skipped.includes(".github/workflows/cd-selfhosted.yml"));
+
+  const cliNoForce = spawnSync(NODE, [join(REPO, ".orca", "ci-generator.mjs"), "--dir", tmpTricky, "--write", "--self-hosted-cd"], { encoding: "utf8" });
+  eq("V9 ci-generator CLI without --force exited 0", cliNoForce.status, 0);
+  eq("V9 ci-generator CLI without --force preserved custom cd-selfhosted.yml", readFileSync(join(tmpTricky, ".github", "workflows", "cd-selfhosted.yml"), "utf8"), customCdText);
+  ok("V9 ci-generator CLI logged preservation message", /kept existing \.github\/workflows\/cd-selfhosted\.yml \(pass --force to overwrite\)/.test(cliNoForce.stdout));
+
+  const initNoForce = await runInit({ name: "v9-init-preserve", dir: tmpTricky, args: ["--no-interactive", "--self-hosted-cd"] });
+  eq("V9 bin/init.mjs --self-hosted-cd without --force preserved custom cd-selfhosted.yml", readFileSync(join(tmpTricky, ".github", "workflows", "cd-selfhosted.yml"), "utf8"), customCdText);
+  ok("V9 bin/init.mjs logged preservation message", /kept existing \.github\/workflows\/cd-selfhosted\.yml/.test(initNoForce.out));
+
+  const cliForce = spawnSync(NODE, [join(REPO, ".orca", "ci-generator.mjs"), "--dir", tmpTricky, "--write", "--self-hosted-cd", "--force"], { encoding: "utf8" });
+  eq("V9 ci-generator CLI WITH --force exited 0", cliForce.status, 0);
+  ok("V9 ci-generator CLI WITH --force overwrote cd-selfhosted.yml", readFileSync(join(tmpTricky, ".github", "workflows", "cd-selfhosted.yml"), "utf8").includes("docker-compose.prod.yml"));
+
+  // 5) P1-12: Gitea PR Risk Summary API call restored & verified end-to-end against mock Gitea + TokenHub server!
+  ok("V9 bundled .gitea/workflows/ci-release.yml contains Gitea /issues/${prNum}/comments POST", bundledGiteaCi.includes("/issues/${prNum}/comments") && bundledGiteaCi.includes("token ${giteaToken}"));
+
+  const giteaHits = [];
+  const mockForgeSrv = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      giteaHits.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: JSON.parse(body || "{}") });
+      if (req.url === "/v1/chat/completions") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: { content: "1) 变更概述：修复 pytest 退出码；2) 风险：低；3) 建议：人工核对。" } }] }));
+        return;
+      }
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ id: 901 }));
+    });
+  });
+  await new Promise((r) => mockForgeSrv.listen(0, "127.0.0.1", r));
+  const forgePort = mockForgeSrv.address().port;
+  try {
+    const tmpGiteaRepo = mkdtempSync(join(tmpdir(), "orca-v9-gitea-"));
+    dirsOfCurrentScenario.push(tmpGiteaRepo);
+    spawnSync("git", ["init", tmpGiteaRepo], { encoding: "utf8" });
+    spawnSync("git", ["-C", tmpGiteaRepo, "config", "user.email", "ci@local"], { encoding: "utf8" });
+    spawnSync("git", ["-C", tmpGiteaRepo, "config", "user.name", "CI"], { encoding: "utf8" });
+    writeFileSync(join(tmpGiteaRepo, "main.py"), "x = 1\n");
+    spawnSync("git", ["-C", tmpGiteaRepo, "add", "."], { encoding: "utf8" });
+    spawnSync("git", ["-C", tmpGiteaRepo, "commit", "-m", "base"], { encoding: "utf8" });
+    const baseSha = spawnSync("git", ["-C", tmpGiteaRepo, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+    writeFileSync(join(tmpGiteaRepo, "main.py"), "x = 2\n");
+    spawnSync("git", ["-C", tmpGiteaRepo, "add", "."], { encoding: "utf8" });
+    spawnSync("git", ["-C", tmpGiteaRepo, "commit", "-m", "head"], { encoding: "utf8" });
+    const headSha = spawnSync("git", ["-C", tmpGiteaRepo, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+
+    const giteaRunScript = extractStepScript(bundledGiteaCi, "Generate Chinese PR Risk Summary via TokenHub API");
+    const execGitea = await new Promise((resolveRun) => {
+      const child = spawn("bash", ["-c", giteaRunScript], {
+        cwd: tmpGiteaRepo,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          TOKENHUB_API_KEY: "th-key-test",
+          TOKENHUB_BASE_URL: `http://127.0.0.1:${forgePort}/v1`,
+          TOKENHUB_MODEL: "DeepSeek-V4.1-Flash-1017",
+          BASE_SHA: baseSha,
+          HEAD_SHA: headSha,
+          GITEA_API_URL: `http://127.0.0.1:${forgePort}/api/v1`,
+          GITEA_TOKEN: "gitea-tok-test",
+          GITHUB_REPOSITORY: "shown1985/sxcj",
+          PR_NUMBER: "3",
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      const killTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 15000);
+      child.stdout.on("data", (d) => (stdout += d));
+      child.stderr.on("data", (d) => (stderr += d));
+      child.on("exit", (status) => {
+        clearTimeout(killTimer);
+        resolveRun({ status, stdout, stderr });
+      });
+    });
+    eq("V9 Gitea PR comment script exited 0", execGitea.status, 0);
+    const commentHit = giteaHits.find((h) => h.url === "/api/v1/repos/shown1985/sxcj/issues/3/comments");
+    ok("V9 Gitea PR comment API received POST with token auth & Chinese summary", Boolean(commentHit && commentHit.method === "POST" && commentHit.auth === "token gitea-tok-test" && commentHit.body.body.includes("TokenHub CI 风险摘要")));
+    ok("V9 Gitea PR comment logged HTTP 201 without leaking token", execGitea.stdout.includes("posted PR risk summary comment to PR #3 (HTTP 201)") && !execGitea.stdout.includes("gitea-tok-test"));
+  } finally {
+    mockForgeSrv.close();
+  }
 });
 
 // ---------------------------------------------------------------------------

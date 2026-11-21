@@ -31,6 +31,7 @@ import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { classifyMergeDanger } from "./merge-danger.mjs";
+import { sanitizeText, sanitizeValue } from "./lib/sanitize.mjs";
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 const SAFE_RUN_KEY_RE = /^[a-zA-Z0-9._-]+$/;
@@ -320,12 +321,15 @@ export function createRunLedger({
       }
     },
 
-    recordIntent({ requestId, stepId, title, agent, model, attempt = 1, worktree = null, branch = null }) {
+    recordIntent({ requestId, stepId, title, agent, model, effort = null, family = null, attempt = 1, worktree = null, branch = null }) {
+      const normModel = model && model !== "default" ? model : "default";
       summary.steps[stepId] = {
         ...(summary.steps[stepId] || {}),
         title,
         agent,
-        model: model || "default",
+        model: normModel,
+        effort: effort || null,
+        family: family || null,
         attempt,
         worktree,
         branch,
@@ -334,7 +338,7 @@ export function createRunLedger({
         turnStart: "unobserved",
         health: "healthy",
       };
-      return append("intent", { requestId, stepId, title, agent, model, attempt, worktree, branch }, { critical: false });
+      return append("intent", { requestId, stepId, title, agent, model: normModel, effort: effort || null, family: family || null, attempt, worktree, branch }, { critical: false });
     },
 
     recordDispatchResult({ requestId, stepId, dispatchId = null, terminal = null, turnStart = "unobserved", state = null }) {
@@ -350,39 +354,62 @@ export function createRunLedger({
       return append("result", { requestId, stepId, dispatchId, terminal, turnStart, state }, { critical: false });
     },
 
-    recordHealth({ stepId, state, turnStart, signals = [], note = null }) {
+    recordWorkerStopped({ stepId, dispatchId = null, terminal = null, agent = null, reason = null }) {
+      const safeReason = reason ? sanitizeText(reason, { maxLen: 240 }) : null;
       const cur = summary.steps[stepId] || {};
-      summary.steps[stepId] = { ...cur, health: state, turnStart: turnStart || cur.turnStart, healthNote: note };
-      summary.health = state;
-      return append("health", { stepId, state, turnStart, signals, note }, { critical: false });
+      summary.steps[stepId] = {
+        ...cur,
+        lastStoppedDispatchId: dispatchId || cur.lastStoppedDispatchId || null,
+      };
+      return append("worker_stopped", { stepId, dispatchId, terminal, agent, reason: safeReason }, { critical: false });
     },
 
-    recordFallback({ stepId, fromAgent, fromModel = null, toAgent, toModel = null, toEffort = null, reason = null, phase = "preflight" }) {
+    recordHealth({ stepId, state, turnStart, signals = [], note = null }) {
+      const safeNote = note ? sanitizeText(note, { maxLen: 260 }) : null;
+      const safeSignals = sanitizeValue(signals, { maxStringLen: 240 });
+      const cur = summary.steps[stepId] || {};
+      summary.steps[stepId] = { ...cur, health: state, turnStart: turnStart || cur.turnStart, healthNote: safeNote };
+      summary.health = state;
+      return append("health", { stepId, state, turnStart, signals: safeSignals, note: safeNote }, { critical: false });
+    },
+
+    recordFallback({ stepId, fromAgent, fromModel = null, toAgent, toModel = null, toEffort = null, toFamily = null, reason = null, phase = "preflight" }) {
+      const safeReason = reason ? sanitizeText(reason, { maxLen: 280 }) : null;
       const entry = {
         ts: new Date().toISOString(),
         stepId,
         phase,
         fromAgent,
-        fromModel: fromModel || "default",
+        fromModel: (fromModel && fromModel !== "default") ? fromModel : "default",
         toAgent,
-        toModel: toModel || "default",
+        toModel: (toModel && toModel !== "default") ? toModel : "default",
         toEffort: toEffort || null,
-        reason: reason || null,
+        toFamily: toFamily || null,
+        reason: safeReason,
       };
       summary.fallbacks.push(entry);
       const cur = summary.steps[stepId] || {};
-      summary.steps[stepId] = { ...cur, agent: toAgent, model: toModel || "default", effort: toEffort || cur.effort || null, fallback: entry };
+      summary.steps[stepId] = {
+        ...cur,
+        agent: toAgent,
+        model: entry.toModel,
+        effort: toEffort || null,
+        family: toFamily || cur.family || null,
+        fallback: entry,
+      };
       return append("fallback", entry, { critical: false });
     },
 
     recordWatchdogEvent({ stepId, kind, action, diagnosis = null, evidence = null }) {
+      const safeDiag = diagnosis ? sanitizeText(diagnosis, { maxLen: 280 }) : null;
+      const safeEv = sanitizeValue(evidence, { maxStringLen: 240 });
       const entry = {
         ts: new Date().toISOString(),
         stepId,
         kind,
         action,
-        diagnosis,
-        evidence,
+        diagnosis: safeDiag,
+        evidence: safeEv,
       };
       summary.watchdogEvents.push(entry);
       if (summary.watchdogEvents.length > 50) summary.watchdogEvents.shift();
@@ -391,31 +418,34 @@ export function createRunLedger({
       return append("watchdog", entry, { critical: false });
     },
 
-    recordIssueLinks({ provider = null, repo = null, epic = null, tasks = [] }) {
+    recordIssueLinks({ provider = null, repo = null, defaultBranch = null, epic = null, tasks = [] }) {
       summary.issues = {
         provider,
         repo,
-        epic: epic ? { number: epic.number, url: epic.url || null, title: epic.title || null } : null,
-        tasks: (tasks || []).map((t) => ({ id: t.id, number: t.number || null, url: t.url || null, title: t.title || null })),
+        defaultBranch: defaultBranch || null,
+        epic: epic ? { number: epic.number, url: epic.url || null, title: sanitizeText(epic.title || "", { maxLen: 160 }) || null } : null,
+        tasks: (tasks || []).map((t) => ({ id: t.id, number: t.number || null, url: t.url || null, title: sanitizeText(t.title || "", { maxLen: 160 }) || null })),
         updatedAt: new Date().toISOString(),
       };
       return append("issue_links", summary.issues, { critical: false });
     },
 
     recordStepSettled({ stepId, outcome, note = null, verifyOk = null, verifyReason = null, contractCommit = null }) {
+      const safeNote = note ? sanitizeText(note, { maxLen: 280 }) : null;
+      const safeVerify = verifyReason ? sanitizeText(verifyReason, { maxLen: 280 }) : null;
       const cur = summary.steps[stepId] || {};
       summary.steps[stepId] = {
         ...cur,
         lifecycle: "settled",
         outcome,
-        note,
+        note: safeNote,
         verifyOk,
-        verifyReason,
+        verifyReason: safeVerify,
       };
       if (contractCommit && FULL_SHA_RE.test(contractCommit)) {
         summary.verifiedContractCommit = contractCommit;
       }
-      return append("step_settled", { stepId, outcome, note, verifyOk, verifyReason, contractCommit }, { critical: false });
+      return append("step_settled", { stepId, outcome, note: safeNote, verifyOk, verifyReason: safeVerify, contractCommit }, { critical: false });
     },
 
     recordAcceptanceLevel(level, { status, evidenceRef, detail = null }) {

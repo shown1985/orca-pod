@@ -122,6 +122,9 @@
       "agent": "codex",
       "model": "default",
       "//recommendedModel": "gpt-6.2-sol (effort: high; ABSOLUTELY NEVER max) or any cross-family senior reviewer",
+      "crossFamilyWith": [
+        "contract-architecture"
+      ],
       "interactive": false,
       "writes": "CONTRACT_REVIEW.md",
       "reads": [
@@ -194,6 +197,11 @@
       "agent": "codex",
       "model": "default",
       "//recommendedModel": "gpt-6.2-sol (effort: high; ABSOLUTELY NEVER max) or any cross-family senior reviewer",
+      "crossFamilyWith": [
+        "contract-architecture",
+        "worker-backend",
+        "worker-frontend"
+      ],
       "interactive": false,
       "writes": "TASK_REVIEW_MERGE.md",
       "reads": [
@@ -266,6 +274,12 @@
       "agent": "codex",
       "model": "default",
       "//recommendedModel": "gpt-6.2-sol (effort: xhigh; ABSOLUTELY NEVER max) or any cross-family senior auditor",
+      "crossFamilyWith": [
+        "contract-architecture",
+        "worker-backend",
+        "worker-frontend",
+        "serial-integration"
+      ],
       "interactive": false,
       "writes": "EPIC_AUDIT.md",
       "reads": [

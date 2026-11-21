@@ -79,6 +79,9 @@
       "agent": "codex",
       "model": "default",
       "//recommendedModel": "gpt-6.2-sol (effort: high; NEVER max) or any cross-family reviewer model",
+      "crossFamilyWith": [
+        "hotfix-coding"
+      ],
       "writes": "HOTFIX_AUDIT.md",
       "reads": [
         "hotfix-coding"

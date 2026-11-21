@@ -37,6 +37,7 @@ const FILES = [
   ".orca/ci-generator.mjs",
   ".orca/ledger.mjs",
   ".orca/lib/orca-cli.mjs",
+  ".orca/lib/sanitize.mjs",
   ".orca/lib/status.mjs",
   ".orca/lib/status-template.html",
   ".orca/lib/usage.mjs",
@@ -86,6 +87,7 @@ const ENGINE_FILES = new Set([
   ".orca/ci-generator.mjs",
   ".orca/ledger.mjs",
   ".orca/lib/orca-cli.mjs",
+  ".orca/lib/sanitize.mjs",
   ".orca/lib/status.mjs",
   ".orca/lib/status-template.html",
   ".orca/lib/usage.mjs",
@@ -138,9 +140,11 @@ if (generateCi && !force && !upgradeEngine && existsSync(".orca/flow.mjs")) {
     writeGiteaCi: false,
     writeSelfHostedCd: selfHostedCd,
     force: true,
+    forceCd: force,
   });
   log(`detected stack: ${res.detection.summary}`);
   for (const f of res.written) log(`  generated   ${f}`);
+  for (const f of res.skipped) log(`  kept existing ${f} (pass --force to overwrite)`);
   process.exit(0);
 }
 
@@ -176,20 +180,24 @@ if (gitignoreAdded) {
 // --- Stack-aware CI/CD tailoring (fresh install or --generate-ci / --self-hosted-cd) ---
 const stackDetect = detectProjectStacks(process.cwd());
 const ciGenerated = [];
+const ciSkipped = [];
 if (generateCi || selfHostedCd || (copied.includes(".github/workflows/ci-release.yml") && stackDetect.hasAny)) {
   const ciRes = generateCiCdFiles(process.cwd(), {
     writeGithubCi: generateCi || copied.includes(".github/workflows/ci-release.yml"),
     writeGiteaCi: copied.includes(".gitea/workflows/ci-release.yml"),
     writeSelfHostedCd: selfHostedCd,
     force: true,
+    forceCd: force,
   });
   ciGenerated.push(...ciRes.written);
+  ciSkipped.push(...ciRes.skipped);
 }
 
 // --- Report ---
 log(`installing into ${process.cwd()}`);
 for (const f of copied) log(`  installed   ${f}`);
 for (const f of skipped) log(`  kept yours  ${f}  (already exists; --force to overwrite)`);
+for (const f of ciSkipped) log(`  kept existing ${f} (pass --force to overwrite)`);
 if (gitignoreAdded) log(`  updated     .gitignore  (+ ${GI_LINE})`);
 if (ciGenerated.length) log(`  tailored CI for stack [${stackDetect.summary}]: ${ciGenerated.join(", ")}`);
 

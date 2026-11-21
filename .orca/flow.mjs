@@ -30,6 +30,7 @@ import {
   createRunLedger,
   acquireRunLock,
   releaseRunLock,
+  listLedgerSummaries,
 } from "./ledger.mjs";
 import { scanLocalAgents, recommendStrategy, formatScanReport } from "./agent-scanner.mjs";
 import { runStrategyWizard } from "./strategy-wizard.mjs";
@@ -108,8 +109,8 @@ const opt = {
   noOpenStatus: false, statusPreview: false, newRun: false,
   allowOneWayMerge: false, dedupKey: null, ledgerHome: null,
   scan: false, setup: false, json: false, yes: false, noOrca: false,
-  issues: false, noIssues: false, epicIssue: null,
-  generateCi: false, selfHostedCd: false,
+  issues: false, noIssues: false, epicIssue: null, defaultBranch: null,
+  generateCi: false, selfHostedCd: false, force: false,
 };
 const rest = [];
 for (let i = 0; i < argv.length; i++) {
@@ -138,8 +139,10 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--issues") opt.issues = true;
   else if (a === "--no-issues") opt.noIssues = true;
   else if (a === "--epic-issue") opt.epicIssue = argv[++i];
+  else if (a === "--default-branch") opt.defaultBranch = argv[++i];
   else if (a === "--generate-ci") opt.generateCi = true;
   else if (a === "--self-hosted-cd") opt.selfHostedCd = true;
+  else if (a === "--force") opt.force = true;
   else if (a === "--agent") {
     const [step, ag] = argv[++i].split("=");
     if (step && ag) opt.agentOverrides[step] = ag;
@@ -172,11 +175,13 @@ if (opt.generateCi) {
     writeGiteaCi: false,
     writeSelfHostedCd: opt.selfHostedCd,
     force: true,
+    forceCd: Boolean(opt.force),
   });
   if (opt.json) console.log(JSON.stringify(res, null, 2));
   else {
     log(`[ci] detected stack: ${res.detection.summary}`);
     for (const f of res.written) log(`[ci] wrote ${f}`);
+    for (const f of res.skipped) log(`[ci] kept existing ${f} (pass --force to overwrite)`);
   }
   process.exit(0);
 }
@@ -369,18 +374,25 @@ if (opt.statusPreview && (objective || opt.only || opt.from || Object.keys(opt.a
 if (opt.statusPreview) statusMgr.runPreviewAndExit(HERE);
 
 let WT_DIR = null;
+let PREV_LEDGER_STEPS = {};
 const ISSUE_CFG = resolveIssueTrackingConfig(cfg, opt);
 let ISSUE_PROVIDER = null;
 let ISSUE_STATE = null;
 const runner = createRunner({
   here: HERE, cfg, opt, objective, configFile: CONFIG_FILE, artDir: ART_DIR, autoRun: AUTO_RUN,
-  targetBranch: TARGET_BRANCH, protectedBranches: PROTECTED_BRANCHES, mergeDangerThresholds: MERGE_DANGER_THRESHOLDS,
+  targetBranch: TARGET_BRANCH, defaultBranch: ISSUE_CFG.defaultBranch || null,
+  protectedBranches: PROTECTED_BRANCHES, mergeDangerThresholds: MERGE_DANGER_THRESHOLDS,
   turnStartWindowMs: TURN_START_WINDOW_MS, turnStartEscalateMs: TURN_START_ESCALATE_MS,
   readinessRetries: READINESS_RETRIES, readinessMinBytes: READINESS_MIN_BYTES,
   allSteps, steps, byId, enabledIds, groups, isParallel,
   agentOf, modelOf, effectiveModel, timeoutOf, nudgeRetriesOf, nudgeTimeoutOf, outPath,
-  orcaClient, statusMgr, notifier, getLedger: () => LEDGER, getWtDir: () => WT_DIR,
-  getIssueState: () => ISSUE_STATE, issueTrackingCfg: ISSUE_CFG,
+  orcaClient, statusMgr, notifier,
+  getLedger: () => LEDGER,
+  getPreviousLedgerSteps: () => PREV_LEDGER_STEPS,
+  getWtDir: () => WT_DIR,
+  getIssueState: () => ISSUE_STATE,
+  getIssueProvider: () => ISSUE_PROVIDER,
+  issueTrackingCfg: ISSUE_CFG,
   isolatedState, preStepTargetRefs: PRE_STEP_TARGET_REFS,
   setLastMergeDanger: (cls) => { LAST_MERGE_DANGER = cls; },
   log, warn, die,
@@ -405,6 +417,14 @@ process.on("SIGTERM", () => cleanupOnSignal("SIGTERM"));
 process.on("exit", () => { if (LOCK_CTX) { try { releaseRunLock(LOCK_CTX); } catch {} LOCK_CTX = null; } });
 
 const initialProtectedShas = snapshotBranchShas(WT_DIR || ".", PROTECTED_BRANCHES);
+if (opt.from || opt.only) {
+  try {
+    const priorSummaries = listLedgerSummaries({ ledgerHome: LEDGER_HOME_CFG, repoDir: WT_DIR || "." });
+    if (priorSummaries.length && priorSummaries[0]?.steps) {
+      PREV_LEDGER_STEPS = priorSummaries[0].steps;
+    }
+  } catch {}
+}
 try {
   LEDGER = createRunLedger({
     runKey: EARLY_RUN_KEY, repoDir: WT_DIR || ".", ledgerHome: LEDGER_HOME_CFG,
@@ -432,25 +452,38 @@ log(`Run: ${runId}`);
 LEDGER.setOrcaRunId(runId);
 statusMgr.initStatus();
 
-// Initialize GitHub/Gitea Issue traceability (auto-enabled when gh/tea & remote available)
+// Initialize GitHub/Gitea Issue traceability (auto-enabled when gh/tea & remote available; strictly isolated on --no-issues)
 const artDirAbs = join(WT_DIR || ".", ART_DIR);
-ISSUE_STATE = loadIssueState(artDirAbs);
 ISSUE_PROVIDER = detectIssueProvider({
   repoDir: WT_DIR || ".",
   mode: ISSUE_CFG.mode,
   providerOverride: ISSUE_CFG.provider,
+  defaultBranchOverride: ISSUE_CFG.defaultBranch,
 });
-if (ISSUE_PROVIDER.enabled) {
+if (ISSUE_CFG.mode === false) {
+  ISSUE_STATE = null;
+} else if (ISSUE_PROVIDER.enabled) {
+  ISSUE_STATE = loadIssueState(artDirAbs, {
+    mode: ISSUE_CFG.mode,
+    provider: ISSUE_PROVIDER.provider,
+    host: ISSUE_PROVIDER.host,
+    repo: ISSUE_PROVIDER.repo,
+    objective,
+    epicIssue: ISSUE_CFG.epicIssue,
+  });
   log(`[issues] enabled (provider=${ISSUE_PROVIDER.provider}${ISSUE_PROVIDER.repo ? `, repo=${ISSUE_PROVIDER.repo}` : ""}${ISSUE_CFG.epicIssue ? `, epic=#${ISSUE_CFG.epicIssue}` : ""})`);
-  if (ISSUE_CFG.epicIssue && !ISSUE_STATE?.epic) {
+  if (ISSUE_CFG.epicIssue && ISSUE_STATE?.epic?.number !== ISSUE_CFG.epicIssue) {
     ISSUE_STATE = syncPlanIssues({
       providerInfo: ISSUE_PROVIDER, config: ISSUE_CFG, repoDir: WT_DIR || ".", artDirAbs,
       objective, stepId: "init", artifactPath: null, log, warn,
     });
     if (ISSUE_STATE) LEDGER?.recordIssueLinks(ISSUE_STATE);
   }
-} else if (ISSUE_CFG.mode === true) {
-  warn(`[issues] issueTracking enabled in config/flags but provider unavailable: ${ISSUE_PROVIDER.reason}`);
+} else {
+  ISSUE_STATE = null;
+  if (ISSUE_CFG.mode === true) {
+    warn(`[issues] issueTracking enabled in config/flags but provider unavailable: ${ISSUE_PROVIDER.reason}`);
+  }
 }
 
 const PLANNING_STEP_IDS = new Set(ISSUE_CFG.planningSteps || ["po-backlog", "micro-plan", "triage-root-cause"]);
@@ -550,6 +583,9 @@ while (gi < groups.length) {
       const next = (groups[gi + 1] || [])[0] || null;
       die(`"${r.step.title}" ${r.note}. Its terminal ${r.terminal || "(dispatch-owned)"} was left OPEN to finish. Watch it; once it reports done and writes ${outPath(r.step.writes)}, continue with:\n  node .orca/flow.mjs --from ${next ? next.id : r.step.id} "<objective>"`);
     }
+    if (r.outcome === "blocked") {
+      die(`"${r.step.title}" BLOCKED${r.note ? `: ${r.note}` : ""}. Resolve the cross-family reviewer availability issue, then re-run with --from ${r.step.id}.`);
+    }
     if (r.outcome !== "failed")
       die(`"${r.step.title}" returned outcome=${r.outcome}${r.note ? ` (${r.note})` : ""}. Not retrying without a definite failure — inspect the terminal/artifacts, then re-run with --from ${r.step.id}.`);
 
@@ -560,7 +596,8 @@ while (gi < groups.length) {
       retriesUsed[key] = (retriesUsed[key] || 0) + 1;
       if (retriesUsed[key] > budget) die(`"${r.step.title}" failed and exhausted ${budget} retries. See ${outPath(r.step.writes)}.`);
       log(`[fail] ${r.step.title} FAILED${r.note ? ` (${r.note})` : ""} -> back to "${byId[gotoId].title}" (attempt ${retriesUsed[key]}/${budget})`);
-      orcaClient.orca(["orchestration", "task-update", "--id", runner.taskIds[gotoId], "--status", "ready", "--result", JSON.stringify({ reason: `fix from ${r.step.id} #${retriesUsed[key]}`, see: outPath(r.step.writes) })]);
+      const reopenRes = orcaClient.orca(["orchestration", "task-update", "--id", runner.taskIds[gotoId], "--status", "ready", "--result", JSON.stringify({ reason: `fix from ${r.step.id} #${retriesUsed[key]}`, see: outPath(r.step.writes) })]);
+      if (!reopenRes.ok) warn(`task-update reopen for "${byId[gotoId].title}" did not confirm: ${reopenRes.stderr || reopenRes.raw}`);
       gi = groups.findIndex((g) => g.some((m) => m.id === gotoId));
       jumped = true;
       break;

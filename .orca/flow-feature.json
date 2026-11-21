@@ -125,6 +125,9 @@
       "agent": "codex",
       "model": "default",
       "//recommendedModel": "gpt-6.2-sol (effort: high; NEVER max) or any cross-family senior reviewer model",
+      "crossFamilyWith": [
+        "coding"
+      ],
       "writes": "REVIEW.md",
       "reads": [
         "micro-plan",

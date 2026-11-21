@@ -9,6 +9,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline";
 import { scanLocalAgents, recommendStrategy, formatScanReport } from "./agent-scanner.mjs";
+import { classifyModelFamily } from "./preflight.mjs";
 import { detectProjectStacks, generateCiCdFiles } from "./ci-generator.mjs";
 
 export const STEP_ROLE_MAP = {
@@ -64,9 +65,39 @@ export function applyStrategyToProject(projectDir, strategy) {
       cfg.defaults.protectedBranches = strategy.protectedBranches;
     }
     if (strategy.fallbackAgent) {
-      cfg.defaults.fallback = typeof strategy.fallbackAgent === "string"
+      // Scope fallback to non-reviewer execution agents (`agentFallbacks`) rather than an
+      // unrestricted global `defaults.fallback` that could let an author/coordinator self-review!
+      delete cfg.defaults.fallback;
+      const fbSpec = typeof strategy.fallbackAgent === "string"
         ? { agent: strategy.fallbackAgent }
         : strategy.fallbackAgent;
+      const agentFallbacks = { ...(cfg.defaults.agentFallbacks || {}) };
+      const coderAg = strategy.roles?.coder;
+      const coderAltAg = strategy.roles?.coderAlt;
+      const coordAg = strategy.roles?.coordinator;
+      const reviewerAg = strategy.roles?.reviewer;
+      for (const ag of [coderAg, coderAltAg, coordAg]) {
+        if (ag && ag !== fbSpec.agent && ag !== reviewerAg) {
+          agentFallbacks[ag] = [fbSpec];
+        }
+      }
+      if (strategy.reviewerFallbackAgent) {
+        const revFb = typeof strategy.reviewerFallbackAgent === "string"
+          ? { agent: strategy.reviewerFallbackAgent }
+          : strategy.reviewerFallbackAgent;
+        const revFbFam = classifyModelFamily(revFb.agent, revFb.model);
+        const authorFams = new Set([
+          classifyModelFamily(coderAg, null),
+          classifyModelFamily(coderAltAg, null),
+          classifyModelFamily(coordAg, null),
+        ].filter(Boolean));
+        if (reviewerAg && revFb.agent !== reviewerAg && (!revFbFam || !authorFams.has(revFbFam))) {
+          agentFallbacks[reviewerAg] = [revFb];
+        }
+      }
+      if (Object.keys(agentFallbacks).length) {
+        cfg.defaults.agentFallbacks = agentFallbacks;
+      }
     }
     if (strategy.issueTrackingMode !== undefined) {
       cfg.defaults.issueTracking = { ...(cfg.defaults.issueTracking || {}), mode: strategy.issueTrackingMode };
@@ -218,6 +249,7 @@ export async function runStrategyWizard({
         writeGiteaCi: false,
         writeSelfHostedCd: wantSelfHostedCd,
         force: true,
+        forceCd: false,
         healthUrl: cdHealthUrl,
       });
       ciGenerated = ciRes.written;

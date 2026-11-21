@@ -2,18 +2,57 @@
 // Stack-aware CI/CD workflow generator for Orca-Pod.
 // Detects project tech stacks (Python, Node/Vue/React/Vite, Go, Rust, Docker Compose)
 // including hybrid/monorepo layouts (e.g. backend/ + frontend/), generates executable
-// GitHub Actions / Gitea Actions CI workflows, and optionally generates a private/intranet
-// Self-Hosted Runner CD workflow (outbound HTTPS polling, zero public SSH, automated
-// post-deploy health check). Zero external dependencies (Node >= 18).
+// GitHub Actions / Gitea Actions CI workflows with strict exit codes, least-privilege
+// permissions, safe YAML scalar serialization & unique job IDs, and optionally generates
+// a PII-safe intranet Self-Hosted Runner CD workflow (preserving existing cd-selfhosted.yml
+// unless --force is explicitly passed). Zero external dependencies (Node >= 18).
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SKIP_DIRS = new Set([
   ".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
   ".orca", ".github", ".gitea", ".next", ".nuxt", "target", "vendor", "coverage",
 ]);
+
+const PROD_COMPOSE_NAMES = [
+  "docker-compose.prod.yml",
+  "docker-compose.prod.yaml",
+  "compose.prod.yml",
+  "compose.prod.yaml",
+];
+
+const DEV_COMPOSE_NAMES = [
+  "docker-compose.yml",
+  "docker-compose.yaml",
+  "compose.yml",
+  "compose.yaml",
+];
+
+const ALL_COMPOSE_NAMES = [...PROD_COMPOSE_NAMES, ...DEV_COMPOSE_NAMES];
+const SAFE_SIMPLE_TOKEN_RE = /^[A-Za-z0-9._/-]+$/;
+
+/**
+ * Serialize any scalar value safely for YAML 1.2 (handles colons, spaces, quotes,
+ * brackets, leading special chars, and strips newlines).
+ */
+export function yamlScalar(val) {
+  const s = String(val ?? "").replace(/\r?\n/g, " ");
+  return JSON.stringify(s);
+}
+
+function yamlTokenOrQuoted(val) {
+  const s = String(val ?? "").trim();
+  if (s && /^[A-Za-z0-9._-]+$/.test(s) && !/^(?:true|false|null|yes|no|on|off|~)$/i.test(s)) {
+    return s;
+  }
+  return yamlScalar(s);
+}
+
+function yamlCommentText(val) {
+  return String(val ?? "").replace(/[\r\n]+/g, " ").trim();
+}
 
 function readJsonSafe(p) {
   try { return JSON.parse(readFileSync(p, "utf8")); } catch { return null; }
@@ -60,15 +99,18 @@ function detectPythonInDir(projectDir, relDir) {
   const pytestIni = existsSync(join(abs, "pytest.ini"));
   if (!pyproject && !reqTxt && !setupPy && !pipfile && !pytestIni) return null;
 
+  const pyprojectText = pyproject ? readTextSafe(join(abs, "pyproject.toml")) : "";
   const pyContent = [
-    pyproject ? readTextSafe(join(abs, "pyproject.toml")) : "",
+    pyprojectText,
     reqTxt ? readTextSafe(join(abs, "requirements.txt")) : "",
     reqDev ? readTextSafe(join(abs, "requirements-dev.txt")) : "",
   ].join("\n");
 
   const hasUv = existsSync(join(abs, "uv.lock")) || /\[tool\.uv\]/.test(pyContent);
+  const hasUvLock = existsSync(join(abs, "uv.lock"));
   const hasPoetry = existsSync(join(abs, "poetry.lock")) || /\[tool\.poetry\]/.test(pyContent);
   const hasPytest = pytestIni || existsSync(join(abs, "tests")) || existsSync(join(abs, "test")) || /\bpytest\b/i.test(pyContent);
+  const hasDevExtra = /\[project\.optional-dependencies\][\s\S]*?^\s*dev\s*=/m.test(pyprojectText);
   const hasRuff = existsSync(join(abs, "ruff.toml")) || existsSync(join(abs, ".ruff.toml")) || /\bruff\b/i.test(pyContent);
   const hasFlake8 = existsSync(join(abs, ".flake8")) || /\bflake8\b/i.test(pyContent);
   const hasFastapi = /\bfastapi\b/i.test(pyContent);
@@ -83,7 +125,9 @@ function detectPythonInDir(projectDir, relDir) {
     dir: relDir,
     packageManager: hasUv ? "uv" : hasPoetry ? "poetry" : "pip",
     pythonVersion,
+    hasUvLock,
     hasPyproject: pyproject,
+    hasDevExtra,
     hasRequirements: reqTxt,
     hasRequirementsDev: reqDev,
     hasPytest,
@@ -129,7 +173,9 @@ function detectNodeInDir(projectDir, relDir) {
     hasLockfile:
       existsSync(join(abs, "package-lock.json")) ||
       existsSync(join(abs, "pnpm-lock.yaml")) ||
-      existsSync(join(abs, "yarn.lock")),
+      existsSync(join(abs, "yarn.lock")) ||
+      existsSync(join(projectDir, "pnpm-lock.yaml")) ||
+      existsSync(join(projectDir, "yarn.lock")),
     scripts: {
       lint: Boolean(scripts.lint),
       typecheck: Boolean(scripts.typecheck || scripts["type-check"]),
@@ -163,10 +209,21 @@ export function detectProjectStacks(projectDir = process.cwd()) {
   const go = [];
   const rust = [];
   const dockerfiles = [];
-  let composeFile = null;
+  let prodComposeFile = null;
+  let devComposeFile = null;
+  const composeFiles = [];
 
-  for (const name of ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"]) {
-    if (existsSync(join(projectDir, name))) { composeFile = name; break; }
+  for (const name of PROD_COMPOSE_NAMES) {
+    if (existsSync(join(projectDir, name))) {
+      if (!prodComposeFile) prodComposeFile = name;
+      composeFiles.push(name);
+    }
+  }
+  for (const name of DEV_COMPOSE_NAMES) {
+    if (existsSync(join(projectDir, name))) {
+      if (!devComposeFile) devComposeFile = name;
+      composeFiles.push(name);
+    }
   }
 
   for (const rel of dirs) {
@@ -182,12 +239,27 @@ export function detectProjectStacks(projectDir = process.cwd()) {
     if (existsSync(join(abs, "Dockerfile"))) {
       dockerfiles.push(rel === "." ? "Dockerfile" : `${rel}/Dockerfile`);
     }
-    if (!composeFile && rel !== ".") {
-      for (const name of ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"]) {
-        if (existsSync(join(abs, name))) { composeFile = `${rel}/${name}`; break; }
+    if (rel !== ".") {
+      for (const name of PROD_COMPOSE_NAMES) {
+        if (existsSync(join(abs, name))) {
+          const p = `${rel}/${name}`;
+          if (!prodComposeFile) prodComposeFile = p;
+          composeFiles.push(p);
+        }
+      }
+      for (const name of DEV_COMPOSE_NAMES) {
+        if (existsSync(join(abs, name))) {
+          const p = `${rel}/${name}`;
+          if (!devComposeFile) devComposeFile = p;
+          composeFiles.push(p);
+        }
       }
     }
   }
+
+  // Prioritize docker-compose.prod.yml / compose.prod.yml over dev compose files
+  const composeFile = prodComposeFile || devComposeFile || null;
+  const cdComposeFile = prodComposeFile || devComposeFile || null;
 
   const parts = [];
   for (const p of python) parts.push(`Python(${p.dir === "." ? "root" : p.dir}${p.frameworks.length ? ":" + p.frameworks.join("+") : ""})`);
@@ -204,57 +276,98 @@ export function detectProjectStacks(projectDir = process.cwd()) {
     go,
     rust,
     dockerfiles,
+    prodComposeFile,
+    devComposeFile,
+    cdComposeFile,
     composeFile,
+    composeFiles: [...new Set(composeFiles)],
     hasAny: python.length + node.length + go.length + rust.length + dockerfiles.length + (composeFile ? 1 : 0) > 0,
     summary: parts.length ? parts.join(" + ") : "Generic (no stack manifest detected yet)",
   };
 }
 
-function safeJobId(prefix, relDir, idx) {
-  if (relDir === ".") return prefix;
-  const slug = relDir.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return `${prefix}-${slug || idx}`;
+export function allocateJobId(prefix, relDir, idx, usedJobIds = new Set()) {
+  let base = prefix;
+  if (relDir !== ".") {
+    const slug = String(relDir || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48)
+      .replace(/-+$/g, "");
+    base = `${prefix}-${slug || idx}`;
+  }
+  let candidate = base;
+  let suffix = 2;
+  while (usedJobIds.has(candidate)) {
+    candidate = `${base}-${suffix++}`;
+  }
+  usedJobIds.add(candidate);
+  return candidate;
 }
 
-function renderPythonJob(py, idx) {
-  const jobId = safeJobId("verify-python", py.dir, idx);
-  const wd = py.dir === "." ? "" : `\n    defaults:\n      run:\n        working-directory: ${py.dir}`;
-  const label = py.dir === "." ? "Python" : `Python (${py.dir})`;
+function renderWorkingDirDefaults(dir) {
+  if (!dir || dir === ".") return "";
+  return `\n    defaults:\n      run:\n        working-directory: ${yamlScalar(dir)}`;
+}
 
-  const installLines = [];
+function renderPythonJob(py, idx, usedJobIds) {
+  const jobId = allocateJobId("verify-python", py.dir, idx, usedJobIds);
+  const wd = renderWorkingDirDefaults(py.dir);
+  const label = py.dir === "." ? "Verify Python" : `Verify Python (${py.dir})`;
+
+  // Never swallow dependency install failures!
+  const installLines = ["set -euo pipefail"];
   if (py.packageManager === "uv") {
-    installLines.push("pip install uv", "uv sync --frozen || uv sync");
+    installLines.push(
+      "python -m pip install uv",
+      py.hasUvLock ? "uv sync --frozen" : "uv sync"
+    );
   } else if (py.packageManager === "poetry") {
-    installLines.push("pip install poetry", "poetry install --no-interaction");
+    installLines.push("python -m pip install poetry", "poetry install --no-interaction");
   } else {
     installLines.push("python -m pip install --upgrade pip");
-    if (py.hasRequirements) installLines.push("pip install -r requirements.txt");
-    if (py.hasRequirementsDev) installLines.push("pip install -r requirements-dev.txt");
-    if (py.hasPyproject && !py.hasRequirements) installLines.push("pip install -e '.[dev]' || pip install -e .");
-    if (py.hasPytest && !py.hasRequirementsDev) installLines.push("python -c 'import pytest' 2>/dev/null || pip install pytest");
+    if (py.hasRequirements) installLines.push("python -m pip install -r requirements.txt");
+    if (py.hasRequirementsDev) installLines.push("python -m pip install -r requirements-dev.txt");
+    if (py.hasPyproject && !py.hasRequirements) {
+      installLines.push(py.hasDevExtra ? "python -m pip install -e '.[dev]'" : "python -m pip install -e .");
+    }
+    if (py.hasPytest && !py.hasRequirementsDev) {
+      installLines.push("if ! python -c \"import pytest\" >/dev/null 2>&1; then python -m pip install pytest; fi");
+    }
   }
 
   const runPrefix = py.packageManager === "uv" ? "uv run " : py.packageManager === "poetry" ? "poetry run " : "";
-  const testLines = [];
+  // Never swallow pytest or unittest failures with `|| compileall` or `|| true`!
+  const testLines = ["set -euo pipefail"];
   if (py.hasRuff) testLines.push(`${runPrefix}ruff check .`);
   else if (py.hasFlake8) testLines.push(`${runPrefix}flake8 .`);
-  if (py.hasPytest) testLines.push(`${runPrefix}pytest -q`);
-  else testLines.push("python -m compileall -q .", "python -m unittest discover -q || true");
+  if (py.hasPytest) {
+    testLines.push(`${runPrefix}pytest -q`);
+  } else {
+    testLines.push(
+      "python -m compileall -q .",
+      "if find . -maxdepth 4 \\( -name 'test_*.py' -o -name '*_test.py' \\) | grep -q .; then",
+      "  python -m unittest discover -q",
+      "fi"
+    );
+  }
 
   const yaml = [
     `  ${jobId}:`,
-    `    name: Verify ${label}`,
+    `    name: ${yamlScalar(label)}`,
     `    runs-on: ubuntu-latest${wd}`,
     `    steps:`,
     `      - name: Checkout repository`,
     `        uses: actions/checkout@v4`,
     `        with:`,
     `          fetch-depth: 0`,
+    `          persist-credentials: false`,
     ``,
     `      - name: Setup Python ${py.pythonVersion}`,
     `        uses: actions/setup-python@v5`,
     `        with:`,
-    `          python-version: "${py.pythonVersion}"`,
+    `          python-version: ${yamlScalar(py.pythonVersion)}`,
     `          cache: "pip"`,
     ``,
     `      - name: Install Python dependencies`,
@@ -269,52 +382,53 @@ function renderPythonJob(py, idx) {
   return { jobId, yaml };
 }
 
-function renderNodeJob(nd, idx) {
-  const jobId = safeJobId("verify-node", nd.dir, idx);
-  const wd = nd.dir === "." ? "" : `\n    defaults:\n      run:\n        working-directory: ${nd.dir}`;
-  const label = nd.dir === "." ? "Node" : `Node (${nd.dir})`;
+function renderNodeJob(nd, idx, usedJobIds) {
+  const jobId = allocateJobId("verify-node", nd.dir, idx, usedJobIds);
+  const wd = renderWorkingDirDefaults(nd.dir);
+  const label = nd.dir === "." ? "Verify Node" : `Verify Node (${nd.dir})`;
   const pm = nd.packageManager;
 
-  const setupExtra = pm === "pnpm"
+  const setupExtra = (pm === "pnpm" || pm === "yarn")
     ? [
       ``,
-      `      - name: Enable pnpm`,
+      `      - name: Enable Corepack (${pm})`,
       `        run: corepack enable`,
     ]
     : [];
 
   const installCmd = pm === "pnpm"
-    ? "pnpm install --frozen-lockfile || pnpm install"
+    ? (nd.hasLockfile ? "pnpm install --frozen-lockfile" : "pnpm install")
     : pm === "yarn"
-      ? "yarn install --frozen-lockfile || yarn install"
+      ? (nd.hasLockfile ? "yarn install --frozen-lockfile" : "yarn install")
       : pm === "bun"
         ? "bun install"
         : (nd.hasLockfile ? "npm ci" : "npm install");
 
   const runCmd = (script) => pm === "pnpm" ? `pnpm run ${script}` : pm === "yarn" ? `yarn ${script}` : pm === "bun" ? `bun run ${script}` : `npm run ${script}`;
-  const testLines = [];
+  const testLines = ["set -euo pipefail"];
   if (nd.scripts.lint) testLines.push(runCmd("lint"));
   if (nd.scripts.typecheck) testLines.push(runCmd(nd.scripts.typecheckName || "typecheck"));
   if (nd.scripts.test) testLines.push(pm === "npm" ? "npm test" : runCmd("test"));
   if (nd.scripts.build) testLines.push(runCmd("build"));
-  if (!testLines.length) {
+  if (testLines.length === 1) {
     testLines.push(`${pm} run --if-present lint`, `${pm} run --if-present typecheck`, `${pm} test --if-present`, `${pm} run --if-present build`);
   }
 
   const yaml = [
     `  ${jobId}:`,
-    `    name: Verify ${label}`,
+    `    name: ${yamlScalar(label)}`,
     `    runs-on: ubuntu-latest${wd}`,
     `    steps:`,
     `      - name: Checkout repository`,
     `        uses: actions/checkout@v4`,
     `        with:`,
     `          fetch-depth: 0`,
+    `          persist-credentials: false`,
     ``,
     `      - name: Setup Node.js ${nd.nodeVersion}`,
     `        uses: actions/setup-node@v4`,
     `        with:`,
-    `          node-version: "${nd.nodeVersion}"`,
+    `          node-version: ${yamlScalar(nd.nodeVersion)}`,
     ...setupExtra,
     ``,
     `      - name: Install dependencies`,
@@ -328,130 +442,300 @@ function renderNodeJob(nd, idx) {
   return { jobId, yaml };
 }
 
-function renderGoJob(g, idx) {
-  const jobId = safeJobId("verify-go", g.dir, idx);
-  const wd = g.dir === "." ? "" : `\n    defaults:\n      run:\n        working-directory: ${g.dir}`;
+function renderGoJob(g, idx, usedJobIds) {
+  const jobId = allocateJobId("verify-go", g.dir, idx, usedJobIds);
+  const wd = renderWorkingDirDefaults(g.dir);
+  const label = g.dir === "." ? "Verify Go" : `Verify Go (${g.dir})`;
   const yaml = [
     `  ${jobId}:`,
-    `    name: Verify Go${g.dir === "." ? "" : ` (${g.dir})`}`,
+    `    name: ${yamlScalar(label)}`,
     `    runs-on: ubuntu-latest${wd}`,
     `    steps:`,
-    `      - uses: actions/checkout@v4`,
-    `      - uses: actions/setup-go@v5`,
+    `      - name: Checkout repository`,
+    `        uses: actions/checkout@v4`,
     `        with:`,
-    `          go-version: "${g.goVersion}"`,
+    `          persist-credentials: false`,
+    `      - name: Setup Go ${g.goVersion}`,
+    `        uses: actions/setup-go@v5`,
+    `        with:`,
+    `          go-version: ${yamlScalar(g.goVersion)}`,
     `      - name: Vet & Test`,
     `        run: |`,
+    `          set -euo pipefail`,
     `          go vet ./...`,
     `          go test -race ./...`,
   ].join("\n");
   return { jobId, yaml };
 }
 
-function renderRustJob(rs, idx) {
-  const jobId = safeJobId("verify-rust", rs.dir, idx);
-  const wd = rs.dir === "." ? "" : `\n    defaults:\n      run:\n        working-directory: ${rs.dir}`;
+function renderRustJob(rs, idx, usedJobIds) {
+  const jobId = allocateJobId("verify-rust", rs.dir, idx, usedJobIds);
+  const wd = renderWorkingDirDefaults(rs.dir);
+  const label = rs.dir === "." ? "Verify Rust" : `Verify Rust (${rs.dir})`;
   const yaml = [
     `  ${jobId}:`,
-    `    name: Verify Rust${rs.dir === "." ? "" : ` (${rs.dir})`}`,
+    `    name: ${yamlScalar(label)}`,
     `    runs-on: ubuntu-latest${wd}`,
     `    steps:`,
-    `      - uses: actions/checkout@v4`,
+    `      - name: Checkout repository`,
+    `        uses: actions/checkout@v4`,
+    `        with:`,
+    `          persist-credentials: false`,
     `      - name: Clippy & Test`,
     `        run: |`,
+    `          set -euo pipefail`,
     `          cargo clippy --all-targets -- -D warnings`,
     `          cargo test`,
   ].join("\n");
   return { jobId, yaml };
 }
 
-function renderDockerJob(detection) {
+function renderDockerJob(detection, usedJobIds) {
+  const jobId = allocateJobId("verify-docker", ".", 0, usedJobIds);
   const steps = [
     `      - name: Checkout repository`,
     `        uses: actions/checkout@v4`,
+    `        with:`,
+    `          persist-credentials: false`,
   ];
-  if (detection.composeFile) {
+  const composeTargets = detection.composeFiles?.length
+    ? detection.composeFiles
+    : (detection.composeFile ? [detection.composeFile] : []);
+
+  for (const cf of composeTargets) {
+    const runLine = SAFE_SIMPLE_TOKEN_RE.test(cf)
+      ? `docker compose -f "${cf}" config --quiet`
+      : `docker compose -f "$COMPOSE_FILE" config --quiet`;
     steps.push(
       ``,
-      `      - name: Validate Docker Compose schema (${detection.composeFile})`,
-      `        run: docker compose -f "${detection.composeFile}" config --quiet`
+      `      - name: ${yamlScalar(`Validate Docker Compose schema (${cf})`)}`,
+      `        env:`,
+      `          COMPOSE_FILE: ${yamlScalar(cf)}`,
+      `        run: ${runLine}`
     );
   }
   for (const df of detection.dockerfiles) {
     const ctx = dirname(df) === "." ? "." : dirname(df);
     steps.push(
       ``,
-      `      - name: Validate Dockerfile build (${df})`,
-      `        run: docker build --file "${df}" "${ctx}"`
+      `      - name: ${yamlScalar(`Validate Dockerfile build (${df})`)}`,
+      `        env:`,
+      `          DOCKERFILE_PATH: ${yamlScalar(df)}`,
+      `          DOCKER_CONTEXT: ${yamlScalar(ctx)}`,
+      `        run: docker build --file "$DOCKERFILE_PATH" "$DOCKER_CONTEXT"`
     );
   }
   const yaml = [
-    `  verify-docker:`,
-    `    name: Verify Docker / Compose`,
+    `  ${jobId}:`,
+    `    name: "Verify Docker / Compose"`,
     `    runs-on: ubuntu-latest`,
     `    steps:`,
     ...steps,
   ].join("\n");
-  return { jobId: "verify-docker", yaml };
+  return { jobId, yaml };
 }
 
-function renderGenericAutoDetectJob() {
+export function renderGenericAutoDetectJob(usedJobIds = new Set()) {
+  const jobId = allocateJobId("verify", ".", 0, usedJobIds);
   const yaml = [
-    `  verify:`,
-    `    name: Auto-Detect Stack Verification (Python / Node / Go / Rust / Docker)`,
+    `  ${jobId}:`,
+    `    name: "Auto-Detect Stack Verification (Python / Node / Go / Rust / Docker)"`,
     `    runs-on: ubuntu-latest`,
     `    steps:`,
     `      - name: Checkout repository`,
     `        uses: actions/checkout@v4`,
     `        with:`,
     `          fetch-depth: 0`,
+    `          persist-credentials: false`,
+    ``,
+    `      - name: Setup Node.js 22`,
+    `        uses: actions/setup-node@v4`,
+    `        with:`,
+    `          node-version: "22"`,
+    ``,
+    `      - name: Setup Python 3.12`,
+    `        uses: actions/setup-python@v5`,
+    `        with:`,
+    `          python-version: "3.12"`,
+    ``,
+    `      - name: Setup Go (when go.mod exists)`,
+    `        if: hashFiles('**/go.mod') != ''`,
+    `        uses: actions/setup-go@v5`,
+    `        with:`,
+    `          go-version: "1.22"`,
     ``,
     `      - name: Verify Node.js projects (root / frontend)`,
     `        run: |`,
+    `          set -euo pipefail`,
     `          for dir in . frontend web client ui; do`,
     `            if [ -f "$dir/package.json" ]; then`,
     `              echo "=== Node verify: $dir ==="`,
-    `              (cd "$dir" && ( [ -f pnpm-lock.yaml ] && corepack enable && pnpm install --frozen-lockfile || ([ -f package-lock.json ] && npm ci || npm install) ) && npm run --if-present lint && npm run --if-present typecheck && npm test --if-present && npm run --if-present build)`,
+    `              (`,
+    `                cd "$dir"`,
+    `                if [ -f pnpm-lock.yaml ]; then`,
+    `                  corepack enable`,
+    `                  pnpm install --frozen-lockfile`,
+    `                  pnpm run --if-present lint`,
+    `                  pnpm run --if-present typecheck`,
+    `                  pnpm test --if-present`,
+    `                  pnpm run --if-present build`,
+    `                elif [ -f yarn.lock ]; then`,
+    `                  corepack enable`,
+    `                  yarn install --frozen-lockfile`,
+    `                  yarn run --if-present lint`,
+    `                  yarn run --if-present typecheck`,
+    `                  yarn test --if-present`,
+    `                  yarn run --if-present build`,
+    `                elif [ -f package-lock.json ]; then`,
+    `                  npm ci`,
+    `                  npm run --if-present lint`,
+    `                  npm run --if-present typecheck`,
+    `                  npm test --if-present`,
+    `                  npm run --if-present build`,
+    `                else`,
+    `                  npm install`,
+    `                  npm run --if-present lint`,
+    `                  npm run --if-present typecheck`,
+    `                  npm test --if-present`,
+    `                  npm run --if-present build`,
+    `                fi`,
+    `              )`,
     `            fi`,
     `          done`,
     ``,
     `      - name: Verify Python projects (root / backend)`,
     `        run: |`,
+    `          set -euo pipefail`,
     `          for dir in . backend server api; do`,
     `            if [ -f "$dir/pyproject.toml" ] || [ -f "$dir/requirements.txt" ]; then`,
     `              echo "=== Python verify: $dir ==="`,
-    `              (cd "$dir" && python3 -m pip install --upgrade pip && ([ -f requirements.txt ] && pip install -r requirements.txt || true) && ([ -f requirements-dev.txt ] && pip install -r requirements-dev.txt || true) && (python3 -c 'import pytest' 2>/dev/null && pytest -q || python3 -m compileall -q .))`,
+    `              (`,
+    `                cd "$dir"`,
+    `                python3 -m pip install --upgrade pip`,
+    `                if [ -f requirements.txt ]; then`,
+    `                  python3 -m pip install -r requirements.txt`,
+    `                fi`,
+    `                if [ -f requirements-dev.txt ]; then`,
+    `                  python3 -m pip install -r requirements-dev.txt`,
+    `                elif [ -f pyproject.toml ]; then`,
+    `                  python3 -m pip install -e .`,
+    `                fi`,
+    `                has_py_tests=0`,
+    `                if [ -f pytest.ini ] || [ -d tests ] || [ -d test ] || find . -maxdepth 3 \\( -name 'test_*.py' -o -name '*_test.py' \\) | grep -q .; then`,
+    `                  has_py_tests=1`,
+    `                fi`,
+    `                if python3 -c "import pytest" >/dev/null 2>&1 && { [ "$has_py_tests" -eq 1 ] || grep -qi "pytest" pyproject.toml requirements*.txt 2>/dev/null; }; then`,
+    `                  python3 -m pytest -q`,
+    `                elif [ "$has_py_tests" -eq 1 ]; then`,
+    `                  if grep -qi "pytest" pyproject.toml requirements*.txt 2>/dev/null; then`,
+    `                    python3 -m pip install pytest`,
+    `                    python3 -m pytest -q`,
+    `                  else`,
+    `                    python3 -m unittest discover -q`,
+    `                  fi`,
+    `                else`,
+    `                  echo "No Python test suite configured in $dir; running compileall syntax check"`,
+    `                  python3 -m compileall -q .`,
+    `                fi`,
+    `              )`,
+    `            fi`,
+    `          done`,
+    ``,
+    `      - name: Verify Go projects (if present)`,
+    `        run: |`,
+    `          set -euo pipefail`,
+    `          for dir in . backend server cmd; do`,
+    `            if [ -f "$dir/go.mod" ]; then`,
+    `              echo "=== Go verify: $dir ==="`,
+    `              (cd "$dir" && go vet ./... && go test ./...)`,
+    `            fi`,
+    `          done`,
+    ``,
+    `      - name: Verify Rust projects (if present)`,
+    `        run: |`,
+    `          set -euo pipefail`,
+    `          for dir in . backend server; do`,
+    `            if [ -f "$dir/Cargo.toml" ]; then`,
+    `              echo "=== Rust verify: $dir ==="`,
+    `              (cd "$dir" && cargo check --all-targets && cargo test)`,
     `            fi`,
     `          done`,
     ``,
     `      - name: Validate Docker Compose (if present)`,
     `        run: |`,
-    `          for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do`,
+    `          set -euo pipefail`,
+    `          for f in ${ALL_COMPOSE_NAMES.join(" ")}; do`,
     `            if [ -f "$f" ]; then docker compose -f "$f" config --quiet; fi`,
     `          done`,
   ].join("\n");
-  return { jobId: "verify", yaml };
+  return { jobId, yaml };
 }
 
-function renderTokenHubJob(needsIds, platform = "github") {
+function renderTokenHubJob(needsIds, platform = "github", usedJobIds = new Set()) {
+  const jobId = allocateJobId("tokenhub-pr-review", ".", 0, usedJobIds);
   const needsLine = needsIds.length === 1
     ? `    needs: ${needsIds[0]}`
     : `    needs: [${needsIds.join(", ")}]`;
-  const commentStep = platform === "gitea"
-    ? `            // For Gitea, post comment via API if GITEA_TOKEN is available; otherwise log summary\n            console.log(body);`
-    : `            require("node:fs").writeFileSync("/tmp/pr-summary.md", body);\n            execSync(\`gh pr comment "\${process.env.PR_NUMBER}" --body-file /tmp/pr-summary.md\`, { stdio: "inherit" });`;
+
+  const envExtra = platform === "gitea"
+    ? [
+      `          GITEA_TOKEN: \${{ secrets.GITEA_TOKEN || github.token }}`,
+      `          GITEA_API_URL: \${{ github.api_url }}`,
+      `          GITHUB_REPOSITORY: \${{ github.repository }}`,
+      `          PR_NUMBER: \${{ github.event.pull_request.number }}`,
+    ]
+    : [
+      `          GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}`,
+      `          PR_NUMBER: \${{ github.event.pull_request.number }}`,
+    ];
+
+  const commentLines = platform === "gitea"
+    ? [
+      `            const giteaApi = (process.env.GITEA_API_URL || "").replace(/\\/+$/, "");`,
+      `            const giteaToken = process.env.GITEA_TOKEN || "";`,
+      `            const repoFullName = process.env.GITHUB_REPOSITORY || "";`,
+      `            const prNum = process.env.PR_NUMBER || "";`,
+      `            if (giteaApi && giteaToken && repoFullName && prNum) {`,
+      `              const postResp = await fetch(`,
+      `                \`\${giteaApi}/repos/\${repoFullName}/issues/\${prNum}/comments\`,`,
+      `                {`,
+      `                  method: "POST",`,
+      `                  headers: {`,
+      `                    "Content-Type": "application/json",`,
+      `                    "Authorization": \`token \${giteaToken}\`,`,
+      `                  },`,
+      `                  body: JSON.stringify({ body }),`,
+      `                }`,
+      `              );`,
+      `              if (postResp.ok) {`,
+      `                console.log(\`[tokenhub-gitea] posted PR risk summary comment to PR #\${prNum} (HTTP \${postResp.status})\`);`,
+      `              } else {`,
+      `                console.error(\`[tokenhub-gitea] PR comment API failed: HTTP \${postResp.status}\`);`,
+      `              }`,
+      `            } else {`,
+      `              console.log("[tokenhub-gitea] skipped PR comment API call (missing GITEA_API_URL, GITEA_TOKEN, or PR_NUMBER).");`,
+      `            }`,
+    ]
+    : [
+      `            require("node:fs").writeFileSync("/tmp/pr-summary.md", body);`,
+      `            execSync(\`gh pr comment "\${process.env.PR_NUMBER}" --body-file /tmp/pr-summary.md\`, { stdio: "inherit" });`,
+    ];
 
   return [
-    `  tokenhub-pr-review:`,
-    `    name: Headless PR Risk Summary (TokenHub API)`,
+    `  ${jobId}:`,
+    `    name: "Headless PR Risk Summary (TokenHub API)"`,
     `    if: github.event_name == 'pull_request'`,
     `    runs-on: ubuntu-latest`,
     needsLine,
+    `    permissions:`,
+    `      contents: read`,
+    `      pull-requests: write`,
     `    steps:`,
     `      - name: Checkout PR branch`,
     `        uses: actions/checkout@v4`,
     `        with:`,
     `          fetch-depth: 0`,
+    `          persist-credentials: false`,
     ``,
     `      - name: Generate Chinese PR Risk Summary via TokenHub API`,
     `        env:`,
@@ -460,8 +744,7 @@ function renderTokenHubJob(needsIds, platform = "github") {
     `          TOKENHUB_MODEL: \${{ vars.TOKENHUB_REVIEW_MODEL || 'DeepSeek-V4.1-Flash-1017' }}`,
     `          BASE_SHA: \${{ github.event.pull_request.base.sha }}`,
     `          HEAD_SHA: \${{ github.event.pull_request.head.sha }}`,
-    `          GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}`,
-    `          PR_NUMBER: \${{ github.event.pull_request.number }}`,
+    ...envExtra,
     `        run: |`,
     `          if [ -z "$TOKENHUB_API_KEY" ]; then`,
     `            echo "::notice::TOKENHUB_API_KEY 未配置，跳过无头 PR 风险摘要。"`,
@@ -472,10 +755,13 @@ function renderTokenHubJob(needsIds, platform = "github") {
     `          const apiKey = process.env.TOKENHUB_API_KEY;`,
     `          const baseUrl = process.env.TOKENHUB_BASE_URL.replace(/\\/+$/, "");`,
     `          const model = process.env.TOKENHUB_MODEL;`,
-    `          const diff = execSync(`,
-    `            \`git diff "\${process.env.BASE_SHA}...\${process.env.HEAD_SHA}" -- . ':(exclude)*.lock' ':(exclude)package-lock.json'\`,`,
+    `          const rawDiff = execSync(`,
+    `            \`git diff "\${process.env.BASE_SHA}...\${process.env.HEAD_SHA}" -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)*.pem' ':(exclude).env*'\`,`,
     `            { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }`,
     `          ).slice(0, 40000);`,
+    `          const diff = rawDiff`,
+    `            .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\\s\\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, "[REDACTED_PRIVATE_KEY]")`,
+    `            .replace(/\\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[0-9A-Z]{16})\\b/g, "[REDACTED_TOKEN]");`,
     `          if (!diff.trim()) process.exit(0);`,
     `          (async () => {`,
     `            const resp = await fetch(\`\${baseUrl}/chat/completions\`, {`,
@@ -485,7 +771,7 @@ function renderTokenHubJob(needsIds, platform = "github") {
     `                model,`,
     `                temperature: 0.2,`,
     `                messages: [`,
-    `                  { role: "system", content: "你是无头 CI PR 风险审查助手。请用简洁中文输出：1) 变更概述；2) 潜在风险点（按高/中/低标注）；3) 合并前人工确认建议。控制在 300 字以内。" },`,
+    `                  { role: "system", content: "你是无头 CI PR 风险审查助手。请用简洁中文输出：1) 变更概述；2) 潜在风险点（按高/中/低标注）；3) 合并前人工确认建议。控制在 300 字以内，切勿回显任何密钥或邮箱。" },`,
     `                  { role: "user", content: \`请审查以下 Pull Request Diff：\\n\\n\${diff}\` }`,
     `                ]`,
     `              })`,
@@ -495,7 +781,7 @@ function renderTokenHubJob(needsIds, platform = "github") {
     `            const summary = data?.choices?.[0]?.message?.content?.trim();`,
     `            if (!summary) process.exit(0);`,
     `            const body = \`### 🤖 TokenHub CI 风险摘要（\\\`\${model}\\\`）\\n\\n\${summary}\\n\\n> 注：本摘要由无头 CI 自动生成，最终合并需人工确认。\`;`,
-    commentStep,
+    ...commentLines,
     `          })().catch((e) => console.error("TokenHub review skipped:", e.message));`,
     `          EOF`,
   ].join("\n");
@@ -506,39 +792,40 @@ export function renderCiWorkflow(detection, {
   branches = ["main", "master", "dev"],
   includeTokenHub = true,
 } = {}) {
+  const usedJobIds = new Set();
   const jobs = [];
-  detection.python.forEach((py, i) => jobs.push(renderPythonJob(py, i)));
-  detection.node.forEach((nd, i) => jobs.push(renderNodeJob(nd, i)));
-  detection.go.forEach((g, i) => jobs.push(renderGoJob(g, i)));
-  detection.rust.forEach((rs, i) => jobs.push(renderRustJob(rs, i)));
-  if (detection.composeFile || detection.dockerfiles.length) {
-    jobs.push(renderDockerJob(detection));
+  detection.python.forEach((py, i) => jobs.push(renderPythonJob(py, i, usedJobIds)));
+  detection.node.forEach((nd, i) => jobs.push(renderNodeJob(nd, i, usedJobIds)));
+  detection.go.forEach((g, i) => jobs.push(renderGoJob(g, i, usedJobIds)));
+  detection.rust.forEach((rs, i) => jobs.push(renderRustJob(rs, i, usedJobIds)));
+  if (detection.composeFile || detection.composeFiles?.length || detection.dockerfiles.length) {
+    jobs.push(renderDockerJob(detection, usedJobIds));
   }
   if (!jobs.length) {
-    jobs.push(renderGenericAutoDetectJob());
+    jobs.push(renderGenericAutoDetectJob(usedJobIds));
   }
 
   const jobIds = jobs.map((j) => j.jobId);
+  const branchesYaml = `[${branches.map(yamlTokenOrQuoted).join(", ")}]`;
   const header = [
-    `# Generated by orca-pod ci-generator (stack: ${detection.summary})`,
+    `# Generated by orca-pod ci-generator (stack: ${yamlCommentText(detection.summary)})`,
     `name: CI & PR Verification`,
     ``,
     `on:`,
     `  pull_request:`,
-    `    branches: [${branches.join(", ")}]`,
+    `    branches: ${branchesYaml}`,
     `  push:`,
-    `    branches: [${branches.join(", ")}]`,
+    `    branches: ${branchesYaml}`,
     ``,
     `permissions:`,
     `  contents: read`,
-    `  pull-requests: write`,
     ``,
     `jobs:`,
   ].join("\n");
 
   const bodyParts = jobs.map((j) => j.yaml);
   if (includeTokenHub) {
-    bodyParts.push(renderTokenHubJob(jobIds, platform));
+    bodyParts.push(renderTokenHubJob(jobIds, platform, usedJobIds));
   }
   return `${header}\n${bodyParts.join("\n\n")}\n`;
 }
@@ -549,57 +836,81 @@ export function renderSelfHostedCdWorkflow(detection, {
   healthUrl = "http://127.0.0.1:8000/health",
   deployDir = "",
   serviceName = "",
+  ciWorkflowName = "CI & PR Verification",
 } = {}) {
-  const composeFile = detection?.composeFile || null;
-  const labelsYaml = `[${runnerLabels.join(", ")}]`;
+  // Prioritize docker-compose.prod.yml / compose.prod.yml over dev compose files
+  const composeFile = detection?.cdComposeFile || detection?.composeFile || null;
+  const labelsYaml = `[${runnerLabels.map(yamlTokenOrQuoted).join(", ")}]`;
+  const branchYaml = yamlTokenOrQuoted(deployBranch);
+  const cdEnterLines = deployDir ? [`          cd "$DEPLOY_DIR"`] : [];
 
   const deployStep = composeFile
     ? [
-      `      - name: Deploy with Docker Compose (${composeFile})`,
+      `      - name: ${yamlScalar(`Deploy with Docker Compose (${composeFile})`)}`,
+      `        env:`,
+      `          COMPOSE_FILE: ${yamlScalar(composeFile)}`,
+      ...(deployDir ? [`          DEPLOY_DIR: ${yamlScalar(deployDir)}`] : []),
       `        run: |`,
       `          set -euo pipefail`,
-      `          COMPOSE_FILE="${composeFile}"`,
+      ...cdEnterLines,
+      ...(SAFE_SIMPLE_TOKEN_RE.test(composeFile) ? [`          COMPOSE_FILE="${composeFile}"`] : []),
       `          echo "Building & starting services via $COMPOSE_FILE ..."`,
-      `          docker compose -f "$COMPOSE_FILE" up -d --build --remove-orphans`,
+      `          docker compose -f "$COMPOSE_FILE" up -d --build --remove-orphans --wait --wait-timeout 120`,
       `          docker compose -f "$COMPOSE_FILE" ps`,
     ]
     : [
       `      - name: Run intranet deploy hook`,
+      `        env:`,
+      ...(deployDir ? [`          DEPLOY_DIR: ${yamlScalar(deployDir)}`] : []),
+      ...(serviceName ? [`          SERVICE_NAME: ${yamlScalar(serviceName)}`] : []),
       `        run: |`,
       `          set -euo pipefail`,
+      ...cdEnterLines,
       `          if [ -x ./scripts/deploy.sh ]; then`,
       `            ./scripts/deploy.sh`,
       ...(serviceName
-        ? [`          elif command -v systemctl >/dev/null 2>&1; then`, `            sudo systemctl restart "${serviceName}"`]
+        ? [`          elif command -v systemctl >/dev/null 2>&1 && [ -n "\${SERVICE_NAME:-}" ]; then`, `            sudo systemctl restart "$SERVICE_NAME"`]
         : []),
       `          else`,
-      `            echo "::error::No docker-compose.yml or executable ./scripts/deploy.sh found."`,
+      `            echo "::error::No docker-compose file or executable ./scripts/deploy.sh found."`,
       `            exit 1`,
       `          fi`,
     ];
 
   const healthCheckStep = [
-    `      - name: Post-deploy automated health check`,
+    `      - name: Post-deploy automated health check (PII-safe)`,
     `        env:`,
-    `          HEALTHCHECK_URL: \${{ vars.DEPLOY_HEALTHCHECK_URL || '${healthUrl}' }}`,
+    ...(composeFile ? [`          COMPOSE_FILE: ${yamlScalar(composeFile)}`] : []),
+    ...(deployDir ? [`          DEPLOY_DIR: ${yamlScalar(deployDir)}`] : []),
+    `          DEFAULT_HEALTHCHECK_URL: ${yamlScalar(healthUrl)}`,
+    `          HEALTHCHECK_URL: \${{ vars.DEPLOY_HEALTHCHECK_URL }}`,
     `          HEALTHCHECK_RETRIES: \${{ vars.DEPLOY_HEALTHCHECK_RETRIES || '15' }}`,
     `          HEALTHCHECK_INTERVAL: \${{ vars.DEPLOY_HEALTHCHECK_INTERVAL || '4' }}`,
     `        run: |`,
     `          set -euo pipefail`,
+    ...cdEnterLines,
+    `          TARGET_URL="\${HEALTHCHECK_URL:-$DEFAULT_HEALTHCHECK_URL}"`,
     ...(composeFile
       ? [
-        `          echo "Checking container states..."`,
-        `          if docker compose -f "${composeFile}" ps --status exited --status dead --format json 2>/dev/null | grep -q '"State"'; then`,
-        `            echo "::error::One or more containers exited unexpectedly!"`,
-        `            docker compose -f "${composeFile}" logs --tail=80`,
+        `          echo "Verifying Docker Compose container status (without dumping raw application logs)..."`,
+        `          running_out="$(docker compose -f "$COMPOSE_FILE" ps --status running --format json)"`,
+        `          if [ -z "$running_out" ]; then`,
+        `            echo "::error::No running containers reported by docker compose ps!"`,
+        `            docker compose -f "$COMPOSE_FILE" ps --all`,
+        `            exit 1`,
+        `          fi`,
+        `          unhealthy_out="$(docker compose -f "$COMPOSE_FILE" ps --status exited --status dead --status restarting --format json)"`,
+        `          if [ -n "$unhealthy_out" ]; then`,
+        `            echo "::error::One or more containers exited or are crash-looping! Raw container logs are omitted to protect intranet PII/secrets — inspect directly on host."`,
+        `            docker compose -f "$COMPOSE_FILE" ps --all`,
         `            exit 1`,
         `          fi`,
       ]
       : []),
-    `          echo "Probing $HEALTHCHECK_URL (retries=$HEALTHCHECK_RETRIES, interval=\${HEALTHCHECK_INTERVAL}s)..."`,
+    `          echo "Probing $TARGET_URL (retries=$HEALTHCHECK_RETRIES, interval=\${HEALTHCHECK_INTERVAL}s)..."`,
     `          ok=0`,
     `          for i in $(seq 1 "$HEALTHCHECK_RETRIES"); do`,
-    `            if curl -fsS --max-time 5 "$HEALTHCHECK_URL" >/dev/null 2>&1; then`,
+    `            if curl -fsS --max-time 5 "$TARGET_URL" >/dev/null 2>&1; then`,
     `              echo "Health check PASSED on attempt $i/$HEALTHCHECK_RETRIES"`,
     `              ok=1`,
     `              break`,
@@ -608,18 +919,31 @@ export function renderSelfHostedCdWorkflow(detection, {
     `            sleep "$HEALTHCHECK_INTERVAL"`,
     `          done`,
     `          if [ "$ok" -ne 1 ]; then`,
-    `            echo "::error::Post-deploy health check FAILED for $HEALTHCHECK_URL"`,
-    ...(composeFile ? [`            docker compose -f "${composeFile}" logs --tail=100 || true`] : []),
+    `            echo "::error::Post-deploy health check FAILED for $TARGET_URL. Raw container logs are intentionally NOT printed to GitHub Actions to protect PII/secrets — inspect on intranet host."`,
+    ...(composeFile ? [`            docker compose -f "$COMPOSE_FILE" ps --all || true`] : []),
     `            exit 1`,
     `          fi`,
+    ...(composeFile
+      ? [
+        `          post_exited="$(docker compose -f "$COMPOSE_FILE" ps --status exited --status dead --status restarting --format json)"`,
+        `          if [ -n "$post_exited" ]; then`,
+        `            echo "::error::Container exited immediately after HTTP probe! Inspect logs directly on intranet host."`,
+        `            docker compose -f "$COMPOSE_FILE" ps --all`,
+        `            exit 1`,
+        `          fi`,
+      ]
+      : []),
   ];
 
   const workdirStep = deployDir
     ? [
-      `      - name: Sync checkout to deploy directory (${deployDir})`,
+      `      - name: ${yamlScalar(`Sync checkout to deploy directory (${deployDir})`)}`,
+      `        env:`,
+      `          DEPLOY_DIR: ${yamlScalar(deployDir)}`,
       `        run: |`,
-      `          mkdir -p "${deployDir}"`,
-      `          rsync -a --delete --exclude '.git' --exclude '.env' ./ "${deployDir}/"`,
+      `          set -euo pipefail`,
+      `          mkdir -p "$DEPLOY_DIR"`,
+      `          rsync -a --delete --exclude '.git' --exclude '.env' --exclude '.env.*' ./ "$DEPLOY_DIR/"`,
     ]
     : [];
 
@@ -627,12 +951,15 @@ export function renderSelfHostedCdWorkflow(detection, {
     `# Generated by orca-pod ci-generator — Intranet Self-Hosted Runner CD`,
     `# Architecture: Self-Hosted Runner runs inside your private/home intranet and pulls`,
     `# jobs via OUTBOUND HTTPS (443) only — ZERO public SSH / port forwarding required.`,
+    `# Security/PII: Container stdout logs are NEVER uploaded to cloud Actions logs.`,
     `# Setup on intranet host: Repo Settings -> Actions -> Runners -> New self-hosted runner.`,
     `name: CD — Intranet Self-Hosted Deploy`,
     ``,
     `on:`,
-    `  push:`,
-    `    branches: [${deployBranch}]`,
+    `  workflow_run:`,
+    `    workflows: [${yamlScalar(ciWorkflowName)}]`,
+    `    types: [completed]`,
+    `    branches: [${branchYaml}]`,
     `  workflow_dispatch:`,
     `    inputs:`,
     `      reason:`,
@@ -640,18 +967,44 @@ export function renderSelfHostedCdWorkflow(detection, {
     `        required: false`,
     `        default: "manual trigger"`,
     ``,
+    `permissions:`,
+    `  contents: read`,
+    ``,
     `concurrency:`,
-    `  group: cd-intranet-\${{ github.ref }}`,
+    `  group: ${yamlScalar(`cd-intranet-${deployBranch}`)}`,
     `  cancel-in-progress: false`,
     ``,
     `jobs:`,
     `  deploy-intranet:`,
-    `    name: Deploy to Private/Intranet Host`,
+    `    name: "Deploy to Private/Intranet Host"`,
+    `    if: >-`,
+    `      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||`,
+    `      (github.event_name == 'workflow_dispatch' && github.ref_name == ${yamlScalar(deployBranch).replace(/"/g, "'")})`,
     `    runs-on: ${labelsYaml}`,
     `    timeout-minutes: 20`,
     `    steps:`,
-    `      - name: Checkout target revision`,
+    `      - name: Verify CI gate & allowed target branch`,
+    `        env:`,
+    `          DEPLOY_BRANCH: ${yamlScalar(deployBranch)}`,
+    `          EVENT_NAME: \${{ github.event_name }}`,
+    `          REF_NAME: \${{ github.ref_name }}`,
+    `          CI_CONCLUSION: \${{ github.event.workflow_run.conclusion }}`,
+    `        run: |`,
+    `          set -euo pipefail`,
+    `          if [ "$EVENT_NAME" = "workflow_run" ] && [ "$CI_CONCLUSION" != "success" ]; then`,
+    `            echo "::error::Refusing deploy because upstream CI conclusion=$CI_CONCLUSION"`,
+    `            exit 1`,
+    `          fi`,
+    `          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$REF_NAME" != "$DEPLOY_BRANCH" ]; then`,
+    `            echo "::error::Manual deploy only permitted from $DEPLOY_BRANCH (got $REF_NAME)"`,
+    `            exit 1`,
+    `          fi`,
+    ``,
+    `      - name: Checkout verified revision`,
     `        uses: actions/checkout@v4`,
+    `        with:`,
+    `          ref: \${{ github.event.workflow_run.head_sha || github.sha }}`,
+    `          persist-credentials: false`,
     ...(workdirStep.length ? ["", ...workdirStep] : []),
     ``,
     ...deployStep,
@@ -665,20 +1018,28 @@ export function generateCiCdFiles(projectDir = process.cwd(), {
   writeGithubCi = true,
   writeGiteaCi = false,
   writeSelfHostedCd = false,
-  force = true,
+  force = false,
+  forceCd = undefined,
   branches = ["main", "master", "dev"],
   deployBranch = "main",
   runnerLabels = ["self-hosted", "linux"],
   healthUrl = "http://127.0.0.1:8000/health",
+  deployDir = "",
+  serviceName = "",
   includeTokenHub = true,
 } = {}) {
   const detection = detectProjectStacks(projectDir);
   const written = [];
   const skipped = [];
 
-  const emit = (relPath, content) => {
+  // Preserve hand-hardened `.github/workflows/cd-selfhosted.yml` by default unless
+  // explicit `forceCd: true` (or `force: true` when `forceCd` is omitted) is passed!
+  const allowOverwriteCi = Boolean(force);
+  const allowOverwriteCd = forceCd !== undefined ? Boolean(forceCd) : Boolean(force);
+
+  const emit = (relPath, content, allowOverwrite) => {
     const abs = join(projectDir, relPath);
-    if (existsSync(abs) && !force) {
+    if (existsSync(abs) && !allowOverwrite) {
       skipped.push(relPath);
       return;
     }
@@ -688,13 +1049,17 @@ export function generateCiCdFiles(projectDir = process.cwd(), {
   };
 
   if (writeGithubCi) {
-    emit(".github/workflows/ci-release.yml", renderCiWorkflow(detection, { platform: "github", branches, includeTokenHub }));
+    emit(".github/workflows/ci-release.yml", renderCiWorkflow(detection, { platform: "github", branches, includeTokenHub }), allowOverwriteCi);
   }
   if (writeGiteaCi) {
-    emit(".gitea/workflows/ci-release.yml", renderCiWorkflow(detection, { platform: "gitea", branches, includeTokenHub }));
+    emit(".gitea/workflows/ci-release.yml", renderCiWorkflow(detection, { platform: "gitea", branches, includeTokenHub }), allowOverwriteCi);
   }
   if (writeSelfHostedCd) {
-    emit(".github/workflows/cd-selfhosted.yml", renderSelfHostedCdWorkflow(detection, { deployBranch, runnerLabels, healthUrl }));
+    emit(
+      ".github/workflows/cd-selfhosted.yml",
+      renderSelfHostedCdWorkflow(detection, { deployBranch, runnerLabels, healthUrl, deployDir, serviceName }),
+      allowOverwriteCd
+    );
   }
 
   return { detection, written, skipped };
@@ -711,10 +1076,13 @@ if (isMain) {
   const projectDir = resolve(getFlag("--dir", process.cwd()));
   const asJson = args.includes("--json");
   const doWrite = args.includes("--write");
+  const forceFlag = args.includes("--force");
   const selfHostedCd = args.includes("--self-hosted-cd");
   const gitea = args.includes("--gitea");
   const healthUrl = getFlag("--health-url", "http://127.0.0.1:8000/health");
   const deployBranch = getFlag("--deploy-branch", "main");
+  const deployDir = getFlag("--deploy-dir", "");
+  const serviceName = getFlag("--service-name", "");
   const labelsRaw = getFlag("--runner-labels", "self-hosted,linux");
   const runnerLabels = labelsRaw.split(",").map((s) => s.trim()).filter(Boolean);
 
@@ -724,7 +1092,7 @@ if (isMain) {
     else {
       console.log(`[orca-ci] Project: ${detection.projectDir}`);
       console.log(`[orca-ci] Detected stack: ${detection.summary}`);
-      console.log(`[orca-ci] Run with --write [--self-hosted-cd] to generate workflow YAML(s).`);
+      console.log(`[orca-ci] Run with --write [--self-hosted-cd] [--force] to generate workflow YAML(s).`);
     }
     process.exit(0);
   }
@@ -734,14 +1102,18 @@ if (isMain) {
     writeGiteaCi: gitea,
     writeSelfHostedCd: selfHostedCd,
     force: true,
+    forceCd: forceFlag,
     deployBranch,
     runnerLabels,
     healthUrl,
+    deployDir,
+    serviceName,
   });
   if (asJson) console.log(JSON.stringify(res, null, 2));
   else {
     console.log(`[orca-ci] Detected stack: ${res.detection.summary}`);
     for (const f of res.written) console.log(`[orca-ci] wrote ${f}`);
+    for (const f of res.skipped) console.log(`[orca-ci] kept existing ${f} (pass --force to overwrite)`);
   }
   process.exit(0);
 }

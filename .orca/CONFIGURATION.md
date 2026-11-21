@@ -40,8 +40,8 @@ All pipeline behavior lives in `.orca/flow.config.json` (or any `--config <file>
 | `mergeDanger` | built-in | Threshold overrides (`maxFiles`, `maxLines`, `extraOneWayPatterns`) |
 | `watchdog` | enabled | Activity-aware supervisor: `extendOnActivity`, `stallTimeoutMs`, `loopThreshold`, `maxRuntimeMs`, `fallbackOnGatewayError`, `fallbackOnLoop`, `fallbackOnStall`, `fallbackOnPromptBlocked` |
 | `preflight` | enabled | Pre-dispatch endpoint check: `timeoutMs`, `autoDetectOpencodeEndpoints` (auto-probes localhost `opencode.json` providers like Magpie `127.0.0.1:3425`) |
-| `fallback` / `agentFallbacks` | `null` | Default or per-agent fallback candidate(s) `{ agent, model, effort }` used on preflight failure or Watchdog anomaly |
-| `issueTracking` | `"auto"` | GitHub/Gitea Issue traceability: `mode` (`"auto" \| true \| false`), `provider` (`"auto" \| "gh" \| "tea"`), `epicIssue`, `closeOnPr` |
+| `fallback` / `agentFallbacks` / `reviewerFallbacks` | `null` | Per-agent fallback candidate(s) `{ agent, model, effort }` used on preflight failure or Watchdog anomaly (review gates enforce strict cross-family isolation against upstream authors and never inherit unrestricted global `defaults.fallback`) |
+| `issueTracking` | `"auto"` | GitHub/Gitea Issue traceability: `mode` (`"auto" \| true \| false`), `provider` (`"auto" \| "gh" \| "tea"`), `epicIssue`, `closeOnPr`, `defaultBranch` |
 
 ---
 
@@ -58,6 +58,7 @@ All pipeline behavior lives in `.orca/flow.config.json` (or any `--config <file>
 | `gate` / `interactive` | Manual-mode approval gate / interview protocol (when `autoRun: false`) |
 | `skills` / `mcp` | Arrays of registry names materialized into the step's worktree and restored afterward |
 | `verify` | Hard gate checks: `{ requireVerdict: "PASS", requireContractCommit: true, requireMergedTasks: true, mergeDangerCheck: true }` |
+| `crossFamilyWith` | Array of upstream author step IDs whose actual executed model family must NOT match this review step (even after preflight/runtime fallback) |
 | `fallback` / `fallbacks` / `preflight` | Per-step fallback worker chain (`{ agent, model, effort }`) and preflight endpoint check (`{ tcp, url, timeoutMs }`) |
 | `watchdog` | Per-step Watchdog overrides (e.g. `stallTimeoutMs`, `loopThreshold`, `maxRuntimeMs`) |
 | `spec` | Prompt template supporting `{out}`, `{reads}`, `{tasks}`, `{targetBranch}`, `{protectedBranches}`, `{worktreesManifest}`, `{mergeDangerReport}`, `{epicIssue}`, `{issueRefs}`, `{issueCloses}`, `{issueTraceability}` |
@@ -102,21 +103,22 @@ node .orca/ledger.mjs check-lock --dedup-key <key> --repo .
 
 ---
 
-## 5.5 Watchdog, Fallback, `agy` Trust, Issue Sync & CI/CD Generator (v0.5.0)
+## 5.5 Watchdog, Cross-Family Fallback, `agy` Trust, Issue Sync & CI/CD Generator (v0.5.1)
 
-- **Watchdog**: Active workers making git, file, artifact, or non-looping terminal progress automatically extend their runtime deadline instead of being killed by a fixed 600s cap. Dead-loops, true stalls, interactive/trust prompt blocks (`agent_prompt_blocked`), and gateway disconnects (`ECONNREFUSED`) are diagnosed, recorded in the ledger, and trigger automatic fallback when configured.
-- **Pre-flight & Fallback + `agy` Isolated Worktree Compatibility**: Before dispatching, `preflight.mjs` probes configured TCP/HTTP endpoints (and auto-discovered localhost `opencode.json` gateways such as Magpie `127.0.0.1:3425`) and seamlessly downgrades to the configured fallback worker (e.g. `agy` with `claude-sonnet-5-5` + `medium`), recording the downgrade in the out-of-repo ledger. When launching `agy` / `antigravity` in an isolated worktree, `orca-cli.mjs` automatically injects session-scoped `--settings '{"trustedWorkspaces":["<worktreeDir>"]}'` without mutating global `~/.gemini/antigravity-cli/settings.json`.
-- **GitHub/Gitea Issue + PR Traceability**:
+- **Watchdog & Runtime Boundaries**: Each step distinguishes startup proof (`turnStartWindowMs: 120s`, `turnStartEscalateMs: 600s`), idle warning (`timeoutMs: 900s`), step runtime cap (`hardTimeoutMs: 4 * timeoutMs`), and optional absolute ceiling (`watchdog.maxRuntimeMs`). Active workers making content-hashed git/file, artifact, or non-looping terminal progress automatically extend `hardTimeoutMs` (strictly clamped to `maxRuntimeMs` when `maxRuntimeMs > 0`). Output dead-loops, true stalls, unattended workspace-trust prompts (`agent_prompt_blocked` — distinct from normal `user_approval` human waits), and fresh terminal-tail gateway disconnects (`ECONNREFUSED`) are sanitized, deduplicated, recorded in the ledger, and trigger controlled `worker-stop` + dispatch-fenced fallback.
+- **Pre-flight, Cross-Family Fallback Guard + `agy` Isolated Worktree Compatibility**: Before dispatching, `preflight.mjs` probes configured TCP/HTTP endpoints and OpenCode local gateways (`opencode.json` / `opencode.jsonc` matching the effective model) and seamlessly downgrades to healthy fallbacks while materializing Skills/MCP for the active agent. Review gates (`contract-review`, `task-review-merge`, `senior-audit`, `diff-audit`, `code-review`, `crossFamilyWith`) reject any candidate whose model family matches an upstream author's actual executed family — blocking rather than self-reviewing. When launching `agy` / `antigravity`, `orca-cli.mjs` injects session-scoped `--settings` (`trustedWorkspaces`) without mutating global `~/.gemini/antigravity-cli/settings.json`.
+- **GitHub/Gitea Issue + PR Traceability**: `ISSUES.json` is scoped by forge/repo/objective (`--no-issues` disables loading & prompt injection completely). When `targetBranch` (e.g. `dev`) differs from `defaultBranch` (e.g. `main`), PR steps receive explicit post-merge `gh issue close` guidance since GitHub only auto-closes `Closes #N` on the default branch.
   ```bash
   node .orca/issue-tracker.mjs status
   node .orca/flow.mjs --epic-issue 42 "#feat Continue Epic"
   node .orca/flow.mjs --no-issues "#hotfix Quick local fix"
   ```
-- **Stack-Aware CI & Intranet Self-Hosted Runner CD**:
+- **Stack-Aware CI & PII-Safe Intranet Self-Hosted Runner CD**: Prioritizes `docker-compose.prod.yml` / `compose.prod.yml`, omits raw container logs in CI to protect intranet PII, and **preserves existing `.github/workflows/cd-selfhosted.yml` by default** unless `--force` is explicitly passed:
   ```bash
   node .orca/ci-generator.mjs --detect
   node .orca/ci-generator.mjs --write --self-hosted-cd --health-url http://127.0.0.1:8000/health
-  node .orca/flow.mjs --generate-ci --self-hosted-cd
+  node .orca/ci-generator.mjs --write --self-hosted-cd --force
+  node .orca/flow.mjs --generate-ci --self-hosted-cd [--force]
   ```
 
 ---

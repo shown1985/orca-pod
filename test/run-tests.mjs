@@ -7822,6 +7822,394 @@ return out(0, { result: {} });
 });
 
 // ---------------------------------------------------------------------------
+// V19 — Round 11 Final Hardening Regression Suite (P0-01b TOCTOU closure:
+//       single-FD verify+promote snapshot & bound temp inode identity + post-rename verification)
+// ---------------------------------------------------------------------------
+scenario("V19: Round 11 P0-01b single-FD verify+promote snapshot & bound temp (dev,ino,size,bytes) identity against interleaved file replacement", async () => {
+  const { pathToFileURL } = await import("node:url");
+  const tmpV19 = mkdtempSync(join(tmpdir(), "orca-v19-"));
+  dirsOfCurrentScenario.push(tmpV19);
+
+  const probeScript = join(tmpV19, "v19-fs-race-probe.mjs");
+  const gateVerifyUrl = pathToFileURL(join(REPO, ".orca", "gate-verify.mjs")).href;
+  const wtIsoUrl = pathToFileURL(join(REPO, ".orca", "worktree-isolation.mjs")).href;
+
+  // Runs in a fresh child Node process so `syncBuiltinESMExports()` wraps `node:fs`
+  // BEFORE `.orca/gate-verify.mjs` is evaluated, exercising 100% unmodified production code!
+  writeFileSync(probeScript, `
+import { createRequire } from "node:module";
+import { join, resolve } from "node:path";
+
+const req = createRequire(import.meta.url);
+const fs = req("node:fs");
+const mod = req("node:module");
+
+const origOpenSync = fs.openSync.bind(fs);
+const origReadFileSync = fs.readFileSync.bind(fs);
+const origLstatSync = fs.lstatSync.bind(fs);
+const origRenameSync = fs.renameSync.bind(fs);
+
+const state = {
+  mode: "none",
+  scopedTargetAbs: null,
+  scopedOpenFds: new Set(),
+  scopedOpenCount: 0,
+  swappedAfterScopedRead: false,
+  foreignSourcePath: null,
+  capturedTmpPath: null,
+  attackerTmpSourcePath: null,
+  swappedBeforeLstat: false,
+  swappedBeforeRename: false,
+};
+
+fs.openSync = function patchedOpenSync(p, flags, mode) {
+  const abs = typeof p === "string" ? resolve(p) : null;
+  const fd = origOpenSync(p, flags, mode);
+  if (abs && state.scopedTargetAbs && abs === state.scopedTargetAbs) {
+    state.scopedOpenCount++;
+    state.scopedOpenFds.add(fd);
+  }
+  if (
+    abs &&
+    (state.mode === "swap_before_lstat" || state.mode === "swap_before_rename") &&
+    typeof flags === "number" &&
+    (flags & fs.constants.O_CREAT) !== 0 &&
+    (flags & fs.constants.O_EXCL) !== 0 &&
+    abs.includes(".tmp-")
+  ) {
+    state.capturedTmpPath = abs;
+  }
+  return fd;
+};
+
+fs.readFileSync = function patchedReadFileSync(pOrFd, options) {
+  const res = origReadFileSync(pOrFd, options);
+  if (
+    state.mode === "swap_scoped_after_read" &&
+    typeof pOrFd === "number" &&
+    state.scopedOpenFds.has(pOrFd) &&
+    !state.swappedAfterScopedRead &&
+    state.foreignSourcePath &&
+    state.scopedTargetAbs
+  ) {
+    state.swappedAfterScopedRead = true;
+    origRenameSync(state.foreignSourcePath, state.scopedTargetAbs);
+  }
+  return res;
+};
+
+fs.lstatSync = function patchedLstatSync(p, options) {
+  const abs = typeof p === "string" ? resolve(p) : null;
+  if (
+    state.mode === "swap_before_lstat" &&
+    abs &&
+    state.capturedTmpPath &&
+    abs === state.capturedTmpPath &&
+    !state.swappedBeforeLstat &&
+    state.attackerTmpSourcePath
+  ) {
+    state.swappedBeforeLstat = true;
+    origRenameSync(state.attackerTmpSourcePath, state.capturedTmpPath);
+  }
+  return origLstatSync(p, options);
+};
+
+fs.renameSync = function patchedRenameSync(oldP, newP) {
+  const oldAbs = typeof oldP === "string" ? resolve(oldP) : null;
+  if (
+    state.mode === "swap_before_rename" &&
+    oldAbs &&
+    state.capturedTmpPath &&
+    oldAbs === state.capturedTmpPath &&
+    !state.swappedBeforeRename &&
+    state.attackerTmpSourcePath
+  ) {
+    state.swappedBeforeRename = true;
+    origRenameSync(state.attackerTmpSourcePath, state.capturedTmpPath);
+  }
+  return origRenameSync(oldP, newP);
+};
+
+mod.syncBuiltinESMExports();
+
+const { verifyStepArtifact, writeFileAtomicNoFollow } = await import(${JSON.stringify(gateVerifyUrl)});
+const { bindStepArtifactDispatchClaim } = await import(${JSON.stringify(wtIsoUrl)});
+
+const root = process.argv[2];
+const out = {};
+
+// -------------------------------------------------------------------------
+// Probe 1: Verify/promote interleaved regular-file replacement on scoped path
+// -------------------------------------------------------------------------
+const wt1 = join(root, "wt1");
+const art1 = join(wt1, ".orca", "artifacts");
+fs.mkdirSync(join(art1, ".dispatch-disp-active"), { recursive: true });
+bindStepArtifactDispatchClaim(wt1, ".orca/artifacts", { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } }, {
+  dispatchId: "disp-active",
+  fsEpochMtimeMs: 0,
+  clearedAtMs: 0,
+});
+origOpenSync; // keep ref
+const prevCanon1 = "# Previous Canonical Content\\n";
+fs.writeFileSync(join(art1, "REVIEW.md"), prevCanon1);
+const validPassBody = [
+  "<!-- orca-dispatch: disp-active -->",
+  "# Active Dispatch Gate Review",
+  "",
+  "All checks passed cleanly for disp-active.",
+  "",
+  "VERDICT: PASS",
+  "",
+].join("\\n");
+const foreignFailBody = [
+  "<!-- orca-dispatch: disp-foreign -->",
+  "# Foreign Dispatch Gate Review",
+  "",
+  "Foreign unverified replacement payload!",
+  "",
+  "VERDICT: FAIL",
+  "",
+].join("\\n");
+const scopedPath1 = join(art1, ".dispatch-disp-active", "REVIEW.md");
+const foreignSrc1 = join(root, "foreign-fail.md");
+fs.writeFileSync(scopedPath1, validPassBody);
+fs.writeFileSync(foreignSrc1, foreignFailBody);
+
+state.mode = "swap_scoped_after_read";
+state.scopedTargetAbs = resolve(scopedPath1);
+state.scopedOpenCount = 0;
+state.scopedOpenFds.clear();
+state.swappedAfterScopedRead = false;
+state.foreignSourcePath = foreignSrc1;
+
+const rProbe1 = verifyStepArtifact(
+  { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+  art1,
+  wt1,
+  20,
+  { mode: "settlement", dispatchId: "disp-active", clearedBeforeDispatch: true }
+);
+const firstVerifyOpenCount = state.scopedOpenCount;
+state.mode = "none";
+const canonAfterProbe1 = origReadFileSync(join(art1, "REVIEW.md"), "utf8");
+const scopedAfterProbe1 = origReadFileSync(scopedPath1, "utf8");
+
+// Static follow-up: now that scoped file holds disp-foreign/FAIL, re-running verifyStepArtifact MUST reject and preserve canonical!
+const rStaticForeign = verifyStepArtifact(
+  { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+  art1,
+  wt1,
+  20,
+  { mode: "settlement", dispatchId: "disp-active", clearedBeforeDispatch: true }
+);
+const canonAfterStaticReject = origReadFileSync(join(art1, "REVIEW.md"), "utf8");
+
+out.probe1 = {
+  swappedAfterScopedRead: state.swappedAfterScopedRead,
+  scopedOpenCountDuringFirstVerify: firstVerifyOpenCount,
+  ok: rProbe1.ok,
+  verdict: rProbe1.verdict,
+  canonExactMatchPass: canonAfterProbe1 === validPassBody,
+  canonHasForeign: canonAfterProbe1.includes("disp-foreign") || canonAfterProbe1.includes("VERDICT: FAIL"),
+  scopedWasReplacedOnDisk: scopedAfterProbe1.includes("disp-foreign"),
+  staticForeignRejected: rStaticForeign.ok === false,
+  canonPreservedAfterReject: canonAfterStaticReject === validPassBody,
+};
+
+// -------------------------------------------------------------------------
+// Probe 2a: Temp regular-file inode swap BEFORE pre-rename lstatSync
+// -------------------------------------------------------------------------
+const wt2 = join(root, "wt2");
+const art2 = join(wt2, ".orca", "artifacts");
+fs.mkdirSync(join(art2, ".dispatch-disp-2"), { recursive: true });
+bindStepArtifactDispatchClaim(wt2, ".orca/artifacts", { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } }, {
+  dispatchId: "disp-2",
+  fsEpochMtimeMs: 0,
+  clearedAtMs: 0,
+});
+
+const attackerSrcA = join(root, "attacker-2a.md");
+fs.writeFileSync(attackerSrcA, "ATTACKER_SWAPPED_INODE_2A\\n");
+state.mode = "swap_before_lstat";
+state.capturedTmpPath = null;
+state.swappedBeforeLstat = false;
+state.attackerTmpSourcePath = attackerSrcA;
+
+let direct2aErr = null;
+try {
+  writeFileAtomicNoFollow(wt2, art2, join(art2, "DIRECT.md"), "LEGIT_DIRECT_CONTENT");
+} catch (e) {
+  direct2aErr = e?.message || String(e);
+}
+const direct2aSwapped = state.swappedBeforeLstat;
+const direct2aExists = fs.existsSync(join(art2, "DIRECT.md"));
+
+// Same pre-lstat swap during verifyStepArtifact promotion!
+const attackerSrcA2 = join(root, "attacker-2a-gate.md");
+fs.writeFileSync(attackerSrcA2, "<!-- orca-dispatch: disp-foreign -->\\nATTACKER_GATE_2A\\nVERDICT: FAIL\\n");
+const sentinelCanon2 = "# Protected Canonical 2\\n";
+fs.writeFileSync(join(art2, "REVIEW.md"), sentinelCanon2);
+fs.writeFileSync(join(art2, ".dispatch-disp-2", "REVIEW.md"), [
+  "<!-- orca-dispatch: disp-2 -->",
+  "# Legit Review 2",
+  "",
+  "Detailed review body passing size check.",
+  "",
+  "VERDICT: PASS",
+  "",
+].join("\\n"));
+
+state.mode = "swap_before_lstat";
+state.capturedTmpPath = null;
+state.swappedBeforeLstat = false;
+state.attackerTmpSourcePath = attackerSrcA2;
+
+const rGate2a = verifyStepArtifact(
+  { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+  art2,
+  wt2,
+  20,
+  { mode: "settlement", dispatchId: "disp-2", clearedBeforeDispatch: true }
+);
+state.mode = "none";
+out.probe2a = {
+  directSwapped: direct2aSwapped,
+  directMismatchCaught: /identity mismatch before rename/.test(direct2aErr || ""),
+  directTargetNotCreated: !direct2aExists,
+  gateSwapped: state.swappedBeforeLstat,
+  gateOk: rGate2a.ok,
+  gateReasonMatched: /identity mismatch before rename/.test(rGate2a.reason || ""),
+  canonUntouched: origReadFileSync(join(art2, "REVIEW.md"), "utf8") === sentinelCanon2,
+};
+
+// -------------------------------------------------------------------------
+// Probe 2b: Post-lstat / pre-rename regular-file swap caught by post-rename (dev,ino,bytes) check!
+// -------------------------------------------------------------------------
+const attackerSrcB = join(root, "attacker-2b-post.md");
+fs.writeFileSync(attackerSrcB, "<!-- orca-dispatch: disp-foreign -->\\nATTACKER_POST_LSTAT_SWAP\\nVERDICT: FAIL\\n");
+state.mode = "swap_before_rename";
+state.capturedTmpPath = null;
+state.swappedBeforeRename = false;
+state.attackerTmpSourcePath = attackerSrcB;
+
+const rGate2b = verifyStepArtifact(
+  { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+  art2,
+  wt2,
+  20,
+  { mode: "settlement", dispatchId: "disp-2", clearedBeforeDispatch: true }
+);
+state.mode = "none";
+out.probe2b = {
+  swappedBeforeRename: state.swappedBeforeRename,
+  gateOk: rGate2b.ok,
+  postRenameCaught: /published artifact (identity|content) mismatch after rename/.test(rGate2b.reason || ""),
+};
+
+// -------------------------------------------------------------------------
+// Probe 3: Positive control — clean promotion leaves zero .orca-stage-* dirs
+// -------------------------------------------------------------------------
+const wt3 = join(root, "wt3");
+const art3 = join(wt3, ".orca", "artifacts");
+fs.mkdirSync(join(art3, ".dispatch-disp-3"), { recursive: true });
+bindStepArtifactDispatchClaim(wt3, ".orca/artifacts", { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } }, {
+  dispatchId: "disp-3",
+  fsEpochMtimeMs: 0,
+  clearedAtMs: 0,
+});
+const cleanBody3 = [
+  "<!-- orca-dispatch: disp-3 -->",
+  "# Clean Promotion Check",
+  "",
+  "Everything verified cleanly in Round 11.",
+  "",
+  "VERDICT: PASS",
+  "",
+].join("\\n");
+fs.writeFileSync(join(art3, ".dispatch-disp-3", "REVIEW.md"), cleanBody3);
+const rClean3 = verifyStepArtifact(
+  { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+  art3,
+  wt3,
+  20,
+  { mode: "settlement", dispatchId: "disp-3", clearedBeforeDispatch: true }
+);
+const leftoverStageDirs = fs.readdirSync(art3).filter((n) => n.startsWith(".orca-stage-"));
+out.positive = {
+  ok: rClean3.ok,
+  verdict: rClean3.verdict,
+  canonExactMatch: origReadFileSync(join(art3, "REVIEW.md"), "utf8") === cleanBody3,
+  leftoverStageDirs: leftoverStageDirs.length,
+};
+
+console.log(JSON.stringify(out));
+`);
+
+  const probeRun = await new Promise((resProbe) => {
+    const ch = spawn(NODE, [probeScript, tmpV19], {
+      cwd: REPO,
+      env: { ...process.env, NODE_OPTIONS: "" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    const tmr = setTimeout(() => ch.kill("SIGKILL"), 20000);
+    ch.stdout.on("data", (d) => (out += d));
+    ch.stderr.on("data", (d) => (err += d));
+    ch.on("exit", (code) => {
+      clearTimeout(tmr);
+      resProbe({ code, out, err });
+    });
+  });
+
+  eq("V19 child race probe exited cleanly (code 0)", probeRun.code, 0);
+  const p19 = probeRun.code === 0 ? JSON.parse(probeRun.out.trim().split(/\r?\n/).pop()) : {};
+
+  eq("V19 P0-01b Probe 1: interleaved swap of .dispatch-<id>/REVIEW.md after first read opens scoped file ONCE and promotes exact verified PASS buffer (NEVER foreign FAIL)",
+    p19.probe1,
+    {
+      swappedAfterScopedRead: true,
+      scopedOpenCountDuringFirstVerify: 1,
+      ok: true,
+      verdict: "PASS",
+      canonExactMatchPass: true,
+      canonHasForeign: false,
+      scopedWasReplacedOnDisk: true,
+      staticForeignRejected: true,
+      canonPreservedAfterReject: true,
+    });
+
+  eq("V19 P0-01b Probe 2a: swapping temp regular file (different inode) before pre-rename lstat is REJECTED without renaming or clobbering canonical artifact",
+    p19.probe2a,
+    {
+      directSwapped: true,
+      directMismatchCaught: true,
+      directTargetNotCreated: true,
+      gateSwapped: true,
+      gateOk: false,
+      gateReasonMatched: true,
+      canonUntouched: true,
+    });
+
+  eq("V19 P0-01b Probe 2b: post-lstat/pre-rename inode swap is caught by post-rename (dev,ino,bytes) verification so gate returns ok=false (NEVER false PASS)",
+    p19.probe2b,
+    {
+      swappedBeforeRename: true,
+      gateOk: false,
+      postRenameCaught: true,
+    });
+
+  eq("V19 P0-01b positive control: clean promotion matches verified buffer byte-for-byte and leaves 0 .orca-stage-* directories",
+    p19.positive,
+    {
+      ok: true,
+      verdict: "PASS",
+      canonExactMatch: true,
+      leftoverStageDirs: 0,
+    });
+});
+
+// ---------------------------------------------------------------------------
 (async () => {
   const t0 = Date.now();
   for (const s of scenarios) {

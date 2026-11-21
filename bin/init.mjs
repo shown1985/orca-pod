@@ -6,7 +6,8 @@
 // Usage:
 //   npx /path/to/orca-pod                    # install (existing user files kept safely)
 //   npx github:shown1985/orca-pod            # install directly from GitHub
-//   npx /path/to/orca-pod --force            # overwrite existing files
+//   npx /path/to/orca-pod --upgrade-engine   # refresh engine/runtime files only (preserve custom configs/docs)
+//   npx /path/to/orca-pod --force            # overwrite all existing files
 //
 // Rules:
 //   - explicit whitelist ONLY: the repo's .orca/ also holds dev/runtime junk
@@ -26,6 +27,8 @@ const die = (m) => { console.error("[orca-pod] ERROR:", m); process.exit(1); };
 const FILES = [
   ".orca/flow.mjs",
   ".orca/agent-config.mjs",
+  ".orca/gate-verify.mjs",
+  ".orca/worktree-isolation.mjs",
   ".orca/designer.mjs",
   ".orca/designer.html",
   ".orca/flow.config.json",
@@ -63,7 +66,19 @@ const MERGE_SENSITIVE = new Set([
   ".gitea/workflows/ci-release.yml",
 ]);
 
-const force = process.argv.slice(2).includes("--force");
+const ENGINE_FILES = new Set([
+  ".orca/flow.mjs",
+  ".orca/agent-config.mjs",
+  ".orca/gate-verify.mjs",
+  ".orca/worktree-isolation.mjs",
+  ".orca/designer.mjs",
+  ".orca/designer.html",
+  ".orca/CONFIGURATION.md",
+  ".orca/README.md",
+]);
+const args = process.argv.slice(2);
+const force = args.includes("--force");
+const upgradeEngine = args.includes("--upgrade-engine");
 
 // --- Package sanity: verify every source file exists before touching anything ---
 const missing = FILES.filter((f) => !existsSync(join(KIT_ROOT, f)));
@@ -73,7 +88,7 @@ if (missing.length) die(`corrupt package — missing: ${missing.join(", ")}`);
 const copied = [], skipped = [], mergeHints = [];
 try {
   for (const f of FILES) {
-    if (existsSync(f) && !force) {
+    if (existsSync(f) && !force && !(upgradeEngine && ENGINE_FILES.has(f))) {
       skipped.push(f);
       if (MERGE_SENSITIVE.has(f)) mergeHints.push(f);
       continue;
@@ -99,6 +114,13 @@ log(`installing into ${process.cwd()}`);
 for (const f of copied) log(`  installed   ${f}`);
 for (const f of skipped) log(`  kept yours  ${f}  (already exists; --force to overwrite)`);
 if (gitignoreAdded) log(`  updated     .gitignore  (+ ${GI_LINE})`);
+if (upgradeEngine) {
+  log("");
+  log("Engine upgraded. Review template workflow updates (e.g. isolatedWorktree, verify, targetBranch):");
+  for (const tf of [".orca/flow-epic.json", ".orca/flow-feature.json", ".orca/flow-hotfix.json"]) {
+    log(`  diff -u "${tf}" "${join(KIT_ROOT, tf)}"`);
+  }
+}
 if (mergeHints.length) {
   log("");
   log("Safe merge hint — the following existing files were preserved:");

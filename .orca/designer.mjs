@@ -165,7 +165,7 @@ function apiScaffold(body) {
   const st = dirState(body.dir);
   // NTFS is case-insensitive: normalize case on Windows so a case-mangled
   // path into the kit's own folder cannot bypass the refusal.
-  const norm = (p) => (IS_WIN ? p.toLowerCase() : p);
+  const norm = (p) => (IS_WIN || process.platform === "darwin" ? p.toLowerCase() : p);
   if (norm(st.dir) === norm(ROOT) || norm(st.dir) === norm(HERE) || norm(st.dir + sep).startsWith(norm(HERE) + sep))
     return { status: 400, error: "refusing to scaffold inside the kit's own folder" };
   if (st.hasOrca) return { status: 400, error: `${st.dir} already contains .orca/ — refusing to overwrite` };

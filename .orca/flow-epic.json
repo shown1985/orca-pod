@@ -2,16 +2,15 @@
   "//": "flow-epic.json — Track 2 完整编排通道（#epic / 0->1 新模块 / 跨端重构）。",
   "//usage": "node .orca/flow.mjs --config flow-epic.json \"#epic <史诗需求或 0->1 模块目标>\"",
   "//switch": "切换轨道：Track 0 (--config flow-hotfix.json) | Track 1 (默认 flow.config.json / --config flow-feature.json) | Track 2 (--config flow-epic.json)",
-  "//workflow": "PO Backlog & DAG 拆解 -> 契约先行(Contract Commit: API Schema/TS 类型/DB 迁移/DESIGN.md) -> 无状态并发 Worktree(仅 lint/typecheck/unit-test) -> 有状态串行集成测试 -> Visual Gate -> 跨家族终审 (Max Retry=2 熔断) -> 提 PR 跑 CI + Orca Decision Gate 等待人工确认合并与发布（绝不自动 Merge main）。",
-  "//autoRunNote": "autoRun 设为 false 以启用终点 Orca Decision Gate（pr-ci-gate 的 gate:true）；其余步骤均设为 interactive:false 以保持自动推进，避免无谓阻塞。",
+  "//workflow": "PO Backlog & DAG 拆解 -> 契约 Commit 先行 -> 跨家族契约评审硬门禁(VERDICT: PASS + Contract-Commit == HEAD) -> 独立隔离 Worktree 无状态并发开发(worker-backend ∥ worker-frontend) -> 跨家族 Reviewer 逐分支审查并合并本地 Task Worktree -> 有状态串行集成测试 -> Visual Gate -> 跨家族终审 (Max Retry=2 熔断) -> Reviewer 提 PR 指向 dev 并合并发布（严禁直推或自动合并 main/master）。",
+  "//autoRunNote": "autoRun 设为 false 以支持人工门禁与交互式契约评审；各执行步骤设 interactive:false 以自动推进，核心评审节点均启用引擎级 verify 硬门禁（校验 VERDICT: PASS 与 Contract-Commit SHA）。",
   "//modelNote": "默认 model 均为 \"default\"（沿用各 CLI 自身默认配置，可自由替换为任意闭源或开源模型）。下方为参考推荐组合，如需锁定模型将对应步骤的 model 改为实际模型 ID 即可。",
   "//recommendedModelPool": {
     "contract-architecture (0->1 架构与契约)": "参考：Gemini 4 Carbon (High，禁止开 Low) 或其他旗舰架构推理模型。",
     "po-backlog & visual-gate": "参考：Gemini 4 Neon (Medium，禁止对 Carbon/Neon 开 Low) 或其他多模态协调模型。",
-    "worker-backend & worker-frontend (70% 并发开发)": "参考：DeepSeek-V4.1-Flash-1017 (High；疑难 Bug 可切 Max) 或任意高吞吐开源/闭源编码模型。",
+    "worker-backend & worker-frontend (70% 独立 Worktree 并发开发)": "参考：DeepSeek-V4.1-Flash-1017 (High；疑难 Bug 可切 Max) 或任意高吞吐开源/闭源编码模型。",
     "serial-integration (30% 复杂终端排错/集成调试)": "参考：Kimi K3.1 Pro / Kimi K2.7 Code 或 GLM-5.3 (手动降为 Low/High，严禁放任 GLM-5.3 走默认 Max 卡死并发队列)。",
-    "senior-audit (核心安全与并发终审)": "参考：GPT-6.2 Sol (Xhigh，绝对不要开 Max) 或任意与编码模型不同家族的强审计模型。",
-    "pr-ci-gate (PR 摘要与发布门禁)": "参考：DeepSeek-V4.1-Flash-1017 (Low) 或 Hy4 flash / Gemini 4 Hydrogen (Low/Medium)。",
+    "contract-review / task-review-merge / senior-audit / pr-release-dev (跨家族审查与发布)": "参考：GPT-6.2 Sol (常规 High / 终审 Xhigh，绝对不要开 Max) 或其他跨家族资深审查模型。",
     "ciFallback": "远端无头 CI 审 PR 推荐使用独立 API（如腾讯 TokenHub / 任意 OpenAI 兼容端点），严禁在 CI Runner 中使用个人订阅账号。"
   },
   "artifactsDir": ".orca/artifacts",
@@ -22,6 +21,11 @@
     "gateTimeoutMs": 7200000,
     "worktree": null,
     "autoCreateWorktree": false,
+    "targetBranch": "dev",
+    "protectedBranches": [
+      "main",
+      "master"
+    ],
     "model": "default",
     "readinessRetries": 3,
     "nudgeRetries": 0,
@@ -69,63 +73,123 @@
       "skills": [
         "triage-po"
       ],
-      "spec": "You are a Track 2 (#epic) Product Owner & Orchestration Coordinator. Based on {reads} and the repo, decompose the Epic into concrete Backlog/Issues and an explicit DAG dependency graph in {out}: (1) Contract-First prerequisites (API schemas, TS shared types, DB migrations, DESIGN.md); (2) stateless parallel workstreams (backend vs frontend) with strict file-ownership boundaries; (3) stateful serial integration test scenarios; (4) mechanical acceptance criteria. Do NOT write implementation code."
+      "spec": "You are a Track 2 (#epic) Product Owner & Orchestration Coordinator. Based on {reads} and the repo, decompose the Epic into concrete Backlog/Issues and an explicit DAG dependency graph in {out}: (1) Contract-First prerequisites (API schemas, shared types, DB migrations, DESIGN.md); (2) non-overlapping Backend vs Frontend isolated-worktree task slices with strict file ownership boundaries; (3) serial integration & Playwright visual verification plan; (4) release target branch `{targetBranch}` (NEVER `{protectedBranches}`). Do NOT write production code."
     },
     {
       "id": "contract-architecture",
-      "title": "Contract-First Architecture & Contract Commit",
+      "title": "Contract-First Architecture & Commit",
       "enabled": true,
       "agent": "gemini",
       "model": "default",
-      "//recommendedModel": "gemini-4-carbon (effort: high; never low) or any flagship architect model",
+      "//recommendedModel": "gemini-4-carbon (effort: high; never low)",
       "interactive": false,
-      "writes": "CONTRACT_ARCH.md",
+      "writes": "CONTRACT_ARCHITECTURE.md",
       "reads": [
         "po-backlog"
       ],
       "timeoutMs": 1800000,
       "hardTimeoutMs": 7200000,
-      "spec": "You are a Track 2 Chief Architect. Based on {reads}, execute CONTRACT-FIRST setup: (1) design the module boundaries, data flow, and concurrency/security invariants; (2) author/update the actual frozen contract files in the repo — API Schema (OpenAPI/RPC), shared TypeScript types, database migration files, and DESIGN.md (aligned with Google Stitch export / Open Design MCP); (3) run typecheck/schema validation and create a dedicated Contract Commit (`chore(contract): freeze schemas, types, migrations, and DESIGN.md`) on an epic/<slug> working branch (NEVER commit on main); (4) document the contract commit hash, frozen interfaces, and worker handoff rules in {out}."
+      "spec": "You are a Track 2 Chief Architect. Based on {reads}, execute CONTRACT-FIRST setup: (1) design the module boundaries, data flow, and concurrency/security invariants; (2) author/update the actual frozen contract files in the repo — API Schema (OpenAPI/RPC), shared types/contracts, database migration files, and DESIGN.md; (3) run schema/contract validation tests and create a dedicated Contract Commit (`chore(contract): freeze schemas, types, migrations, and DESIGN.md`) on an `epic/<slug>` working branch (NEVER commit on `{protectedBranches}`); (4) record the FULL 40-char `Contract-Commit: <40-char-sha>` hash, frozen interfaces, and isolated-worker ownership boundaries in {out}. If re-run after a failed contract-review, read CONTRACT_REVIEW.md and resolve every BLOCKER/MAJOR finding before creating a new Contract Commit."
+    },
+    {
+      "id": "contract-review",
+      "title": "Cross-Family Contract Review Gate",
+      "enabled": true,
+      "agent": "codex",
+      "model": "default",
+      "//recommendedModel": "gpt-6.2-sol (effort: high; ABSOLUTELY NEVER max) or any cross-family senior reviewer",
+      "interactive": false,
+      "writes": "CONTRACT_REVIEW.md",
+      "reads": [
+        "po-backlog",
+        "contract-architecture"
+      ],
+      "skills": [
+        "senior-auditor"
+      ],
+      "onFailGoto": "contract-architecture",
+      "maxRetries": 2,
+      "timeoutMs": 1800000,
+      "hardTimeoutMs": 5400000,
+      "verify": {
+        "requireVerdict": "PASS",
+        "requireContractCommit": "HEAD"
+      },
+      "spec": "You are the Track 2 Cross-Family Contract Reviewer. Audit the frozen contracts committed by contract-architecture ({reads}) BEFORE any parallel workers are dispatched. Verify: (1) OpenAPI / RPC schemas, shared types, DB migrations, and DESIGN.md are mutually consistent and parse cleanly; (2) backend vs frontend ownership boundaries have zero overlap; (3) no breaking regressions or security/privacy defects exist in the contracts. Include EXACTLY ONE `Contract-Commit: <full-40-char-HEAD-SHA>` header line matching `git rev-parse HEAD`, list findings by BLOCKER/MAJOR/MINOR, and end {out} with the final non-empty line strictly as `VERDICT: PASS` (zero BLOCKER/MAJOR) or `VERDICT: FAIL` (also report outcome=failed; Max Retry = 2)."
     },
     {
       "id": "worker-backend",
-      "title": "Parallel Worker: Backend (Stateless Checks)",
+      "title": "Isolated Worktree Worker: Backend",
       "enabled": true,
       "agent": "opencode",
       "model": "default",
       "//recommendedModel": "deepseek-v4.1-flash-1017 (effort: high) or any high-throughput coding model",
       "interactive": false,
+      "isolatedWorktree": true,
+      "branchPrefix": "task/",
       "writes": "BACKEND_CHANGES.md",
       "progress": "BACKEND_TASKS.md",
       "reads": [
         "po-backlog",
-        "contract-architecture"
+        "contract-architecture",
+        "contract-review"
       ],
       "onFailGoto": null,
       "hardTimeoutMs": 7200000,
-      "spec": "You are the Track 2 Backend Worker running in a STATELESS PARALLEL group alongside worker-frontend. FIRST ACTION: maintain a live Markdown task checklist in {tasks}. Strictly obey the frozen contracts from {reads} — do NOT modify shared contracts or frontend files. STATELESS CONSTRAINT: run ONLY `lint`, `typecheck`, and `unit-test` (do NOT boot shared DBs, run live migrations, or bind shared server ports during parallel execution). If re-run after failed integration/audit, read INTEGRATION_REPORT.md and EPIC_AUDIT.md and fix all backend findings. Write {out} with changed files, unit-test results, and notes."
+      "spec": "You are the Track 2 Backend Worker running in your OWN physically isolated Git Worktree & task branch (parallel with worker-frontend). FIRST ACTION: maintain a live Markdown task checklist in {tasks}. Strictly obey the verified frozen contracts from {reads} — do NOT modify frozen contract files or frontend files. STATELESS CONSTRAINT: run ONLY `lint`, `typecheck`, and `unit-test` (do NOT boot shared DBs or bind shared server ports during parallel execution). Commit your verified backend changes cleanly on your task branch before finishing. If re-run after failed review/integration/audit, read TASK_REVIEW_MERGE.md, INTEGRATION_REPORT.md, and EPIC_AUDIT.md and fix all backend findings on your task branch. Write {out} with changed files, commit SHA, unit-test results, and notes."
     },
     {
       "id": "worker-frontend",
-      "title": "Parallel Worker: Frontend (Stateless Checks)",
+      "title": "Isolated Worktree Worker: Frontend",
       "enabled": true,
       "agent": "opencode",
       "model": "default",
       "//recommendedModel": "deepseek-v4.1-flash-1017 (effort: high) or any high-throughput coding model",
       "interactive": false,
       "parallelWith": "worker-backend",
+      "isolatedWorktree": true,
+      "branchPrefix": "task/",
       "writes": "FRONTEND_CHANGES.md",
       "progress": "FRONTEND_TASKS.md",
       "reads": [
         "po-backlog",
-        "contract-architecture"
+        "contract-architecture",
+        "contract-review"
       ],
       "skills": [
         "frontend-worker"
       ],
       "onFailGoto": null,
       "hardTimeoutMs": 7200000,
-      "spec": "You are the Track 2 Frontend Worker running in a STATELESS PARALLEL group alongside worker-backend. FIRST ACTION: maintain a live Markdown task checklist in {tasks}. Strictly obey the frozen contracts and DESIGN.md from {reads} — do NOT modify shared contracts or backend files. Implement all 4 UI states (Default/Loading Skeleton/Empty/Error), follow anti-AI-slop rules, and reuse existing components. STATELESS CONSTRAINT: run ONLY `lint`, `typecheck`, and `unit-test` (no live DB or shared port contention). If re-run after failed visual-gate/audit, read VISUAL_GATE.md and EPIC_AUDIT.md and fix all frontend findings. Write {out} with changed files, unit-test results, and Playwright screenshot readiness."
+      "spec": "You are the Track 2 Frontend Worker running in your OWN physically isolated Git Worktree & task branch (parallel with worker-backend). FIRST ACTION: maintain a live Markdown task checklist in {tasks}. Strictly obey the verified frozen contracts and DESIGN.md from {reads} — do NOT modify frozen contract files or backend files. Implement all 4 UI states (Default/Loading Skeleton/Empty/Error), follow anti-AI-slop rules, and reuse existing components. STATELESS CONSTRAINT: run ONLY `lint`, `typecheck`, and `unit-test` (no live DB or shared port contention). Commit your verified frontend changes cleanly on your task branch before finishing. If re-run after failed review/visual-gate/audit, read TASK_REVIEW_MERGE.md, VISUAL_GATE.md, and EPIC_AUDIT.md and fix all frontend findings on your task branch. Write {out} with changed files, commit SHA, unit-test results, and Playwright screenshot readiness."
+    },
+    {
+      "id": "task-review-merge",
+      "title": "Cross-Family Task Review & Local Worktree Merge",
+      "enabled": true,
+      "agent": "codex",
+      "model": "default",
+      "//recommendedModel": "gpt-6.2-sol (effort: high; ABSOLUTELY NEVER max) or any cross-family senior reviewer",
+      "interactive": false,
+      "writes": "TASK_REVIEW_MERGE.md",
+      "reads": [
+        "contract-architecture",
+        "contract-review",
+        "worker-backend",
+        "worker-frontend"
+      ],
+      "skills": [
+        "senior-auditor"
+      ],
+      "onFailGoto": "worker-backend",
+      "maxRetries": 2,
+      "timeoutMs": 1800000,
+      "hardTimeoutMs": 5400000,
+      "verify": {
+        "requireVerdict": "PASS",
+        "requireMergedTasks": true
+      },
+      "spec": "You are the Track 2 Cross-Family Reviewer responsible for reviewing AND locally merging the isolated task worktrees listed in {worktreesManifest} based on {reads}. (1) Inspect each task branch diff against `baseCommit` (frozen contract commit): verify strict contract compliance, zero unauthorized edits to frozen contracts or cross-boundary files, clean commits (`dirty: false`), and passing unit tests; (2) if ANY task branch has a BLOCKER or MAJOR issue (or dirty uncommitted work), do NOT merge — document exact findings per branch in {out}, end with `VERDICT: FAIL`, and report outcome=failed (loops back to parallel workers, Max Retry = 2); (3) if ALL task branches pass review, merge each approved task branch cleanly into the current integration branch (`git merge --no-ff <branch>`) in this integration worktree, verify zero conflicts and clean `git status`, record merged commits in {out}, and end {out} with the final non-empty line strictly as `VERDICT: PASS`."
     },
     {
       "id": "serial-integration",
@@ -138,14 +202,16 @@
       "writes": "INTEGRATION_REPORT.md",
       "reads": [
         "contract-architecture",
-        "worker-backend",
-        "worker-frontend"
+        "task-review-merge"
       ],
       "onFailGoto": "worker-backend",
       "maxRetries": 2,
       "timeoutMs": 1800000,
       "hardTimeoutMs": 5400000,
-      "spec": "You are the Track 2 Stateful Serial Integration Engineer. This is the SINGLE SERIAL node after parallel workers join. Based on {reads}: (1) verify all parallel changes are cleanly integrated on the local epic integration branch with no conflicts; (2) run database migrations, boot the full application services cleanly, and execute end-to-end / integration test suites; (3) capture Playwright screenshots at 1440px desktop and 390px mobile into .orca/artifacts/screenshots/ if UI exists, then tear down test services cleanly; (4) write {out} with commands, logs, and VERDICT: PASS or FAIL (outcome=failed loops back to parallel workers, maxRetries=2)."
+      "verify": {
+        "requireVerdict": "PASS"
+      },
+      "spec": "You are the Track 2 Stateful Serial Integration Engineer. This is the SINGLE SERIAL node after the Reviewer merged all approved task worktrees. Based on {reads}: (1) verify HEAD contains the merged backend + frontend commits cleanly with no conflicts; (2) run database migrations, boot full application services cleanly, and execute end-to-end / integration test suites; (3) capture Playwright screenshots at 1440px desktop and 390px mobile into .orca/artifacts/screenshots/ if UI exists, then tear down test services cleanly; (4) write {out} with commands, logs, and end {out} with the final non-empty line strictly as `VERDICT: PASS` or `VERDICT: FAIL` (also report outcome=failed to loop back, maxRetries=2)."
     },
     {
       "id": "visual-gate",
@@ -164,7 +230,10 @@
       "onFailGoto": "worker-backend",
       "maxRetries": 2,
       "timeoutMs": 900000,
-      "spec": "You are the Track 2 UI/UX Visual Gate Reviewer. Audit Playwright 1440px desktop + 390px mobile screenshots from .orca/artifacts/screenshots/ against DESIGN.md and {reads}. Verify: Stitch/Open-Design token fidelity, restrained whitespace, crisp typography, 1px subtle borders, ZERO AI-slop purple/blue gradients or filler cards, component reuse, and 4-state completeness (Default/Loading Skeleton/Empty/Error). If no UI exists in this Epic, state so and PASS. Write {out} with VERDICT: PASS or FAIL (outcome=failed loops back, maxRetries=2)."
+      "verify": {
+        "requireVerdict": "PASS"
+      },
+      "spec": "You are the Track 2 UI/UX Visual Gate Reviewer. Audit Playwright 1440px desktop + 390px mobile screenshots from .orca/artifacts/screenshots/ against DESIGN.md and {reads}. Verify: Design token fidelity, restrained whitespace, crisp typography, 1px subtle borders, ZERO AI-slop purple/blue gradients or filler cards, component reuse, and 4-state completeness (Default/Loading Skeleton/Empty/Error). If no UI exists in this Epic, state so clearly. Write {out} and end {out} with the final non-empty line strictly as `VERDICT: PASS` or `VERDICT: FAIL` (also report outcome=failed to loop back, maxRetries=2)."
     },
     {
       "id": "senior-audit",
@@ -177,8 +246,7 @@
       "writes": "EPIC_AUDIT.md",
       "reads": [
         "contract-architecture",
-        "worker-backend",
-        "worker-frontend",
+        "task-review-merge",
         "serial-integration",
         "visual-gate"
       ],
@@ -189,27 +257,31 @@
       "maxRetries": 2,
       "timeoutMs": 1800000,
       "hardTimeoutMs": 7200000,
-      "spec": "You are the Track 2 Cross-Family Senior Security & Concurrency Auditor. Perform a deep end-to-end audit of git diff, frozen contracts, concurrency safety, auth/injection/secret security, and test coverage per {reads} and AGENTS.md. Write {out} with BLOCKER/MAJOR/MINOR findings and VERDICT: if any BLOCKER/MAJOR exists, report FAIL (outcome=failed) — hard circuit-breaker Max Retry = 2 (exceeding 2 rounds halts for human intervention); otherwise PASS."
+      "verify": {
+        "requireVerdict": "PASS"
+      },
+      "spec": "You are the Track 2 Cross-Family Senior Security & Concurrency Auditor. Perform a deep end-to-end audit of the integrated git diff against `{targetBranch}`, frozen contracts, concurrency safety, auth/injection/secret security, and test coverage per {reads} and AGENTS.md. Write {out} with BLOCKER/MAJOR/MINOR findings and end {out} with the final non-empty line strictly as `VERDICT: PASS` (zero BLOCKER/MAJOR) or `VERDICT: FAIL` (also report outcome=failed — hard circuit-breaker Max Retry = 2)."
     },
     {
-      "id": "pr-ci-gate",
-      "title": "Open PR, Verify CI & Orca Decision Gate",
+      "id": "pr-release-dev",
+      "title": "Reviewer PR Create & Merge to Target Branch",
       "enabled": true,
-      "agent": "opencode",
+      "agent": "codex",
       "model": "default",
-      "//recommendedModel": "deepseek-v4.1-flash-1017 / hy4-flash / gemini-4-hydrogen (effort: low/medium)",
+      "//recommendedModel": "gpt-6.2-sol (effort: high; NEVER max) or cross-family release reviewer",
       "interactive": false,
-      "gate": true,
+      "gate": false,
       "writes": "EPIC_RELEASE_GATE.md",
       "reads": [
         "po-backlog",
         "contract-architecture",
+        "task-review-merge",
         "serial-integration",
         "visual-gate",
         "senior-audit"
       ],
       "onFailGoto": null,
-      "spec": "You are the Track 2 PR & Release Gate Coordinator. Based on {reads}: (1) verify HEAD is on the epic/<slug> branch (NEVER push directly to main and NEVER auto-merge to main); (2) push the branch (`git push -u origin HEAD`) and open/update the Pull Request targeting main (via `gh pr create` or `tea pr create`, triggering headless CI PR risk summary); (3) check CI status if CLI tooling is authenticated and record PR URL, CI checks, audit verdict, and rollout/rollback checklist in {out}. After this step finishes, Orca Decision Gate (`gate: true`) will pause and wait for explicit human approval before any merge or release."
+      "spec": "You are the Track 2 Cross-Family Release Reviewer. Based on {reads}: (1) verify HEAD is on the `epic/<slug>` integration branch (NEVER push directly to `{protectedBranches}` and NEVER auto-merge into `{protectedBranches}`); (2) verify target branch `{targetBranch}` is NOT in `{protectedBranches}` (if `{targetBranch}` is protected, STOP after opening PR and wait for human approval); (3) push the branch (`git push -u origin HEAD`), create/update the Pull Request targeting `{targetBranch}` (`gh pr create --base {targetBranch}` or `tea pr create --base {targetBranch}`), and verify CI checks & all upstream VERDICT: PASS gates; (4) when `{targetBranch}` is a non-protected release branch such as `dev` and all checks are green, merge the PR into `{targetBranch}` (or perform local fast-forward/no-ff merge to `{targetBranch}` if no remote PR CLI is configured, never touching `{protectedBranches}`), and record PR URL, CI status, merge commit SHA, and rollback checklist in {out}."
     }
   ]
 }

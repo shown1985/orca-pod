@@ -21,7 +21,12 @@
     "readinessRetries": 3,
     "nudgeRetries": 0,
     "nudgeTimeoutMs": 120000,
-    "readinessMinBytes": 200
+    "readinessMinBytes": 200,
+    "targetBranch": "dev",
+    "protectedBranches": [
+      "main",
+      "master"
+    ]
   },
   "skills": {
     "senior-auditor": {
@@ -61,13 +66,16 @@
       "maxRetries": 2,
       "timeoutMs": 900000,
       "hardTimeoutMs": 2700000,
-      "spec": "You are a Track 0 cross-family senior diff auditor. Inspect the git diff and {reads}. Verify strictly: (1) scope <= 3 files and zero contract changes; (2) genuine Red->Green regression test exists and passes; (3) no security regressions, side effects, or test-cheating. Write {out} with severity-grouped findings (BLOCKER/MAJOR/MINOR) and a clear VERDICT at the end: if any BLOCKER/MAJOR exists, report FAIL (outcome=failed) to loop back to hotfix-coding (hard cap Max Retry = 2); otherwise PASS."
+      "spec": "You are a Track 0 cross-family senior diff auditor. Inspect the git diff and {reads}. Verify strictly: (1) scope <= 3 files and zero contract changes; (2) genuine Red->Green regression test exists and passes; (3) no security regressions, side effects, or test-cheating. Write {out} with severity-grouped findings (BLOCKER/MAJOR/MINOR) and a clear VERDICT at the end: if any BLOCKER/MAJOR exists, report FAIL (outcome=failed) to loop back to hotfix-coding (hard cap Max Retry = 2); otherwise PASS. End {out} with the final non-empty line strictly as `VERDICT: PASS` or `VERDICT: FAIL`.",
+      "verify": {
+        "requireVerdict": "PASS"
+      }
     },
     {
       "id": "pr-submit",
       "title": "Unit Test Green & Open PR",
       "enabled": true,
-      "agent": "opencode",
+      "agent": "codex",
       "model": "default",
       "//recommendedModel": "deepseek-v4.1-flash-1017 / hy4-flash / gemini-4-hydrogen (effort: low/medium)",
       "writes": "HOTFIX_PR.md",
@@ -76,7 +84,7 @@
         "diff-audit"
       ],
       "onFailGoto": null,
-      "spec": "You are a Track 0 release assistant. Based on {reads}: (1) re-verify local unit tests are green; (2) ensure HEAD is on a hotfix/<slug> branch (NEVER push directly to main/master and NEVER auto-merge to main); (3) commit clean changes if uncommitted (exclude .orca/artifacts/), push the branch (`git push -u origin HEAD`), and create/update a Pull Request targeting main (using `gh pr create` or `tea pr create` if available, otherwise output the exact PR title/body and CLI command); (4) summarize the PR description and CI trigger status in {out}."
+      "spec": "You are the Track 0 Release Reviewer. Based on {reads}: (1) re-verify local unit tests are green; (2) ensure HEAD is on a `hotfix/<slug>` branch (NEVER push directly to `{protectedBranches}` and NEVER auto-merge into `{protectedBranches}`); (3) commit clean changes if uncommitted (exclude .orca/artifacts/), push (`git push -u origin HEAD`), create/update a Pull Request targeting `{targetBranch}` (`--base {targetBranch}`), and once CI/audit is green on non-protected `{targetBranch}` (e.g. `dev`), merge into `{targetBranch}`; (4) summarize the PR URL, merge commit, and CI status in {out}."
     }
   ]
 }

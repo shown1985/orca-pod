@@ -31,3 +31,21 @@ description: 跨家族资深代码与安全审计规范（面向 GPT-6.2 Sol Hig
 3. **最终裁决（VERDICT）**：
    - 存在任意 `BLOCKER` 或 `MAJOR` → 输出 `VERDICT: FAIL`，并上报 `outcome=failed` 触发打回修复（全局锁死 **Max Retry = 2**，超限将熔断交由人工介入）。
    - 仅含 `MINOR` 或无问题 → 输出 `VERDICT: PASS`，上报 `outcome=succeeded`。
+
+## Engine-Enforced Hard Gate Format (Mandatory)
+
+`.orca/flow.mjs` (via `.orca/gate-verify.mjs`) enforces machine-checked verdicts on both live settlement and `--from` resume:
+
+1. **Contract Review Gate (`contract-review`)**:
+   - Include **exactly one** header line with the full 40-character lowercase Git SHA:
+     `Contract-Commit: <40-char-HEAD-SHA>`
+   - Must match `git rev-parse HEAD` in the integration worktree. Short SHAs, placeholders, or duplicate headers will be rejected by the engine.
+2. **Final Verdict Line (All Review / Audit / Merge Gates)**:
+   - The **last non-empty line** of the report MUST be strictly:
+     `VERDICT: PASS` (when zero BLOCKER and zero MAJOR findings exist)
+     or
+     `VERDICT: FAIL` (when any BLOCKER or MAJOR finding exists; also report `outcome=failed`).
+   - Do NOT include conflicting standalone `VERDICT:` lines earlier in the report.
+3. **Local Task Worktree Review & Merge (`task-review-merge`) + Release to `dev`**:
+   - Read `.orca/artifacts/WORKTREES.json`, inspect each isolated task branch diff against `baseCommit`, reject dirty/contract-violating branches with `VERDICT: FAIL`, and merge only approved task branches locally into the integration branch (`git merge --no-ff`).
+   - Open PRs targeting `{targetBranch}` (default `dev`) and merge only to non-protected target branches after all gates pass; **NEVER** push directly to or auto-merge `main`/`master`.

@@ -51,18 +51,30 @@ function main(argv) {
     state, flags, rest, key,
     id: () => String(state.nextId++),
     pushDone: (task, outcome) => state.pendingDone.push({ task, outcome }),
-    materialize: (task, outcome) => {
+    materialize: (task, outcome, wtDirOverride = null) => {
       // Shared with scenario handlers that override worker-start wholesale:
       // leave the step's artifact behind on success, like a real worker.
       if (outcome !== "succeeded" || !env.ORCA_FAKE_WRITES || !task.spec) return;
       const title = (task.spec.match(/^# (.+)$/m) || [])[1];
       const writes = title ? JSON.parse(env.ORCA_FAKE_WRITES)[title] : null;
       if (!writes) return;
-      const dir = join(env.ORCA_FAKE_WT || ".", ".orca", "artifacts");
+      const baseWt = wtDirOverride || env.ORCA_FAKE_WT || ".";
+      const dir = join(baseWt, ".orca", "artifacts");
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(join(dir, writes),
-        `# ${title}\n\n` +
-        "Fake artifact produced by the E2E fake orca; filler content clearing the readiness gate's minimum-size check.\n".repeat(4));
+      const verifyMap = env.ORCA_FAKE_VERIFY ? JSON.parse(env.ORCA_FAKE_VERIFY) : {};
+      const v = title ? verifyMap[title] : null;
+      let body = `# ${title}\n\n`;
+      if (v && v.requireContractCommit) {
+        const sha = v.requireContractCommit === "HEAD"
+          ? (env.ORCA_VERIFY_HEAD_SHA || "a".repeat(40))
+          : v.requireContractCommit;
+        body += `Contract-Commit: ${sha}\n\n`;
+      }
+      body += "Fake artifact produced by the E2E fake orca; filler content clearing the readiness gate's minimum-size check.\n".repeat(4);
+      if (v && v.requireVerdict) {
+        body += `\nVERDICT: ${v.requireVerdict}\n`;
+      }
+      fs.writeFileSync(join(dir, writes), body);
     },
     ok: (j) => save(0, { result: j ?? {} }),
     fail: (msg, code = 1) => save(code, { error: msg }),
@@ -71,19 +83,30 @@ function main(argv) {
 
   const DEFAULTS = {
     "status": () => c.ok({}),
-    "worktree show": () => c.ok({ worktree: { path: env.ORCA_FAKE_WT || "." } }),
+    "worktree show": () => {
+      const sel = String(flags.worktree ?? "");
+      const mapped = (state.extra.worktreePaths || {})[sel];
+      c.ok({ worktree: { path: mapped || env.ORCA_FAKE_WT || "." } });
+    },
     "worktree list": () => c.ok({ worktrees: [] }),
     "worktree current": () => c.ok({ worktree: { path: env.ORCA_FAKE_WT || "." } }),
     "worktree create": () => {
       const name = String(flags.name ?? "");
       if (!name) return c.fail("worktree create: --name required");
-      // Recorded for scenario handlers (shared via state) and for future
-      // name-conflict timelines; E2E assertions read the calls log instead.
-      (state.extra.createdWorktrees ??= []).push({ name, repo: flags.repo ?? null, baseBranch: flags["base-branch"] ?? null });
-      // The created worktree IS the seeded fake worktree dir: everything the
-      // flow computes from WT_PATH (artifacts, status page, readiness files)
-      // then lands exactly where runFlow already reads them.
-      c.ok({ worktree: { name, path: env.ORCA_FAKE_WT || "." } });
+      let wtPath = env.ORCA_FAKE_WT || ".";
+      if (flags.branch) {
+        // Isolated per-step worktree: allocate a real sibling directory so tests
+        // can assert physical isolation, separate agent configs, and artifact sync.
+        const parent = require("node:path").dirname(wtPath);
+        wtPath = join(parent, "isolated-" + name);
+        fs.mkdirSync(join(wtPath, ".orca", "artifacts"), { recursive: true });
+        (state.extra.worktreePaths ??= {})[`name:${name}`] = wtPath;
+      }
+      (state.extra.createdWorktrees ??= []).push({
+        name, repo: flags.repo ?? null, baseBranch: flags["base-branch"] ?? null,
+        branch: flags.branch ?? null, path: wtPath,
+      });
+      c.ok({ worktree: { name, path: wtPath } });
     },
 
     "orchestration run-create": () => c.ok({ run: { id: "run-" + c.id() } }),
@@ -117,13 +140,11 @@ function main(argv) {
     // "orchestration worker-start" handler replaces the whole body (outcomeOf is then ignored).
     "orchestration worker-start": () => {
       const id = "disp-" + c.id();
-      state.dispatches[id] = { id, task: flags.task, status: "dispatching", created: Date.now() };
+      const wtDir = (state.extra.worktreePaths || {})[flags.worktree] || env.ORCA_FAKE_WT || ".";
+      state.dispatches[id] = { id, task: flags.task, worktree: flags.worktree || null, wtDir, status: "dispatching", created: Date.now() };
       const task = state.tasks[flags.task] || {};
       const outcome = scenario.outcomeOf ? scenario.outcomeOf(task, c) : "succeeded";
-      // Materialize the step's artifact on success: the readiness gate inspects
-      // <worktree>/.orca/artifacts/<writes> before launching consumers, so a
-      // green-path fake must leave the file behind like a real worker would.
-      c.materialize(task, outcome);
+      c.materialize(task, outcome, wtDir);
       c.pushDone(flags.task, outcome);
       c.ok({ dispatchId: id, state: "ready" });
     },

@@ -655,3 +655,51 @@ per run instead of per step.
 
 **Secrets:** after filling the file in, add it to your project's `.gitignore` —
 webhook URLs and tokens are credentials. The empty template is safe to commit.
+
+---
+
+## orca-pod Engine Extensions (v0.2.0)
+
+### 1. Per-Step Isolated Worktrees (`isolatedWorktree`)
+
+Upstream `parallelWith` shares a single worktree across parallel steps (suitable for read-only doc/review steps). For parallel **code-writing** workers, opt in per step:
+
+```json
+{
+  "id": "worker-backend",
+  "isolatedWorktree": true,
+  "branchPrefix": "task/"
+}
+```
+
+When enabled, `.orca/worktree-isolation.mjs`:
+- Creates a physically separate Orca/Git worktree and `task/<slug>-<step>` branch from the integration worktree's current `HEAD` (typically the frozen `Contract-Commit`).
+- Copies upstream `reads` artifacts into the isolated worktree and materializes/restores agent skills/MCP strictly inside that isolated worktree (zero cross-contamination).
+- Continuously syncs `progress` and `writes` artifacts back to the integration worktree and records all task worktrees in `.orca/artifacts/WORKTREES.json` (exposed as `{worktreesManifest}` for the downstream Reviewer merge step).
+- Reuses the isolated worktree across `onFailGoto` retries so the worker fixes findings directly on its branch.
+
+### 2. Hard Content-Aware Gate Verification (`verify`)
+
+To prevent failed or stale reviews from bypassing readiness checks (which otherwise only verify `size >= readinessMinBytes`), declare `verify` on any review/audit step:
+
+```json
+{
+  "id": "contract-review",
+  "verify": {
+    "requireVerdict": "PASS",
+    "requireContractCommit": "HEAD"
+  }
+}
+```
+
+Enforced by `.orca/gate-verify.mjs` at **both** live step settlement (overrides `outcome=succeeded` to `failed` so `onFailGoto` / `maxRetries` triggers) **and** `readinessOf` / `--from` resume (blocks downstream launch until repaired). Also runnable standalone:
+
+```bash
+node .orca/gate-verify.mjs --artifact .orca/artifacts/CONTRACT_REVIEW.md --require-verdict PASS --require-contract-commit HEAD
+```
+
+### 3. Target Branch & Protected Branches
+
+Configure in `defaults`:
+- `defaults.targetBranch` (default `"dev"`): injected as `{targetBranch}` in step specs for Reviewer PR creation and merge.
+- `defaults.protectedBranches` (default `["main", "master"]`): injected as `{protectedBranches}` — pipelines never push directly to or auto-merge protected branches.

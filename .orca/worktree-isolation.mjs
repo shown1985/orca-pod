@@ -1,0 +1,437 @@
+// worktree-isolation.mjs — Per-step isolated Git/Orca Worktree orchestration for orca-pod.
+//
+// Zero external dependencies (Node builtins only).
+
+import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
+
+export const WORKTREES_MANIFEST = "WORKTREES.json";
+const CASE_INSENSITIVE_FS = process.platform === "win32" || process.platform === "darwin";
+
+function samePath(a, b) {
+  if (!a || !b) return false;
+  const ra = resolve(a);
+  const rb = resolve(b);
+  return CASE_INSENSITIVE_FS ? ra.toLowerCase() === rb.toLowerCase() : ra === rb;
+}
+
+export function validateIsolationConfig(step, die) {
+  if (step.isolatedWorktree !== undefined && typeof step.isolatedWorktree !== "boolean") {
+    die(`step "${step.id}": isolatedWorktree must be a boolean.`);
+  }
+  if (step.branchPrefix !== undefined) {
+    if (typeof step.branchPrefix !== "string" || !step.branchPrefix.trim() || /\s/.test(step.branchPrefix)) {
+      die(`step "${step.id}": branchPrefix must be a non-empty string with no whitespace.`);
+    }
+  }
+}
+
+export function slugifyPart(text, maxLen = 18) {
+  return String(text || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "").normalize("NFC")
+    .toLowerCase()
+    .replace(/đ/g, "d")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, maxLen)
+    .replace(/-+$/g, "") || "task";
+}
+
+function shortHash(text, len = 8) {
+  return createHash("sha256").update(String(text || "")).digest("hex").slice(0, len);
+}
+
+function gitIn(dir, args) {
+  const r = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  return !r.error && r.status === 0 ? (r.stdout || "").trim() : null;
+}
+
+export function gitHeadIn(dir) {
+  return gitIn(dir, ["rev-parse", "HEAD"]);
+}
+
+export function gitBranchIn(dir) {
+  return gitIn(dir, ["rev-parse", "--abbrev-ref", "HEAD"]);
+}
+
+/**
+ * Check whether an isolated worktree has uncommitted changes outside engine-managed
+ * artifact paths. Must be called AFTER restoreAgentConfig so temporary harness
+ * files never cause false-positive dirty states.
+ */
+export function gitDirtyIn(dir, artDirRel = ".orca/artifacts") {
+  const relClean = String(artDirRel || ".orca/artifacts").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const out = gitIn(dir, ["status", "--porcelain", "--", ".", `:!${relClean}`]);
+  if (out == null) return null;
+  return out.length > 0;
+}
+
+/**
+ * Add engine-managed artifact paths to the worktree's local git exclude file
+ * so workers running `git status` or `git add` never accidentally see or commit
+ * synced artifacts or temporary manifests.
+ */
+function ensureLocalGitExclude(stepWtDir, artDirRel) {
+  const relClean = String(artDirRel || ".orca/artifacts").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const excludeRel = gitIn(stepWtDir, ["rev-parse", "--git-path", "info/exclude"]);
+  if (!excludeRel) return;
+  const excludePath = resolve(stepWtDir, excludeRel);
+  try {
+    mkdirSync(dirname(excludePath), { recursive: true });
+    const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+    const lines = existing.split(/\r?\n/);
+    const wanted = [`${relClean}/`, ".orca-agent-config-manifest.json"];
+    const toAdd = wanted.filter((w) => !lines.includes(w));
+    if (toAdd.length) {
+      const base = existing ? existing.replace(/\r?\n?$/, "\n") : "";
+      writeFileSync(excludePath, base + "# orca-pod engine-managed paths\n" + toAdd.join("\n") + "\n", "utf8");
+    }
+  } catch { /* best-effort inside non-git test fixtures */ }
+}
+
+export function readWorktreesManifest(artDir) {
+  const p = join(artDir, WORKTREES_MANIFEST);
+  if (!existsSync(p)) {
+    return {
+      runId: null,
+      integrationWorktree: null,
+      integrationBranch: null,
+      baseCommit: null,
+      verifiedContractCommit: null,
+      mergedAfterContract: false,
+      tasks: {},
+    };
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(p, "utf8"));
+    return {
+      runId: parsed.runId ?? null,
+      integrationWorktree: parsed.integrationWorktree ?? null,
+      integrationBranch: parsed.integrationBranch ?? null,
+      baseCommit: parsed.baseCommit ?? null,
+      verifiedContractCommit: parsed.verifiedContractCommit ?? null,
+      mergedAfterContract: Boolean(parsed.mergedAfterContract),
+      tasks: parsed.tasks && typeof parsed.tasks === "object" ? parsed.tasks : {},
+    };
+  } catch {
+    return {
+      runId: null,
+      integrationWorktree: null,
+      integrationBranch: null,
+      baseCommit: null,
+      verifiedContractCommit: null,
+      mergedAfterContract: false,
+      tasks: {},
+    };
+  }
+}
+
+export function writeWorktreesManifest(artDir, manifest) {
+  mkdirSync(artDir, { recursive: true });
+  writeFileSync(
+    join(artDir, WORKTREES_MANIFEST),
+    JSON.stringify({ ...manifest, updatedAt: new Date().toISOString() }, null, 2) + "\n",
+    "utf8"
+  );
+}
+
+/**
+ * Record the verified Contract-Commit SHA after `contract-review` passes
+ * settlement verification (and reset mergedAfterContract for a fresh contract).
+ */
+export function recordVerifiedContractCommit(artDir, commitSha, wtDir) {
+  if (!commitSha) return;
+  const manifest = readWorktreesManifest(artDir);
+  manifest.integrationWorktree = resolve(wtDir || ".");
+  manifest.integrationBranch = gitBranchIn(wtDir || ".");
+  if (manifest.verifiedContractCommit !== commitSha) {
+    manifest.mergedAfterContract = false;
+  }
+  manifest.verifiedContractCommit = commitSha;
+  manifest.baseCommit = commitSha;
+  writeWorktreesManifest(artDir, manifest);
+}
+
+/**
+ * Mark that `task-review-merge` succeeded and merged approved task branches
+ * onto the integration branch, allowing post-merge retry loops to accept the
+ * pinned `verifiedContractCommit` as an ancestor of HEAD.
+ */
+export function recordMergedAfterContract(artDir, wtDir) {
+  const manifest = readWorktreesManifest(artDir);
+  manifest.integrationWorktree = resolve(wtDir || ".");
+  manifest.integrationBranch = gitBranchIn(wtDir || ".");
+  manifest.mergedAfterContract = true;
+  manifest.mergedHead = gitHeadIn(wtDir || ".");
+  writeWorktreesManifest(artDir, manifest);
+}
+
+/**
+ * Remove stale output artifact before launching a step so a PASS written in an
+ * earlier round can never survive a crash or skipped rewrite on retry.
+ */
+export function clearStaleStepArtifact(step, wtDir, stepWtDir, artDirRel) {
+  if (!step || !step.writes) return;
+  const targets = [join(wtDir, artDirRel, step.writes)];
+  if (stepWtDir && !samePath(stepWtDir, wtDir)) {
+    targets.push(join(stepWtDir, artDirRel, step.writes));
+  }
+  for (const p of targets) {
+    try { if (existsSync(p)) rmSync(p, { force: true }); } catch { /* best-effort */ }
+  }
+}
+
+/**
+ * Copy upstream read artifacts, review/audit feedback reports, and screenshots
+ * from integration worktree into the isolated step worktree.
+ */
+export function syncInputsToIsolatedWorktree({ step, wtDir, stepWtDir, artDirRel, byId, effectiveReads, allSteps }) {
+  if (!stepWtDir || samePath(stepWtDir, wtDir)) return;
+  const srcArt = join(wtDir, artDirRel);
+  const dstArt = join(stepWtDir, artDirRel);
+  mkdirSync(dstArt, { recursive: true });
+
+  const filesToCopy = new Set();
+  for (const rid of effectiveReads(step)) {
+    if (byId[rid]?.writes) filesToCopy.add(byId[rid].writes);
+  }
+  for (const s of allSteps) {
+    if (s.writes && s.id !== step.id && s.onFailGoto) {
+      filesToCopy.add(s.writes);
+    }
+  }
+  if (existsSync(join(srcArt, WORKTREES_MANIFEST))) {
+    filesToCopy.add(WORKTREES_MANIFEST);
+  }
+
+  for (const fname of filesToCopy) {
+    const src = join(srcArt, fname);
+    if (existsSync(src)) {
+      try { copyFileSync(src, join(dstArt, fname)); } catch { /* best-effort */ }
+    }
+  }
+  // Also sync Playwright screenshots dir when present (helpful on visual-gate retry).
+  const srcShots = join(srcArt, "screenshots");
+  if (existsSync(srcShots)) {
+    try { cpSync(srcShots, join(dstArt, "screenshots"), { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+/**
+ * Sync the isolated step's output artifact and progress checklist back to the
+ * integration worktree's artifacts dir.
+ */
+export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDirRel }) {
+  if (!stepWtDir || samePath(stepWtDir, wtDir)) return;
+  const srcArt = join(stepWtDir, artDirRel);
+  const dstArt = join(wtDir, artDirRel);
+  mkdirSync(dstArt, { recursive: true });
+  for (const fname of [step.writes, step.progress].filter(Boolean)) {
+    const src = join(srcArt, fname);
+    if (existsSync(src)) {
+      try { copyFileSync(src, join(dstArt, fname)); } catch { /* best-effort */ }
+    }
+  }
+}
+
+/**
+ * Ensure an isolated Orca/Git worktree exists for `step`, creating it from the
+ * integration worktree's current HEAD on first launch or reusing it ONLY when
+ * its baseCommit still matches the active Contract-Commit (or post-merge retry
+ * within the same run).
+ */
+export function prepareStepWorktree({
+  step,
+  objective,
+  runId,
+  wtSelector,
+  wtDir,
+  artDirRel,
+  orca,
+  pick,
+  res,
+  byId,
+  effectiveReads,
+  allSteps,
+  isolatedState,
+  log,
+  warn,
+  die,
+}) {
+  const realHead = gitHeadIn(wtDir);
+  const fallbackHead = (!realHead && process.env.ORCA_TEST_MODE === "1") ? (process.env.ORCA_VERIFY_HEAD_SHA || null) : null;
+  const currentHead = realHead || fallbackHead;
+  const integrationBranch = gitBranchIn(wtDir);
+
+  if (!step.isolatedWorktree) {
+    return {
+      isolated: false,
+      stepId: step.id,
+      wtName: null,
+      selector: wtSelector,
+      dir: wtDir,
+      branch: integrationBranch,
+      baseCommit: currentHead,
+    };
+  }
+
+  const artDir = join(wtDir, artDirRel);
+  const manifest = readWorktreesManifest(artDir);
+  manifest.integrationWorktree = resolve(wtDir);
+  manifest.integrationBranch = integrationBranch;
+  if (runId) manifest.runId = runId;
+
+  // Determine the expected contract base commit: if a verified contract commit
+  // exists and matches HEAD (or is in a post-merge retry loop), honor it; else HEAD.
+  const expectedBase = (manifest.mergedAfterContract && manifest.verifiedContractCommit)
+    ? manifest.verifiedContractCommit
+    : currentHead;
+
+  // Reuse an existing isolated worktree ONLY if:
+  //   1. Its directory still exists on disk, AND
+  //   2. Its recorded baseCommit matches the active expectedBase (prevents
+  //      silently reusing a worktree built on an outdated Contract-Commit!), AND
+  //   3. Either it was created in this run OR matches the pinned contract commit.
+  const existing = isolatedState[step.id] || manifest.tasks[step.id];
+  const baseMatches = !expectedBase || !existing?.baseCommit || existing.baseCommit === expectedBase;
+  const runMatches = !existing?.runId || !runId || existing.runId === runId || manifest.verifiedContractCommit === existing.baseCommit;
+  if (existing && existing.path && existsSync(existing.path) && baseMatches && runMatches) {
+    existing.status = "retrying";
+    existing.runId = runId || existing.runId || null;
+    isolatedState[step.id] = existing;
+    manifest.tasks[step.id] = existing;
+    manifest.baseCommit = expectedBase || manifest.baseCommit;
+    writeWorktreesManifest(artDir, manifest);
+    ensureLocalGitExclude(existing.path, artDirRel);
+    syncInputsToIsolatedWorktree({ step, wtDir, stepWtDir: existing.path, artDirRel, byId, effectiveReads, allSteps });
+    log(`[worktree-isolation] reusing isolated worktree ${existing.wtName} (${existing.branch}) -> ${existing.path}`);
+    return {
+      isolated: true,
+      stepId: step.id,
+      wtName: existing.wtName,
+      selector: existing.selector,
+      dir: existing.path,
+      branch: existing.branch,
+      baseCommit: existing.baseCommit || currentHead,
+    };
+  }
+
+  if (existing && existing.path && !baseMatches) {
+    warn(`[worktree-isolation] existing worktree ${existing.wtName} was based on stale commit ${String(existing.baseCommit).slice(0, 8)} (current ${String(expectedBase).slice(0, 8)}); creating a fresh isolated worktree.`);
+  }
+
+  const objSlug = slugifyPart(objective, 14);
+  const stepSlug = slugifyPart(step.id, 18);
+  // Hash incorporates objective + baseCommit + runId so non-ASCII/Chinese
+  // objectives and new contract commits never collide on worktree or branch names.
+  const uniq = shortHash(`${objective}|${currentHead || "nogit"}|${runId || ""}|${step.id}`, 6);
+  const wtName = `wt-${objSlug}-${stepSlug}-${uniq}`;
+  const prefix = step.branchPrefix || "task/";
+  const branch = `${prefix}${objSlug}-${stepSlug}-${uniq}`;
+  const repoRoot = gitIn(wtDir, ["rev-parse", "--show-toplevel"]) || resolve(wtDir);
+
+  const createArgs = ["worktree", "create", "--repo", `path:${repoRoot}`, "--name", wtName, "--branch", branch, "--no-parent"];
+  if (currentHead) createArgs.push("--base-branch", currentHead);
+
+  const c = orca(createArgs);
+  if (!c.ok) {
+    const detail = String(c.json?.error || c.stderr || c.raw || "orca worktree create failed").slice(0, 600);
+    die(`[worktree-isolation] failed to create isolated worktree "${wtName}" for step "${step.id}": ${detail}`);
+  }
+
+  const selector = `name:${wtName}`;
+  let stepWtDir = pick(pick(res(c.json), ["worktree"]) || {}, ["path"]) || null;
+  if (!stepWtDir) {
+    const shown = orca(["worktree", "show", "--worktree", selector]);
+    stepWtDir = pick(pick(res(shown.json), ["worktree"]) || {}, ["path"]) || null;
+  }
+  if (!stepWtDir) {
+    die(`[worktree-isolation] created worktree "${wtName}" but could not resolve its path.`);
+  }
+  mkdirSync(join(stepWtDir, artDirRel), { recursive: true });
+  ensureLocalGitExclude(stepWtDir, artDirRel);
+
+  const entry = {
+    stepId: step.id,
+    title: step.title,
+    runId: runId || null,
+    wtName,
+    selector,
+    path: resolve(stepWtDir),
+    branch,
+    baseCommit: currentHead,
+    headCommit: gitHeadIn(stepWtDir) || currentHead,
+    dirty: false,
+    status: "running",
+    createdAt: new Date().toISOString(),
+  };
+  isolatedState[step.id] = entry;
+  manifest.baseCommit = currentHead;
+  manifest.tasks[step.id] = entry;
+  writeWorktreesManifest(artDir, manifest);
+  syncInputsToIsolatedWorktree({ step, wtDir, stepWtDir, artDirRel, byId, effectiveReads, allSteps });
+  log(`[worktree-isolation] created isolated worktree ${wtName} (branch=${branch}${currentHead ? `, base=${currentHead.slice(0, 8)}` : ""}) -> ${stepWtDir}`);
+
+  return {
+    isolated: true,
+    stepId: step.id,
+    wtName,
+    selector,
+    dir: resolve(stepWtDir),
+    branch,
+    baseCommit: currentHead,
+  };
+}
+
+/**
+ * Record final commit SHA / dirty status and sync artifacts back to the
+ * integration worktree AFTER agent config has been restored.
+ */
+export function finalizeStepWorktree({ step, stepCtx, outcome, wtDir, artDirRel, isolatedState }) {
+  if (!stepCtx || !stepCtx.isolated) return;
+  syncOutputsFromIsolatedWorktree({ step, stepWtDir: stepCtx.dir, wtDir, artDirRel });
+  const artDir = join(wtDir, artDirRel);
+  const manifest = readWorktreesManifest(artDir);
+  const entry = isolatedState[step.id] || manifest.tasks[step.id] || {
+    stepId: step.id,
+    title: step.title,
+    wtName: stepCtx.wtName,
+    selector: stepCtx.selector,
+    path: stepCtx.dir,
+    branch: stepCtx.branch,
+    baseCommit: stepCtx.baseCommit,
+  };
+  entry.headCommit = gitHeadIn(stepCtx.dir) || entry.baseCommit;
+  entry.dirty = gitDirtyIn(stepCtx.dir, artDirRel);
+  entry.status = outcome || "unknown";
+  entry.finishedAt = new Date().toISOString();
+  isolatedState[step.id] = entry;
+  manifest.tasks[step.id] = entry;
+  writeWorktreesManifest(artDir, manifest);
+}
+
+/**
+ * Return existing isolated worktree paths recorded in WORKTREES.json so startup
+ * crash self-heal can restore leftover agent configs in them too.
+ */
+export function knownIsolatedWorktreePaths(artDir) {
+  const mf = readWorktreesManifest(artDir);
+  return Object.values(mf.tasks || {})
+    .map((t) => t?.path)
+    .filter((p) => typeof p === "string" && p && existsSync(p));
+}
+
+export function renderIsolatedWorktreeNote(stepCtx, outRelPath) {
+  if (!stepCtx || !stepCtx.isolated) return "";
+  return (
+    `\n\nISOLATED WORKTREE EXECUTION (ENFORCED BY ENGINE):\n` +
+    `- Worktree: ${stepCtx.wtName} (${stepCtx.dir})\n` +
+    `- Task Branch: ${stepCtx.branch}` + (stepCtx.baseCommit ? ` (branched from Contract-Commit ${stepCtx.baseCommit})` : "") + "\n" +
+    `- You are physically isolated from other parallel workers. Stay strictly on branch "${stepCtx.branch}", ` +
+    `do NOT modify frozen contract files, and commit ONLY your own source/test files cleanly on this branch before finishing ` +
+    `(NEVER \`git add\` \`.orca/artifacts/\` or temporary agent config files; leave \`git status\` clean).\n` +
+    `- Write your report to ${outRelPath} (automatically synced back to the integration worktree for the Reviewer merge gate).`
+  );
+}

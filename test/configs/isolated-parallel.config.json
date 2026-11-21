@@ -1,0 +1,89 @@
+{
+  "artifactsDir": ".orca/artifacts",
+  "maxRetries": 2,
+  "autoRun": true,
+  "defaults": {
+    "timeoutMs": 60000,
+    "model": "default",
+    "nudgeRetries": 0,
+    "targetBranch": "dev",
+    "protectedBranches": [
+      "main",
+      "master"
+    ]
+  },
+  "skills": {
+    "be-skill": {
+      "description": "Backend skill",
+      "prompt": "Follow backend contract."
+    },
+    "fe-skill": {
+      "description": "Frontend skill",
+      "prompt": "Follow frontend contract."
+    }
+  },
+  "pipeline": [
+    {
+      "id": "contract-review",
+      "title": "Contract Review",
+      "enabled": true,
+      "agent": "codex",
+      "writes": "CONTRACT_REVIEW.md",
+      "reads": [],
+      "verify": {
+        "requireVerdict": "PASS",
+        "requireContractCommit": "HEAD"
+      },
+      "spec": "Review contracts and write {out}."
+    },
+    {
+      "id": "worker-backend",
+      "title": "Worker Backend",
+      "enabled": true,
+      "agent": "opencode",
+      "isolatedWorktree": true,
+      "branchPrefix": "task/",
+      "writes": "BACKEND_CHANGES.md",
+      "reads": [
+        "contract-review"
+      ],
+      "skills": [
+        "be-skill"
+      ],
+      "spec": "Implement backend per {reads} and write {out}."
+    },
+    {
+      "id": "worker-frontend",
+      "title": "Worker Frontend",
+      "enabled": true,
+      "agent": "opencode",
+      "parallelWith": "worker-backend",
+      "isolatedWorktree": true,
+      "branchPrefix": "task/",
+      "writes": "FRONTEND_CHANGES.md",
+      "reads": [
+        "contract-review"
+      ],
+      "skills": [
+        "fe-skill"
+      ],
+      "spec": "Implement frontend per {reads} and write {out}."
+    },
+    {
+      "id": "task-review-merge",
+      "title": "Task Review Merge",
+      "enabled": true,
+      "agent": "codex",
+      "writes": "TASK_REVIEW_MERGE.md",
+      "reads": [
+        "contract-review",
+        "worker-backend",
+        "worker-frontend"
+      ],
+      "verify": {
+        "requireVerdict": "PASS"
+      },
+      "spec": "Inspect {worktreesManifest}, merge into integration branch, target {targetBranch}, write {out}."
+    }
+  ]
+}

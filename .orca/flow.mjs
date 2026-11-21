@@ -60,6 +60,13 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import readline from "node:readline";
 import { validateAgentConfig, materializeAgentConfig, restoreAgentConfig } from "./agent-config.mjs";
+import { validateVerifyConfig, verifyStepArtifact, formatVerifySummary } from "./gate-verify.mjs";
+import {
+  WORKTREES_MANIFEST, validateIsolationConfig, prepareStepWorktree,
+  syncOutputsFromIsolatedWorktree, finalizeStepWorktree, renderIsolatedWorktreeNote,
+  clearStaleStepArtifact, recordVerifiedContractCommit, recordMergedAfterContract,
+  knownIsolatedWorktreePaths,
+} from "./worktree-isolation.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Live-page accumulator: null until the status section assigns it (before any
@@ -339,6 +346,25 @@ for (const g of groups) if (g.length > 1) for (const m of g) isParallel.add(m.id
 // in --dry-run instead of mid-pipeline. Materialization happens per group.
 validateAgentConfig({ cfg, configDir: HERE, steps, die });
 
+// Gate verification & per-step worktree isolation rules: fail fast at load.
+{
+  for (const s of allSteps) {
+    validateVerifyConfig(s, die);
+    validateIsolationConfig(s, die);
+  }
+  const tb = cfg.defaults?.targetBranch;
+  if (tb != null && (typeof tb !== "string" || !tb.trim() || /\s/.test(tb)))
+    die(`defaults: targetBranch must be a non-empty branch name with no whitespace (got ${JSON.stringify(tb)}).`);
+  const pb = cfg.defaults?.protectedBranches;
+  if (pb != null && (!Array.isArray(pb) || pb.some((x) => typeof x !== "string" || !x.trim())))
+    die(`defaults: protectedBranches must be an array of non-empty branch names.`);
+}
+const TARGET_BRANCH = cfg.defaults?.targetBranch || "dev";
+const PROTECTED_BRANCHES = cfg.defaults?.protectedBranches || ["main", "master"];
+if (PROTECTED_BRANCHES.includes(TARGET_BRANCH))
+  die(`defaults: targetBranch "${TARGET_BRANCH}" is listed in protectedBranches (${PROTECTED_BRANCHES.join(", ")}) — refusing to target a protected branch.`);
+const isolatedState = {};
+
 // A step's reads. Steps in this run always count. Steps NOT part of this run
 // (dropped by --from/--only, or disabled) still count when their artifact file
 // already exists in the worktree — that is the RESUME case: `--from coding`
@@ -359,7 +385,7 @@ function effectiveReads(step) {
 //   directive so agents do not stall waiting for a human.
 // - manual mode: steps flagged "interactive": true get an INTERVIEW protocol
 //   (align with the user before finalizing). Ignored in auto-run mode.
-function renderSpec(step) {
+function renderSpec(step, stepCtx = null) {
   const reads = effectiveReads(step);
   const readList = reads.length
     ? reads.map((id) => `${byId[id].title} (${outPath(byId[id].writes)})`).join(", ")
@@ -371,10 +397,14 @@ function renderSpec(step) {
   const interview = (!AUTO_RUN && step.interactive)
     ? "\n\nINTERACTIVE SESSION (manual mode): this pipeline runs with user oversight — ALIGN WITH THE USER before finalizing. Interview protocol, follow exactly: (1) Ask ONE question at a time in this terminal and WAIT for the answer; never batch questions. (2) Cover, roughly in order: alignment with the functional requirements and scope; non-functional requirements; performance targets and expected load; security and compliance constraints; scalability and growth expectations; database and persistence choices; technology constraints and team preferences; deployment and operations. (3) Prefer multiple choice; open-ended only when options would bias the answer. (4) After each answer, restate your understanding in one short line so the user can correct you early. (5) Finish with a numbered DECISIONS list (decision + rationale) and get the user's confirmation on each before writing {out}. Include the confirmed decisions and any remaining open points in {out}."
     : "";
-  return (objectiveLine + (step.spec || "") + autonomy + interview)
+  const wtNote = renderIsolatedWorktreeNote(stepCtx, outPath(step.writes));
+  return (objectiveLine + (step.spec || "") + autonomy + interview + wtNote)
     .replaceAll("{out}", outPath(step.writes))
     .replaceAll("{tasks}", step.progress ? outPath(step.progress) : "{tasks}")
-    .replaceAll("{reads}", readList);
+    .replaceAll("{reads}", readList)
+    .replaceAll("{targetBranch}", TARGET_BRANCH)
+    .replaceAll("{protectedBranches}", PROTECTED_BRANCHES.join(", "))
+    .replaceAll("{worktreesManifest}", outPath(WORKTREES_MANIFEST));
 }
 
 // --- Orca CLI (argv-safe, no shell to avoid mangling special characters) ---
@@ -1757,9 +1787,9 @@ function agentCommand(agent, model = null) {
     : `env CLAUDE_AFK_TIMEOUT_MS=60000 ${cmd}`;
 }
 
-function warmTerminal(agent, model = null) {
+function warmTerminal(agent, model = null, wtSelector = null) {
   const startedAt = Date.now();
-  const c = orca(["terminal", "create", "--worktree", resolveWorktree(), "--command", agentCommand(agent, model)]);
+  const c = orca(["terminal", "create", "--worktree", wtSelector || resolveWorktree(), "--command", agentCommand(agent, model)]);
   const cr = res(c.json);
   const handle = pick(cr, ["handle", "terminalHandle"]) || pick(cr.terminal || {}, ["handle"]);
   if (!c.ok || !handle) {
@@ -1792,8 +1822,8 @@ function warmTerminal(agent, model = null) {
 
 // Manual path: returns { dispatchId, terminal } or null. See the comment
 // block above for why we cannot use worker-start's injection on this setup.
-function manualStart(step, taskId) {
-  const term = warmTerminal(agentOf(step), modelOf(step));
+function manualStart(step, taskId, wtSelector = null) {
+  const term = warmTerminal(agentOf(step), modelOf(step), wtSelector);
   if (!term) return null;
 
   // Tracking dispatch WITHOUT --inject: no injection, no acceptance window.
@@ -1871,12 +1901,12 @@ function manualStart(step, taskId) {
 
 // Fallback: Orca-managed cold launch via worker-start --agent. Works only
 // where the agent TUI boots within Orca's short dispatch_input window.
-function coldStart(step, taskId) {
+function coldStart(step, taskId, wtSelector = null) {
   let retryOf = null;
   const model = modelOf(step);   // same resolution as the manual path (defaults + "default" = no-op)
   for (let attempt = 0; attempt <= START_RETRIES; attempt++) {
     const args = ["orchestration", "worker-start", "--task", taskId, "--run", RUN_ID,
-      "--worktree", resolveWorktree(), "--agent", agentOf(step)];
+      "--worktree", wtSelector || resolveWorktree(), "--agent", agentOf(step)];
     if (model) args.push("--model", model);
     if (step.effort) args.push("--effort", step.effort);
     if (step.startTimeoutMs) args.push("--timeout-ms", String(step.startTimeoutMs));
@@ -1905,8 +1935,8 @@ function coldStart(step, taskId) {
   }
 }
 
-function startWorker(step, taskId) {
-  return manualStart(step, taskId) || coldStart(step, taskId);
+function startWorker(step, taskId, wtSelector = null) {
+  return manualStart(step, taskId, wtSelector) || coldStart(step, taskId, wtSelector);
 }
 
 // =============================================================================
@@ -1915,6 +1945,7 @@ function startWorker(step, taskId) {
 function printPlan() {
   log(`Config: ${CONFIG_FILE}${opt.config ? "" : " (default)"}`);
   log(`Worktree: ${WT || WT_PIN || "(auto-detect, unresolved in dry-run)"}  (${wtSource()})`);
+  log(`Target branch: ${TARGET_BRANCH} (protected: ${PROTECTED_BRANCHES.join(", ")})`);
   log(`Auto-run: ${AUTO_RUN ? "on — agents run unattended, gates ignored" : "off — steps with 'gate' block for approval"}`);
   log(`Notifications: ${NOTIFY.on ? `on (${NOTIFY.cfg.provider}, events: ${[...NOTIFY.events].join(",")})` : "off"}`);
   if (opt.dryRun) {
@@ -1936,6 +1967,9 @@ function printPlan() {
     else if (isParallel.has(s.id)) flags.push("parallel-group");
     if ((s.skills || []).length) flags.push(`skills=${s.skills.join(",")}`);
     if ((s.mcp || []).length) flags.push(`mcp=${s.mcp.join(",")}`);
+    if (s.isolatedWorktree) flags.push("isolated-wt");
+    const vSum = formatVerifySummary(s.verify);
+    if (vSum) flags.push(`verify=${vSum}`);
     console.log(
       `  ${i + 1}. ${s.title.padEnd(26)} agent=${agentOf(s).padEnd(9)}` +
       `${model ? ` model=${model}` : ""} ` +
@@ -2023,6 +2057,10 @@ if (!HISTORY_ARCHIVE_DONE) archiveCurrentRun();
 // the manifest behind — put the worktree back before anything else runs.
 if (restoreAgentConfig({ worktree: WT_DIR || ".", warn }))
   log("[agent-config] restored worktree files left behind by a previous run.");
+for (const isoDir of knownIsolatedWorktreePaths(join(WT_DIR || ".", ART_DIR))) {
+  if (restoreAgentConfig({ worktree: isoDir, warn }))
+    log(`[agent-config] restored isolated worktree files left behind in ${isoDir}.`);
+}
 if (!orca(["status"]).ok) die("Orca runtime not ready (orca status failed).");
 
 log(`Creating Run: ${objective}`);
@@ -2035,7 +2073,7 @@ initStatus();
 
 // Create a task per step, keep taskId for reuse on retries
 const taskIds = {};
-function ensureTask(step) {
+function ensureTask(step, stepCtx = null) {
   if (taskIds[step.id]) {
     // Reuse on an onFailGoto jump: the cached task settled on its previous
     // attempt — failed for the gate that demanded the fix, completed for the
@@ -2049,7 +2087,7 @@ function ensureTask(step) {
     return taskIds[step.id];
   }
   // Title becomes the first line of the spec (this build has no --task-title flag).
-  const spec = `# ${step.title}\n\n${renderSpec(step)}`;
+  const spec = `# ${step.title}\n\n${renderSpec(step, stepCtx)}`;
   const r = orca(["orchestration", "task-create", "--run", RUN_ID, "--spec", spec]);
   const id = pick(res(r.json).task || {}, ["id"]) || pick(res(r.json), ["taskId", "task_id", "id"]);
   if (!id) die(`task-create '${step.title}' returned no taskId. Output: ${r.raw || r.stderr}`);
@@ -2223,6 +2261,7 @@ function holdForNudge(m, outcome, done) {
 // file spends another attempt; exhausted or hard-capped => settle failed
 // (we hold a verdict — still-running is reserved for the no-verdict case).
 function nudgePoll(m) {
+  if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: WT_DIR || ".", artDirRel: ART_DIR });
   if (artifactReady(m.step.id)) {
     m.note = `artifact recovered via nudge (${m.nudge.count} sent)`;
     settleMember(m, m.nudge.outcome || "succeeded", m.nudge.done);
@@ -2267,16 +2306,17 @@ function nudgePoll(m) {
 // Create the task + start the worker; return the per-member bookkeeping.
 // Budgets mirror the sequential semantics exactly (manual-mode interactive
 // steps get the raised silence/hard caps).
-function launchMember(step) {
-  const taskId = ensureTask(step);
-  log(`> ${step.title}  (agent=${agentOf(step)}, task=${taskId})`);
-  const { dispatchId, terminal } = startWorker(step, taskId);
+function launchMember(step, stepCtx = null) {
+  const taskId = ensureTask(step, stepCtx);
+  const wtTag = stepCtx?.isolated ? `, worktree=${stepCtx.wtName}, branch=${stepCtx.branch}` : "";
+  log(`> ${step.title}  (agent=${agentOf(step)}, task=${taskId}${wtTag})`);
+  const { dispatchId, terminal } = startWorker(step, taskId, stepCtx?.selector || null);
   const interactiveNow = !AUTO_RUN && step.interactive;
   const baseIdleMs = timeoutOf(step);
   const baseHardMs = step.hardTimeoutMs ?? cfg.defaults?.hardTimeoutMs ?? 4 * baseIdleMs;
   const maxIdleMs = interactiveNow ? Math.max(baseIdleMs, 3600000) : baseIdleMs;
   return {
-    step, taskId, dispatchId, terminal,
+    step, ctx: stepCtx, taskId, dispatchId, terminal,
     maxIdleMs,
     hardCapMs: interactiveNow ? Math.max(baseHardMs, 14400000) : baseHardMs,
     sliceMs: Math.min(120000, maxIdleMs),
@@ -2299,6 +2339,8 @@ function settleMember(m, outcome, done) {
   m.settled = true;
   m.outcome = outcome;
   m.done = done || null;
+  if (m.ctx?.isolated)
+    syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: WT_DIR || ".", artDirRel: ART_DIR });
   refreshProgress(m.step);   // final snapshot: catch the last ticks
   writeArtifactSnapshot(m.step);   // final artifact snapshot for the viewer
   statusEnd(m.step.id, outcome, m.note);
@@ -2319,18 +2361,46 @@ function settleMember(m, outcome, done) {
 // cap; a hard-capped member settles as still-running and is dropped from
 // the wait set — the pipeline then stops (main loop) with a resume hint.
 function runGroup(members) {
-  // Skills + MCP config files live in the worktree for the whole group (union
-  // across parallel members). NOTE: die() exits the process without running
-  // this finally — that is exactly what the manifest + startup self-heal cover.
-  materializeAgentConfig({ worktree: WT_DIR || ".", members: members.map((s) => ({ ...s, agent: agentOf(s) })), cfg, configDir: HERE, die, warn });
+  const materializedDirs = [];
+  let M = [];
   try {
+  // Resolve per-member worktree context inside try so any partial setup is
+  // cleanly restored in finally on exception.
+  const prepared = members.map((s) => ({
+    step: s,
+    ctx: prepareStepWorktree({
+      step: s, objective, runId: RUN_ID, wtSelector: resolveWorktree(), wtDir: WT_DIR || ".",
+      artDirRel: ART_DIR, orca, pick, res, byId, effectiveReads, allSteps,
+      isolatedState, log, warn, die,
+    }),
+  }));
+  // Clear stale output artifacts for verify-guarded or isolated steps BEFORE
+  // launch so an earlier round's VERDICT: PASS can never survive a crash or
+  // skipped rewrite on retry.
+  for (const p of prepared) {
+    if (p.step.verify || p.ctx.isolated)
+      clearStaleStepArtifact(p.step, WT_DIR || ".", p.ctx.dir, ART_DIR);
+  }
+  const sharedMembers = prepared.filter((p) => !p.ctx.isolated).map((p) => ({ ...p.step, agent: agentOf(p.step) }));
+  if (sharedMembers.length) {
+    materializedDirs.push(WT_DIR || ".");
+    materializeAgentConfig({ worktree: WT_DIR || ".", members: sharedMembers, cfg, configDir: HERE, die, warn });
+  }
+  for (const p of prepared.filter((x) => x.ctx.isolated)) {
+    materializedDirs.push(p.ctx.dir);
+    materializeAgentConfig({ worktree: p.ctx.dir, members: [{ ...p.step, agent: agentOf(p.step) }], cfg, configDir: HERE, die, warn });
+  }
   for (const s of members) statusBegin(s.id);
-  const M = members.map(launchMember);
+  M = prepared.map((p) => launchMember(p.step, p.ctx));
   while (true) {
     const open = M.filter((m) => !m.settled);
     if (!open.length) break;
     const slice = Math.min(...open.map((m) => m.sliceMs));
-    for (const m of open) { refreshProgress(m.step); writeArtifactSnapshot(m.step); }
+    for (const m of open) {
+      if (m.ctx?.isolated)
+        syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: WT_DIR || ".", artDirRel: ART_DIR });
+      refreshProgress(m.step); writeArtifactSnapshot(m.step);
+    }
     writeStatus();   // heartbeat: keep the page's "updated Xs ago" fresh each slice
     const wait = orca(["orchestration", "check", "--run", RUN_ID, "--wait",
       "--types", "worker_done,escalation,question", "--timeout-ms", String(slice)],
@@ -2354,6 +2424,8 @@ function runGroup(members) {
         return mt === m.taskId || (mt == null && open.length === 1);
       });
       if (wd) {
+        if (m.ctx?.isolated)
+          syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: WT_DIR || ".", artDirRel: ART_DIR });
         const out = outcomeOf(wd) || "unknown";
         if (!holdForNudge(m, out, wd)) settleMember(m, m.outcome || out, wd);
         continue;
@@ -2370,6 +2442,8 @@ function runGroup(members) {
         const drained = (pick(dr, ["messages", "msgs"]) || [])
           .find((msg) => pick(msg, ["type"]) === "worker_done" && taskOfMsg(msg) === m.taskId) || null;
         if (drid) orca(["orchestration", "check", "--run", RUN_ID, "--ack", drid]);
+        if (m.ctx?.isolated)
+          syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: WT_DIR || ".", artDirRel: ART_DIR });
         const vout = (drained && outcomeOf(drained)) || v.outcome || "unknown";
         const vdone = drained || { payload: JSON.stringify({ outcome: v.outcome }) };
         if (!holdForNudge(m, vout, vdone)) settleMember(m, m.outcome || vout, vdone);
@@ -2435,7 +2509,14 @@ function runGroup(members) {
   writeStatus();
   return M;
   } finally {
-    restoreAgentConfig({ worktree: WT_DIR || ".", warn });
+    for (const d of new Set(materializedDirs))
+      restoreAgentConfig({ worktree: d, warn });
+    // Inspect isolated worktree dirty/HEAD status AFTER restoring temporary
+    // agent-config files so engine-written skills/MCP never trip dirty=true.
+    for (const m of M) {
+      if (m.ctx?.isolated)
+        finalizeStepWorktree({ step: m.step, stepCtx: m.ctx, outcome: m.outcome, wtDir: WT_DIR || ".", artDirRel: ART_DIR, isolatedState });
+    }
   }
 }
 
@@ -2494,12 +2575,8 @@ function readinessOf(step) {
   for (const id of (step.reads || [])) {
     if (!byId[id]) continue;
     if (byId[id].enabled === false) continue;   // config-disabled producer: optional input, auto-removed per config contract
-    let size = -1;
-    try { size = statSync(join(WT_DIR || ".", ART_DIR, byId[id].writes)).size; } catch { }
-    const reason = size < 0 ? "missing"
-      : size < READINESS_MIN_BYTES ? `too small (${size} bytes < ${READINESS_MIN_BYTES} min)`
-      : null;
-    if (reason) missing.push({ id, title: byId[id].title, path: outPath(byId[id].writes), reason });
+    const v = verifyStepArtifact(byId[id], join(WT_DIR || ".", ART_DIR), WT_DIR || ".", READINESS_MIN_BYTES, { mode: "readiness" });
+    if (!v.ok) missing.push({ id, title: byId[id].title, path: outPath(byId[id].writes), reason: v.reason });
   }
   return missing;
 }
@@ -2627,7 +2704,10 @@ async function readinessGate(members) {
             `Watch it; once it writes ${outPath(step.writes)}, continue with:\n` +
             `  node .orca/flow.mjs --from ${members[0].id} "${objective}"`);
       }
-      if (artifactReady(step.id)) {
+      const repairedCheck = verifyStepArtifact(step, join(WT_DIR || ".", ART_DIR), WT_DIR || ".", READINESS_MIN_BYTES, { mode: "settlement" });
+      if (repairedCheck.ok) {
+        if (step.verify?.requireContractCommit && repairedCheck.contractCommit)
+          recordVerifiedContractCommit(join(WT_DIR || ".", ART_DIR), repairedCheck.contractCommit, WT_DIR || ".");
         if (r.outcome === "succeeded" && step.gate && !AUTO_RUN) runGate(step);
         log(`[readiness] "${step.title}" artifact ready -> ${outPath(step.writes)}`);
         break;
@@ -2662,6 +2742,21 @@ while (gi < groups.length) {
   // (die / retry jump) wins; a retry re-runs the whole group anyway.
   let jumped = false;
   for (const r of results) {
+    if (r.outcome === "succeeded" && r.step.verify) {
+      const checkDir = r.ctx?.isolated ? r.ctx.dir : (WT_DIR || ".");
+      const vres = verifyStepArtifact(r.step, join(WT_DIR || ".", ART_DIR), checkDir, READINESS_MIN_BYTES, { mode: "settlement" });
+      if (!vres.ok) {
+        warn(`[gate-verify] "${r.step.title}" failed hard gate verification: ${vres.reason} — overriding outcome to failed.`);
+        r.outcome = "failed";
+        r.note = r.note ? `${r.note}; gate verify failed: ${vres.reason}` : `gate verify failed: ${vres.reason}`;
+        statusSet(r.step.id, { status: "failed", note: r.note });
+      } else {
+        if (r.step.verify.requireContractCommit && vres.contractCommit)
+          recordVerifiedContractCommit(join(WT_DIR || ".", ART_DIR), vres.contractCommit, WT_DIR || ".");
+        if (r.step.verify.requireMergedTasks)
+          recordMergedAfterContract(join(WT_DIR || ".", ART_DIR), WT_DIR || ".");
+      }
+    }
     if (r.outcome === "succeeded") {
       log(`[ok] ${r.step.title} done -> ${outPath(r.step.writes)}`);
       if (r.step.gate && !AUTO_RUN) runGate(r.step);

@@ -8,10 +8,13 @@
 
 ## 一、 新增与改造文件全景
 
-核心引擎 `.orca/flow.mjs` 与 `.orca/agent-config.mjs` 保持上游原版零修改，所有定制内容如下：
+在兼容上游 `vankhangfet/orca-sdlc-kit` 协议与测试套件的基础上，本仓库通过两个零依赖扩展模块（`.orca/gate-verify.mjs` 与 `.orca/worktree-isolation.mjs`）对 `.orca/flow.mjs` 补齐了**物理隔离独立并发 Worktree** 与**引擎级 Verdict/SHA 硬门禁**，所有新增与改造文件如下：
 
 | 文件路径 | 类型 | 用途说明 |
 |---|---|---|
+| `.orca/gate-verify.mjs` | 新增 | 引擎级硬门禁校验器（也可 CLI 独立调用）：强制解析末尾 `VERDICT: PASS` 与唯一 40 位 `Contract-Commit == HEAD`，在实时结算与 `--from` 续跑双点硬阻断 |
+| `.orca/worktree-isolation.mjs` | 新增 | Per-step 独立 Orca/Git Worktree 编排器：为 `isolatedWorktree: true` 的并发编码步骤自动派生独立目录与 `task/*` 分支、同步只读契约产物、隔离挂载 Skills/MCP、回收报告并生成 `WORKTREES.json` 供 Reviewer 合并 |
+| `.orca/flow.mjs` | 增强 | 接入 `gate-verify.mjs` 与 `worktree-isolation.mjs`，支持 `verify` / `isolatedWorktree` / `targetBranch` (`dev`) / `protectedBranches` (`main, master`) |
 | `.orca/flow-hotfix.json` | 新增 | **Track 0 极速通道**：跳过 PO，Red→Green 测试先行 + `GPT-6.2 Sol` (High) 极速 Diff 审计 + 提 PR |
 | `.orca/flow-feature.json` | 新增 | **Track 1 标准通道**：≤10 行微型 Plan + 单 Worktree 编码单测 + 按需 Visual Gate + `GPT-6.2 Sol` (High) 审查 + 提 PR |
 | `.orca/flow-epic.json` | 新增 | **Track 2 完整编排通道**：PO DAG 拆解 + 契约 Commit 先行 + 无状态并发 Worktree + 串行集成 + Visual Gate + `GPT-6.2 Sol` (Xhigh) 终审 + **Orca Decision Gate** |
@@ -49,7 +52,11 @@ npx /path/to/orca-pod
 ### 3. 安全不覆盖与合并提示
 
 - **默认安全模式**：目标仓库已存在的 `AGENTS.md`、`DESIGN.md`、`.worktreeinclude`、`orca.yaml`、`.orca/flow.config.json`、`ci-release.yml` **不会被覆盖**，脚本会保留你的本地修改并自动打印 `diff -u` 比对命令方便人工合并。
-- **强制覆盖模式**（仅在确认整体刷新脚手架模板时使用）：
+- **仅升级引擎模式（推荐用于已有业务仓库更新）**：只刷新 `.orca/flow.mjs`、`.orca/gate-verify.mjs`、`.orca/worktree-isolation.mjs` 等引擎文件，完整保留你定制的 `AGENTS.md`、`DESIGN.md` 与 `flow-*.json`：
+  ```bash
+  npx github:shown1985/orca-pod --upgrade-engine
+  ```
+- **强制覆盖模式**（仅在确认整体刷新全部脚手架模板时使用）：
   ```bash
   npx github:shown1985/orca-pod --force
   ```

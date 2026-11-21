@@ -22,7 +22,12 @@
     "readinessRetries": 3,
     "nudgeRetries": 0,
     "nudgeTimeoutMs": 120000,
-    "readinessMinBytes": 200
+    "readinessMinBytes": 200,
+    "targetBranch": "dev",
+    "protectedBranches": [
+      "main",
+      "master"
+    ]
   },
   "skills": {
     "triage-po": {
@@ -84,7 +89,10 @@
       "onFailGoto": "coding",
       "maxRetries": 2,
       "timeoutMs": 900000,
-      "spec": "You are the Track 1 UI/UX Visual Gate reviewer. Check {reads}: if MICRO_PLAN.md and git diff confirm NO UI/UX files were modified (`UI_TOUCHED: no`), record 'Visual Gate skipped (backend/non-UI change)' in {out} and return PASS (outcome=succeeded). Otherwise, inspect DESIGN.md and verify Playwright screenshots at 1440px desktop and 390px mobile (capture them into .orca/artifacts/screenshots/ if not yet captured). Audit strictly: token compliance, restrained whitespace, crisp typography hierarchy, 1px subtle borders, NO AI-slop purple/blue gradients or decorative filler cards, component reuse, and 4-state completeness (Default/Loading Skeleton/Empty/Error). Write {out} with VERDICT: PASS or FAIL (outcome=failed loops back to coding, maxRetries=2)."
+      "spec": "You are the Track 1 UI/UX Visual Gate reviewer. Check {reads}: if MICRO_PLAN.md and git diff confirm NO UI/UX files were modified (`UI_TOUCHED: no`), record 'Visual Gate skipped (backend/non-UI change)' in {out} and return PASS (outcome=succeeded). Otherwise, inspect DESIGN.md and verify Playwright screenshots at 1440px desktop and 390px mobile (capture them into .orca/artifacts/screenshots/ if not yet captured). Audit strictly: token compliance, restrained whitespace, crisp typography hierarchy, 1px subtle borders, NO AI-slop purple/blue gradients or decorative filler cards, component reuse, and 4-state completeness (Default/Loading Skeleton/Empty/Error). Write {out} with VERDICT: PASS or FAIL (outcome=failed loops back to coding, maxRetries=2). End {out} with the final non-empty line strictly as `VERDICT: PASS` or `VERDICT: FAIL`.",
+      "verify": {
+        "requireVerdict": "PASS"
+      }
     },
     {
       "id": "code-review",
@@ -106,13 +114,16 @@
       "maxRetries": 2,
       "timeoutMs": 1800000,
       "hardTimeoutMs": 5400000,
-      "spec": "You are a Track 1 cross-family senior reviewer. Review git diff against {reads} and AGENTS.md. Check correctness, edge cases, security basics, test quality, and adherence to scope. Write {out} with BLOCKER/MAJOR/MINOR findings and VERDICT: if any BLOCKER/MAJOR exists, report FAIL (outcome=failed) to loop back to coding (hard cap Max Retry = 2); otherwise PASS."
+      "spec": "You are a Track 1 cross-family senior reviewer. Review git diff against {reads} and AGENTS.md. Check correctness, edge cases, security basics, test quality, and adherence to scope. Write {out} with BLOCKER/MAJOR/MINOR findings and VERDICT: if any BLOCKER/MAJOR exists, report FAIL (outcome=failed) to loop back to coding (hard cap Max Retry = 2); otherwise PASS. End {out} with the final non-empty line strictly as `VERDICT: PASS` or `VERDICT: FAIL`.",
+      "verify": {
+        "requireVerdict": "PASS"
+      }
     },
     {
       "id": "pr-submit",
-      "title": "Open PR & Trigger CI",
+      "title": "Reviewer PR Create & Merge to Target Branch",
       "enabled": true,
-      "agent": "opencode",
+      "agent": "codex",
       "model": "default",
       "//recommendedModel": "deepseek-v4.1-flash-1017 / hy4-flash / gemini-4-hydrogen (effort: low/medium)",
       "writes": "PR_SUMMARY.md",
@@ -123,7 +134,7 @@
         "code-review"
       ],
       "onFailGoto": null,
-      "spec": "You are a Track 1 PR delivery assistant. Based on {reads}: (1) verify current branch is a feature/fix branch (NEVER push directly to main/master and NEVER auto-merge to main); (2) commit clean changes (never commit .orca/artifacts/), push with `git push -u origin HEAD`, and create/update a Pull Request targeting main (via `gh pr create` or `tea pr create` if available, else output ready-to-run PR command & body); (3) write a concise PR summary + test/visual verification checklist to {out}."
+      "spec": "You are the Track 1 Release Reviewer. Based on {reads}: (1) verify current branch is a `feat/<slug>` or `fix/<slug>` branch (NEVER push directly to `{protectedBranches}` and NEVER auto-merge into `{protectedBranches}`); (2) commit clean changes (never commit .orca/artifacts/), push with `git push -u origin HEAD`, create/update a Pull Request targeting `{targetBranch}` (`--base {targetBranch}`), and once CI + Visual Gate + Code Review are green on non-protected `{targetBranch}` (e.g. `dev`), merge into `{targetBranch}`; (3) write PR URL, merge commit SHA, and verification checklist to {out}."
     }
   ]
 }

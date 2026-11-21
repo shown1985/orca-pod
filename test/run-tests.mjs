@@ -104,6 +104,7 @@ async function runFlow({ name, config, scenario: scenarioFile = "default.cjs", a
   env.ORCA_FAKE_LOG = join(dir, "calls.jsonl");
   env.ORCA_FAKE_SCENARIO = join(HERE, "scenarios", scenarioFile);
   env.ORCA_FAKE_WT = wt;
+  env.ORCA_TEST_MODE = "1";
   // Title -> writes map: lets the fake materialize each step's artifact on
   // success, exactly like a real worker leaving its {out} file behind.
   env.ORCA_FAKE_WRITES = (() => {
@@ -111,6 +112,13 @@ async function runFlow({ name, config, scenario: scenarioFile = "default.cjs", a
       const cc = JSON.parse(readFileSync(join(REPO, ".orca", config ?? "flow.config.json"), "utf8"));
       return JSON.stringify(Object.fromEntries(
         (cc.pipeline || []).filter((s) => s && s.title && s.writes).map((s) => [s.title, s.writes])));
+    } catch { return "{}"; }
+  })();
+  env.ORCA_FAKE_VERIFY = (() => {
+    try {
+      const cc = JSON.parse(readFileSync(join(REPO, ".orca", config ?? "flow.config.json"), "utf8"));
+      return JSON.stringify(Object.fromEntries(
+        (cc.pipeline || []).filter((s) => s && s.title && s.verify).map((s) => [s.title, s.verify])));
     } catch { return "{}"; }
   })();
   // worktreePin: null = no pin at all — the flow's auto-detect path runs.
@@ -144,7 +152,8 @@ async function runFlow({ name, config, scenario: scenarioFile = "default.cjs", a
     ? readFileSync(join(dir, "calls.jsonl"), "utf8").split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l))
     : [];
   const by = (cmd) => calls.filter((c) => c.cmd === cmd);
-  return { code, out, err, hung, status, calls, by, wt, dir };
+  const state = existsSync(join(dir, "state.json")) ? JSON.parse(readFileSync(join(dir, "state.json"), "utf8")) : null;
+  return { code, out, err, hung, status, state, calls, by, wt, dir };
 }
 
 const scenarios = [];
@@ -816,7 +825,7 @@ scenario("E17 repair-hang (still-running repair keeps the resume hint)", async (
 // steps (grill) are optional inputs — the gate must not prompt or abort.
 // ---------------------------------------------------------------------------
 scenario("E18 readiness-skips-disabled (shipped config, fresh worktree, no prompt)", async () => {
-  const r = await runFlow({ name: "e18", config: null, budgetMs: 120000 });
+  const r = await runFlow({ name: "e18", config: "workflow-template/sdlc.config.json", budgetMs: 120000 });
   ok("E18 not hung", !r.hung);
   eq("E18 exit code", r.code, 0);
   ok("E18 never reported missing inputs", !/Missing or incomplete input artifact/.test(r.out + r.err));
@@ -1248,9 +1257,9 @@ scenario("F14 dry-run shows per-step retry budget", async () => {
 // I2 guards the documented invariant: FILES must mirror package.json "files"
 // (a drift either corrupts the package or makes init die on a missing source).
 // ---------------------------------------------------------------------------
-async function runInit({ name, args = [], budgetMs = 15000 }) {
-  const dir = mkdtempSync(join(tmpdir(), `orca-init-${name}-`));
-  dirsOfCurrentScenario.push(dir);
+async function runInit({ name, dir: existingDir = null, args = [], budgetMs = 15000 }) {
+  const dir = existingDir ?? mkdtempSync(join(tmpdir(), `orca-init-${name}-`));
+  if (!dirsOfCurrentScenario.includes(dir)) dirsOfCurrentScenario.push(dir);
   const child = spawn(NODE, [join(REPO, "bin", "init.mjs"), ...args], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
   let out = ""; let err = ""; let hung = false;
   const timer = setTimeout(() => { hung = true; hungInCurrentScenario = true; child.kill(); }, budgetMs);
@@ -1473,6 +1482,214 @@ scenario("D7 designer scaffolds a fresh project workspace", async () => {
     try { rmdirSync(join(REPO, ".orca", "artifacts")); } catch {}
     rmSync(join(REPO, ".orca", "designer-filter-test.tmp"), { force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// P1 — Isolated per-step Worktrees for parallel coding workers:
+// worker-backend ∥ worker-frontend each receive their own physically separate
+// worktree, task branch, isolated agent-config files, synced upstream reads,
+// synced-back reports, and WORKTREES.json handoff manifest.
+// ---------------------------------------------------------------------------
+scenario("P1 isolated-worktree parallel workers (separate dirs, branches, skills, WORKTREES.json)", async () => {
+  const HEAD_SHA = "1111111111111111111111111111111111111111";
+  const r = await runFlow({
+    name: "p1",
+    config: "../test/configs/isolated-parallel.config.json",
+    scenario: "isolated-snap.cjs",
+    objective: "Exam Workbench",
+    env: { ORCA_VERIFY_HEAD_SHA: HEAD_SHA },
+    budgetMs: 90000,
+  });
+  ok("P1 not hung", !r.hung);
+  eq("P1 exit code", r.code, 0);
+  eq("P1 status overall", r.status?.overall, "succeeded");
+  const creates = r.by("worktree create");
+  eq("P1 created two isolated worktrees", creates.length, 2);
+  ok("P1 backend branch created", creates.some((c) => String(c.flags.branch ?? "").includes("worker-backend")));
+  ok("P1 frontend branch created", creates.some((c) => String(c.flags.branch ?? "").includes("worker-frontend")));
+  const snaps = r.state?.extra?.snaps || {};
+  const beSnap = snaps["Worker Backend"];
+  const feSnap = snaps["Worker Frontend"];
+  ok("P1 backend snapshot captured", Boolean(beSnap));
+  ok("P1 frontend snapshot captured", Boolean(feSnap));
+  ok("P1 backend & frontend ran in DIFFERENT physical directories", beSnap && feSnap && beSnap.wtDir !== feSnap.wtDir && beSnap.wtDir !== r.wt && feSnap.wtDir !== r.wt);
+  ok("P1 backend & frontend used DIFFERENT --worktree selectors", beSnap && feSnap && beSnap.worktreeFlag !== feSnap.worktreeFlag && beSnap.worktreeFlag !== "name:testlab");
+  ok("P1 backend got synced CONTRACT_REVIEW.md", beSnap?.hasSyncedContractReview === true);
+  ok("P1 frontend got synced CONTRACT_REVIEW.md", feSnap?.hasSyncedContractReview === true);
+  ok("P1 backend skills isolated (no fe-skill leak)", beSnap?.agentsText.includes("be-skill") && !beSnap?.agentsText.includes("fe-skill"));
+  ok("P1 frontend skills isolated (no be-skill leak)", feSnap?.agentsText.includes("fe-skill") && !feSnap?.agentsText.includes("be-skill"));
+  ok("P1 backend worktree restored AGENTS.md after run", beSnap && !existsSync(join(beSnap.wtDir, "AGENTS.md")));
+  ok("P1 frontend worktree restored AGENTS.md after run", feSnap && !existsSync(join(feSnap.wtDir, "AGENTS.md")));
+  ok("P1 BACKEND_CHANGES.md synced back to integration wt", existsSync(join(r.wt, ".orca", "artifacts", "BACKEND_CHANGES.md")));
+  ok("P1 FRONTEND_CHANGES.md synced back to integration wt", existsSync(join(r.wt, ".orca", "artifacts", "FRONTEND_CHANGES.md")));
+  const mfPath = join(r.wt, ".orca", "artifacts", "WORKTREES.json");
+  ok("P1 WORKTREES.json manifest written", existsSync(mfPath));
+  const mf = existsSync(mfPath) ? JSON.parse(readFileSync(mfPath, "utf8")) : {};
+  eq("P1 manifest records both isolated tasks as succeeded", [mf.tasks?.["worker-backend"]?.status, mf.tasks?.["worker-frontend"]?.status], ["succeeded", "succeeded"]);
+  const mergeTask = r.by("orchestration task-create").find((c) => String(c.flags.spec ?? "").includes("# Task Review Merge"));
+  ok("P1 Reviewer merge spec resolves {worktreesManifest} and {targetBranch}", Boolean(mergeTask && String(mergeTask.flags.spec).includes("WORKTREES.json") && String(mergeTask.flags.spec).includes("dev")));
+});
+
+// ---------------------------------------------------------------------------
+// P2 — Hard Verdict Gate on live settlement:
+// Reviewer exits outcome=succeeded while writing VERDICT: FAIL on attempt 1 ->
+// flow.mjs MUST override outcome to failed and loop back via onFailGoto!
+// ---------------------------------------------------------------------------
+scenario("P2 hard verdict gate overrides outcome=succeeded when artifact has VERDICT: FAIL", async () => {
+  const HEAD_SHA = "2222222222222222222222222222222222222222";
+  const r = await runFlow({
+    name: "p2",
+    config: "../test/configs/verdict-gate.config.json",
+    scenario: "verdict-fail-once.cjs",
+    env: { ORCA_VERIFY_HEAD_SHA: HEAD_SHA },
+    budgetMs: 90000,
+  });
+  ok("P2 not hung", !r.hung);
+  eq("P2 exit code", r.code, 0);
+  ok("P2 logged gate-verify override warning", /\[gate-verify\].*overriding outcome to failed/.test(r.out + r.err));
+  ok("P2 triggered onFailGoto retry loop", /FAILED.*back to "Contract Arch"/.test(r.out));
+  eq("P2 Contract Review ran twice", r.state?.extra?.reviewRuns, 2);
+  eq("P2 status overall succeeded after retry", r.status?.overall, "succeeded");
+});
+
+// ---------------------------------------------------------------------------
+// P3 — Hard Verdict Gate on --from resume:
+// Seeded CONTRACT_REVIEW.md > 200B with VERDICT: FAIL MUST hard-block --from worker!
+// ---------------------------------------------------------------------------
+scenario("P3 --from resume hard-blocks when CONTRACT_REVIEW.md (>200B) has VERDICT: FAIL", async () => {
+  const HEAD_SHA = "3333333333333333333333333333333333333333";
+  const r = await runFlow({
+    name: "p3",
+    config: "../test/configs/verdict-gate.config.json",
+    args: ["--from", "worker"],
+    env: { ORCA_VERIFY_HEAD_SHA: HEAD_SHA },
+    seedArtifacts: [{
+      file: "CONTRACT_REVIEW.md",
+      text: `# Contract Review\n\nContract-Commit: ${HEAD_SHA}\n\n` + "Blocker details exceeding 200 bytes easily.\n".repeat(6) + "\nVERDICT: FAIL\n",
+    }],
+    stdinText: "n\n",
+    budgetMs: 60000,
+  });
+  ok("P3 not hung", !r.hung);
+  ok("P3 refused to run (non-zero exit)", r.code !== 0);
+  ok("P3 reported verdict mismatch", /verdict is "FAIL", required "PASS"/.test(r.out + r.err));
+  eq("P3 zero workers dispatched", r.by("orchestration worker-start").length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// P4 — Hard Contract-Commit SHA Gate on --from resume:
+// Stale SHA, short SHA, and duplicate headers MUST block; exact 40-char HEAD SHA + VERDICT: PASS succeeds!
+// ---------------------------------------------------------------------------
+scenario("P4 Contract-Commit SHA gate rejects stale/short/duplicate SHAs and accepts exact 40-char HEAD", async () => {
+  const HEAD_SHA = "4444444444444444444444444444444444444444";
+  const STALE_SHA = "5555555555555555555555555555555555555555";
+  const filler = "Contract review details clearing 200 bytes.\n".repeat(6);
+
+  const stale = await runFlow({
+    name: "p4-stale", config: "../test/configs/verdict-gate.config.json", args: ["--from", "worker"],
+    env: { ORCA_VERIFY_HEAD_SHA: HEAD_SHA }, stdinText: "n\n",
+    seedArtifacts: [{ file: "CONTRACT_REVIEW.md", text: `# Review\nContract-Commit: ${STALE_SHA}\n\n${filler}\nVERDICT: PASS\n` }],
+  });
+  ok("P4 stale SHA blocked", stale.code !== 0 && /stale Contract-Commit/.test(stale.out + stale.err));
+  eq("P4 stale SHA zero dispatches", stale.by("orchestration worker-start").length, 0);
+
+  const shortSha = await runFlow({
+    name: "p4-short", config: "../test/configs/verdict-gate.config.json", args: ["--from", "worker"],
+    env: { ORCA_VERIFY_HEAD_SHA: HEAD_SHA }, stdinText: "n\n",
+    seedArtifacts: [{ file: "CONTRACT_REVIEW.md", text: `# Review\nContract-Commit: 44444444\n\n${filler}\nVERDICT: PASS\n` }],
+  });
+  ok("P4 short SHA blocked", shortSha.code !== 0 && /full 40-char lowercase hex SHA/.test(shortSha.out + shortSha.err));
+
+  const dupSha = await runFlow({
+    name: "p4-dup", config: "../test/configs/verdict-gate.config.json", args: ["--from", "worker"],
+    env: { ORCA_VERIFY_HEAD_SHA: HEAD_SHA }, stdinText: "n\n",
+    seedArtifacts: [{ file: "CONTRACT_REVIEW.md", text: `# Review\nContract-Commit: ${HEAD_SHA}\nContract-Commit: ${STALE_SHA}\n\n${filler}\nVERDICT: PASS\n` }],
+  });
+  ok("P4 duplicate Contract-Commit blocked", dupSha.code !== 0 && /ambiguous Contract-Commit/.test(dupSha.out + dupSha.err));
+
+  const valid = await runFlow({
+    name: "p4-valid", config: "../test/configs/verdict-gate.config.json", args: ["--from", "worker"],
+    env: { ORCA_VERIFY_HEAD_SHA: HEAD_SHA },
+    seedArtifacts: [{ file: "CONTRACT_REVIEW.md", text: `# Review\nContract-Commit: ${HEAD_SHA}\n\n${filler}\nVERDICT: PASS\n` }],
+  });
+  eq("P4 exact 40-char HEAD SHA + VERDICT: PASS allowed", valid.code, 0);
+  eq("P4 worker dispatched once", valid.by("orchestration worker-start").length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// P5 — 3-Track dry-run validation & bad verify / isolatedWorktree config errors
+// ---------------------------------------------------------------------------
+scenario("P5 3-track dry-run & verify/isolation config validation", async () => {
+  for (const cfg of ["flow-hotfix.json", "flow-feature.json", "flow-epic.json"]) {
+    const r = await runFlow({ name: `p5-${cfg}`, config: cfg, args: ["--dry-run"], objective: "smoke" });
+    eq(`P5 ${cfg} dry-run exit`, r.code, 0);
+    ok(`P5 ${cfg} shows target branch dev`, /Target branch: dev/.test(r.out));
+  }
+  const epic = await runFlow({ name: "p5-epic", config: "flow-epic.json", args: ["--dry-run"], objective: "smoke" });
+  ok("P5 flow-epic shows isolated-wt flag", /isolated-wt/.test(epic.out));
+  ok("P5 flow-epic shows contract-review verify flag", /verify=verdict:PASS,commit:HEAD/.test(epic.out));
+
+  const badVerify = await runFlow({ name: "p5-badv", config: "../test/configs/bad-verify-key.json", args: ["--dry-run"], objective: "x" });
+  ok("P5 bad verify key rejected", badVerify.code !== 0 && /unknown verify rule/.test(badVerify.out + badVerify.err));
+
+  const badIso = await runFlow({ name: "p5-badi", config: "../test/configs/bad-isolated-type.json", args: ["--dry-run"], objective: "x" });
+  ok("P5 bad isolatedWorktree type rejected", badIso.code !== 0 && /isolatedWorktree must be a boolean/.test(badIso.out + badIso.err));
+});
+
+// ---------------------------------------------------------------------------
+// P6 — Installer ships new engine modules & --upgrade-engine preserves custom AGENTS.md
+// ---------------------------------------------------------------------------
+scenario("P6 installer ships gate-verify & worktree-isolation and --upgrade-engine preserves AGENTS.md", async () => {
+  const r = await runInit({ name: "p6" });
+  eq("P6 fresh install exit", r.code, 0);
+  ok("P6 installed gate-verify.mjs", existsSync(join(r.dir, ".orca", "gate-verify.mjs")));
+  ok("P6 installed worktree-isolation.mjs", existsSync(join(r.dir, ".orca", "worktree-isolation.mjs")));
+  writeFileSync(join(r.dir, "AGENTS.md"), "# CUSTOM PROJECT AGENTS\n");
+  writeFileSync(join(r.dir, ".orca", "flow.mjs"), "// stale engine\n");
+  const up = await runInit({ name: "p6-up", dir: r.dir, args: ["--upgrade-engine"] });
+  eq("P6 upgrade-engine exit", up.code, 0);
+  ok("P6 upgrade-engine refreshed flow.mjs", !readFileSync(join(r.dir, ".orca", "flow.mjs"), "utf8").includes("stale engine"));
+  eq("P6 upgrade-engine preserved custom AGENTS.md", readFileSync(join(r.dir, "AGENTS.md"), "utf8"), "# CUSTOM PROJECT AGENTS\n");
+});
+
+// ---------------------------------------------------------------------------
+// P7 — Post-merge retry loop (B1), protected targetBranch guard (M6),
+// heading/quote conflicting verdict rejection, and bold Contract-Commit parsing
+// ---------------------------------------------------------------------------
+scenario("P7 post-merge retry loop succeeds without Contract-Commit deadlock + protected branch guard", async () => {
+  const CONTRACT_SHA = "6666666666666666666666666666666666666666";
+  const r = await runFlow({
+    name: "p7-retry",
+    config: "../test/configs/post-merge-retry.config.json",
+    scenario: "post-merge-retry.cjs",
+    objective: "#epic 中文模块测试",
+    env: { ORCA_VERIFY_HEAD_SHA: CONTRACT_SHA },
+    budgetMs: 90000,
+  });
+  ok("P7 not hung", !r.hung);
+  eq("P7 exit code", r.code, 0);
+  eq("P7 worker-backend ran twice (reused isolated wt on retry)", r.state?.extra?.beRuns, 2);
+  eq("P7 only 1 worktree created (reused on retry)", r.by("worktree create").length, 1);
+  eq("P7 serial-integration ran twice and passed", r.state?.extra?.intRuns, 2);
+  const mf = JSON.parse(readFileSync(join(r.wt, ".orca", "artifacts", "WORKTREES.json"), "utf8"));
+  eq("P7 manifest recorded verifiedContractCommit", mf.verifiedContractCommit, CONTRACT_SHA);
+  eq("P7 manifest recorded mergedAfterContract", mf.mergedAfterContract, true);
+  ok("P7 Chinese objective got unique hashed worktree name", /^wt-epic-worker-backend-[0-9a-f]{6}$/.test(mf.tasks?.["worker-backend"]?.wtName || ""));
+
+  // Protected targetBranch must be refused at load time
+  const badTarget = await runFlow({ name: "p7-prot", config: "../test/configs/bad-protected-target.json", args: ["--dry-run"], objective: "x" });
+  ok("P7 protected targetBranch main refused", badTarget.code !== 0 && /protectedBranches/.test(badTarget.out + badTarget.err));
+
+  // Heading-style conflicting VERDICT: FAIL before trailing VERDICT: PASS must be rejected
+  const headingConflict = await runFlow({
+    name: "p7-head", config: "../test/configs/verdict-gate.config.json", args: ["--from", "worker"],
+    env: { ORCA_VERIFY_HEAD_SHA: CONTRACT_SHA }, stdinText: "n\n",
+    seedArtifacts: [{
+      file: "CONTRACT_REVIEW.md",
+      text: `# Review\n**Contract-Commit:** ${CONTRACT_SHA}\n\n## VERDICT: FAIL\n\n` + "Details.\n".repeat(25) + "\nVERDICT: PASS\n",
+    }],
+  });
+  ok("P7 heading conflicting VERDICT: FAIL rejected", headingConflict.code !== 0 && /conflicting verdict/.test(headingConflict.out + headingConflict.err));
 });
 
 // ---------------------------------------------------------------------------

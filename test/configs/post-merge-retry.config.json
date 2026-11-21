@@ -1,0 +1,74 @@
+{
+  "artifactsDir": ".orca/artifacts",
+  "maxRetries": 2,
+  "autoRun": true,
+  "defaults": {
+    "timeoutMs": 60000,
+    "model": "default",
+    "nudgeRetries": 0,
+    "targetBranch": "dev",
+    "protectedBranches": [
+      "main",
+      "master"
+    ]
+  },
+  "pipeline": [
+    {
+      "id": "contract-review",
+      "title": "Contract Review",
+      "enabled": true,
+      "agent": "codex",
+      "writes": "CONTRACT_REVIEW.md",
+      "reads": [],
+      "verify": {
+        "requireVerdict": "PASS",
+        "requireContractCommit": "HEAD"
+      },
+      "spec": "Review contracts."
+    },
+    {
+      "id": "worker-backend",
+      "title": "Worker Backend",
+      "enabled": true,
+      "agent": "opencode",
+      "isolatedWorktree": true,
+      "writes": "BACKEND_CHANGES.md",
+      "reads": [
+        "contract-review"
+      ],
+      "spec": "Backend task."
+    },
+    {
+      "id": "task-review-merge",
+      "title": "Task Review Merge",
+      "enabled": true,
+      "agent": "codex",
+      "writes": "TASK_REVIEW_MERGE.md",
+      "reads": [
+        "contract-review",
+        "worker-backend"
+      ],
+      "verify": {
+        "requireVerdict": "PASS",
+        "requireMergedTasks": true
+      },
+      "spec": "Merge task branch."
+    },
+    {
+      "id": "serial-integration",
+      "title": "Serial Integration",
+      "enabled": true,
+      "agent": "opencode",
+      "writes": "INTEGRATION_REPORT.md",
+      "reads": [
+        "task-review-merge"
+      ],
+      "onFailGoto": "worker-backend",
+      "maxRetries": 2,
+      "verify": {
+        "requireVerdict": "PASS"
+      },
+      "spec": "Run integration."
+    }
+  ]
+}

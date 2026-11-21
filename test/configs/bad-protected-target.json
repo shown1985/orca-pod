@@ -1,0 +1,21 @@
+{
+  "artifactsDir": ".orca/artifacts",
+  "defaults": {
+    "targetBranch": "main",
+    "protectedBranches": [
+      "main",
+      "master"
+    ]
+  },
+  "pipeline": [
+    {
+      "id": "a",
+      "title": "A",
+      "enabled": true,
+      "agent": "codex",
+      "writes": "A.md",
+      "reads": [],
+      "spec": "x"
+    }
+  ]
+}

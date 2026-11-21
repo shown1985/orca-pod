@@ -1,0 +1,15 @@
+{
+  "artifactsDir": ".orca/artifacts",
+  "pipeline": [
+    {
+      "id": "a",
+      "title": "A",
+      "enabled": true,
+      "agent": "opencode",
+      "isolatedWorktree": "yes",
+      "writes": "A.md",
+      "reads": [],
+      "spec": "x"
+    }
+  ]
+}

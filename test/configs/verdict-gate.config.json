@@ -1,0 +1,49 @@
+{
+  "artifactsDir": ".orca/artifacts",
+  "maxRetries": 2,
+  "autoRun": true,
+  "defaults": {
+    "timeoutMs": 60000,
+    "model": "default",
+    "nudgeRetries": 0
+  },
+  "pipeline": [
+    {
+      "id": "contract-arch",
+      "title": "Contract Arch",
+      "enabled": true,
+      "agent": "gemini",
+      "writes": "CONTRACT.md",
+      "reads": [],
+      "spec": "Write {out}."
+    },
+    {
+      "id": "contract-review",
+      "title": "Contract Review",
+      "enabled": true,
+      "agent": "codex",
+      "writes": "CONTRACT_REVIEW.md",
+      "reads": [
+        "contract-arch"
+      ],
+      "onFailGoto": "contract-arch",
+      "maxRetries": 2,
+      "verify": {
+        "requireVerdict": "PASS",
+        "requireContractCommit": "HEAD"
+      },
+      "spec": "Audit {reads} and write {out}."
+    },
+    {
+      "id": "worker",
+      "title": "Worker",
+      "enabled": true,
+      "agent": "opencode",
+      "writes": "CHANGES.md",
+      "reads": [
+        "contract-review"
+      ],
+      "spec": "Code per {reads} and write {out}."
+    }
+  ]
+}

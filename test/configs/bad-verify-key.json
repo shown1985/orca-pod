@@ -1,0 +1,17 @@
+{
+  "artifactsDir": ".orca/artifacts",
+  "pipeline": [
+    {
+      "id": "a",
+      "title": "A",
+      "enabled": true,
+      "agent": "codex",
+      "writes": "A.md",
+      "reads": [],
+      "verify": {
+        "unknownRule": true
+      },
+      "spec": "x"
+    }
+  ]
+}

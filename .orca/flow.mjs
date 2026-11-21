@@ -13,8 +13,8 @@
 //   node .orca/flow.mjs --agent coding=claude "."# override step agent
 //   node .orca/flow.mjs --status-preview         # render fixture dashboard
 
-import { readFileSync, mkdirSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { readFileSync, mkdirSync, existsSync, realpathSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateAgentConfig, restoreAgentConfig } from "./agent-config.mjs";
 import { validateVerifyConfig, verifyStepArtifact } from "./gate-verify.mjs";
@@ -31,6 +31,7 @@ import {
   acquireRunLock,
   releaseRunLock,
   listLedgerSummaries,
+  computeFileSha256,
 } from "./ledger.mjs";
 import { scanLocalAgents, recommendStrategy, formatScanReport } from "./agent-scanner.mjs";
 import { runStrategyWizard } from "./strategy-wizard.mjs";
@@ -39,6 +40,7 @@ import {
   resolveIssueTrackingConfig,
   detectIssueProvider,
   loadIssueState,
+  saveIssueState,
   syncPlanIssues,
 } from "./issue-tracker.mjs";
 import { generateCiCdFiles } from "./ci-generator.mjs";
@@ -447,14 +449,44 @@ log(`Run: ${runId}`);
 LEDGER.setOrcaRunId(runId);
 statusMgr.initStatus();
 const resumedLedgerRunKey = statusMgr.getResumedLedgerRunKey();
-if ((opt.from || opt.only) && resumedLedgerRunKey) {
+const resumedLineageId = statusMgr.getResumedLineageId();
+const resumedLineageRunKeys = statusMgr.getResumedLineageRunKeys();
+if ((opt.from || opt.only) && resumedLineageRunKeys.length > 0) {
   try {
+    const canonDir = (p) => { try { return realpathSync(p); } catch { return resolve(p); } };
+    const resolvedWt = canonDir(WT_DIR || ".");
     const priorSummaries = listLedgerSummaries({ ledgerHome: LEDGER_HOME_CFG, repoDir: WT_DIR || "." });
-    const matched = priorSummaries.find((s) => s && s.runKey === resumedLedgerRunKey && (!s.objective || !objective || s.objective === objective));
-    if (matched) BOUND_PREV_LEDGER = matched;
+    const byKey = new Map(priorSummaries.filter((s) => s && s.runKey).map((s) => [s.runKey, s]));
+    const mergedSteps = {};
+    let anyMatched = false;
+    // Merge verified steps chronologically across the run lineage so consecutive `--from` resumes
+    // retain verified author/review provenance from earlier runs in the exact same lineage!
+    for (const rk of resumedLineageRunKeys) {
+      const s = byKey.get(rk);
+      if (!s) continue;
+      if (!s.objective || !objective || s.objective !== objective) continue;
+      if (s.worktreeDir && canonDir(s.worktreeDir) !== resolvedWt) continue;
+      anyMatched = true;
+      for (const [sid, stepRec] of Object.entries(s.steps || {})) {
+        mergedSteps[sid] = stepRec;
+        if (stepRec?.outcome === "succeeded") {
+          statusMgr.statusSet(sid, { provenanceVerified: true });
+        }
+      }
+    }
+    if (anyMatched) {
+      BOUND_PREV_LEDGER = {
+        runKey: resumedLedgerRunKey,
+        lineageId: resumedLineageId || resumedLineageRunKeys[0],
+        lineageRunKeys: resumedLineageRunKeys,
+        steps: mergedSteps,
+      };
+    }
   } catch {}
 }
-statusMgr.setLedgerRunKey(LEDGER.runKey);
+const activeLineageId = resumedLineageId || LEDGER.runKey;
+const activeLineageRunKeys = [...new Set([...resumedLineageRunKeys, LEDGER.runKey])];
+statusMgr.setLedgerRunKey(LEDGER.runKey, { lineageId: activeLineageId, lineageRunKeys: activeLineageRunKeys });
 statusMgr.writeStatus();
 
 // Initialize GitHub/Gitea Issue traceability (auto-enabled when gh/tea & remote available; strictly isolated on --no-issues)
@@ -476,14 +508,24 @@ if (ISSUE_CFG.mode === false) {
     objective,
     epicIssue: ISSUE_CFG.epicIssue,
     runScopeId: opt.from ? resumedLedgerRunKey : LEDGER.runKey,
+    priorRunScopeIds: opt.from ? resumedLineageRunKeys : [],
+    lineageId: opt.from ? resumedLineageId : activeLineageId,
     requireRunScope: Boolean(opt.from),
   });
+  // P1-05: Atomically migrate loaded ISSUES.json to the active runScopeId & lineageId so
+  // multiple consecutive `--from` resumes (even without re-running planning steps) preserve Epic/Task links!
+  if (ISSUE_STATE && opt.from) {
+    ISSUE_STATE.runScopeId = LEDGER.runKey;
+    ISSUE_STATE.lineageId = activeLineageId;
+    saveIssueState(artDirAbs, ISSUE_STATE);
+    LEDGER?.recordIssueLinks(ISSUE_STATE);
+  }
   log(`[issues] enabled (provider=${ISSUE_PROVIDER.provider}${ISSUE_PROVIDER.repo ? `, repo=${ISSUE_PROVIDER.repo}` : ""}${ISSUE_CFG.epicIssue ? `, epic=#${ISSUE_CFG.epicIssue}` : ""})`);
   if (ISSUE_CFG.epicIssue && ISSUE_STATE?.epic?.number !== ISSUE_CFG.epicIssue) {
     ISSUE_STATE = syncPlanIssues({
       providerInfo: ISSUE_PROVIDER, config: ISSUE_CFG, repoDir: WT_DIR || ".", artDirAbs,
       objective, stepId: "init", artifactPath: null,
-      runScopeId: LEDGER.runKey, priorRunScopeId: opt.from ? resumedLedgerRunKey : null, requireRunScope: Boolean(opt.from),
+      runScopeId: LEDGER.runKey, priorRunScopeIds: opt.from ? resumedLineageRunKeys : [], lineageId: activeLineageId, requireRunScope: Boolean(opt.from),
       log, warn,
     });
     if (ISSUE_STATE) LEDGER?.recordIssueLinks(ISSUE_STATE);
@@ -508,6 +550,8 @@ while (gi < groups.length) {
       const checkDir = r.ctx?.isolated ? r.ctx.dir : (WT_DIR || ".");
       vres = verifyStepArtifact(r.step, join(WT_DIR || ".", ART_DIR), checkDir, READINESS_MIN_BYTES, {
         mode: "settlement", targetBranch: TARGET_BRANCH, allowOneWayMerge: opt.allowOneWayMerge,
+        dispatchId: r.dispatchId || null,
+        fsEpochMtimeMs: r.fsEpochMtimeMs,
         minMtimeMs: r.clearedAtMs, clearedBeforeDispatch: r.clearedBeforeDispatch,
         preStepTargetSha: r.preStepTargetSha, preStepOriginTargetSha: r.preStepOriginTargetSha,
         preStepRemoteTargetSha: r.preStepRemoteTargetSha, preStepRemoteError: r.preStepRemoteError,
@@ -556,7 +600,19 @@ while (gi < groups.length) {
       }
     }
     if (LEDGER) {
-      LEDGER.recordStepSettled({ stepId: r.step.id, outcome: r.outcome, note: r.note || null, verifyOk: vres ? vres.ok : null, verifyReason: vres ? vres.reason : null, contractCommit: vres?.contractCommit || null });
+      const settledArtPath = r.step.writes ? join(WT_DIR || ".", ART_DIR, r.step.writes) : null;
+      const settledArtSha = r.outcome === "succeeded" ? computeFileSha256(settledArtPath) : null;
+      const curStepHead = headSha() || null;
+      LEDGER.recordStepSettled({
+        stepId: r.step.id,
+        outcome: r.outcome,
+        note: r.note || null,
+        verifyOk: vres ? vres.ok : null,
+        verifyReason: vres ? vres.reason : null,
+        contractCommit: vres?.contractCommit || null,
+        artifactSha256: settledArtSha,
+        stepHeadSha: curStepHead,
+      });
       if (r.outcome === "succeeded") {
         LEDGER.updateIntegrationHead(WT_DIR || ".");
         const isImplStep = Boolean(r.ctx?.isolated || /(?:worker|coding|impl|fix|integration)/i.test(r.step.id));
@@ -578,7 +634,7 @@ while (gi < groups.length) {
           ISSUE_STATE = syncPlanIssues({
             providerInfo: ISSUE_PROVIDER, config: ISSUE_CFG, repoDir: WT_DIR || ".", artDirAbs,
             objective, stepId: r.step.id, artifactPath: planArt,
-            runScopeId: LEDGER.runKey, priorRunScopeId: opt.from ? resumedLedgerRunKey : null, requireRunScope: Boolean(opt.from),
+            runScopeId: LEDGER.runKey, priorRunScopeIds: opt.from ? resumedLineageRunKeys : [], lineageId: activeLineageId, requireRunScope: Boolean(opt.from),
             log, warn,
           });
           if (ISSUE_STATE) LEDGER?.recordIssueLinks(ISSUE_STATE);

@@ -2,12 +2,13 @@
 //
 // Zero external dependencies (Node builtins only).
 
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 
 export const WORKTREES_MANIFEST = "WORKTREES.json";
+export const DISPATCH_GATE_CLAIMS_FILE = ".dispatch-gate-claims.json";
 const CASE_INSENSITIVE_FS = process.platform === "win32" || process.platform === "darwin";
 
 function samePath(a, b) {
@@ -82,7 +83,7 @@ function ensureLocalGitExclude(stepWtDir, artDirRel) {
     mkdirSync(dirname(excludePath), { recursive: true });
     const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
     const lines = existing.split(/\r?\n/);
-    const wanted = [`${relClean}/`, ".orca-agent-config-manifest.json"];
+    const wanted = [`${relClean}/`, ".orca-agent-config-manifest.json", ".orca-agent-config.json"];
     const toAdd = wanted.filter((w) => !lines.includes(w));
     if (toAdd.length) {
       const base = existing ? existing.replace(/\r?\n?$/, "\n") : "";
@@ -168,13 +169,72 @@ export function recordMergedAfterContract(artDir, wtDir) {
   writeWorktreesManifest(artDir, manifest);
 }
 
+function readGateClaims(artDir) {
+  const p = join(artDir, DISPATCH_GATE_CLAIMS_FILE);
+  if (!existsSync(p)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(p, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeGateClaims(artDir, claims) {
+  mkdirSync(artDir, { recursive: true });
+  const tmp = join(artDir, `${DISPATCH_GATE_CLAIMS_FILE}.tmp.${process.pid}.${Date.now()}`);
+  writeFileSync(tmp, JSON.stringify(claims, null, 2) + "\n", "utf8");
+  try {
+    rmSync(join(artDir, DISPATCH_GATE_CLAIMS_FILE), { force: true });
+  } catch {}
+  copyFileSync(tmp, join(artDir, DISPATCH_GATE_CLAIMS_FILE));
+  try { rmSync(tmp, { force: true }); } catch {}
+}
+
+function sampleFsEpochMtimeMs(dir) {
+  mkdirSync(dir, { recursive: true });
+  const canary = join(dir, `.orca-fs-epoch-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`);
+  try {
+    writeFileSync(canary, "", "utf8");
+    const ms = statSync(canary).mtimeMs;
+    rmSync(canary, { force: true });
+    return ms;
+  } catch {
+    try { rmSync(canary, { force: true }); } catch {}
+    return Date.now();
+  }
+}
+
 /**
- * Remove stale output artifact before launching a step so a PASS written in an
- * earlier round can never survive a crash or skipped rewrite on retry.
- * Throws if an existing stale artifact cannot be deleted cleanly.
+ * Bind the active `dispatchId` to `step.writes` in `.dispatch-gate-claims.json` immediately
+ * upon worker launch so settlement verification can prove per-dispatch artifact ownership!
+ */
+export function bindStepArtifactDispatchClaim(wtDir, artDirRel, step, { dispatchId, taskId = null, fsEpochMtimeMs = null, clearedAtMs = null } = {}) {
+  if (!step || !step.writes) return;
+  const artDir = join(wtDir, artDirRel);
+  const claims = readGateClaims(artDir);
+  claims[step.writes] = {
+    stepId: step.id,
+    writes: step.writes,
+    activeDispatchId: dispatchId || null,
+    taskId: taskId || null,
+    cleared: true,
+    fsEpochMtimeMs: fsEpochMtimeMs ?? clearedAtMs ?? Date.now(),
+    clearedAtMs: clearedAtMs ?? Date.now(),
+    boundAt: new Date().toISOString(),
+  };
+  writeGateClaims(artDir, claims);
+}
+
+/**
+ * Remove stale output artifact before EVERY actual dispatch attempt so a PASS written in an
+ * earlier round or abandoned attempt can never survive a crash or skipped rewrite on retry.
+ * Samples kernel filesystem monotonic mtime (`fsEpochMtimeMs`) AFTER unlinking and resets
+ * the dispatch claim entry; throws if an existing stale artifact cannot be deleted cleanly.
  */
 export function clearStaleStepArtifact(step, wtDir, stepWtDir, artDirRel) {
-  if (!step || !step.writes) return { cleared: true, clearedAtMs: Date.now(), targets: [] };
+  if (!step || !step.writes) return { cleared: true, clearedAtMs: Date.now(), fsEpochMtimeMs: Date.now(), targets: [] };
+  const artDir = join(wtDir, artDirRel);
   const targets = [join(wtDir, artDirRel, step.writes)];
   if (stepWtDir && !samePath(stepWtDir, wtDir)) {
     targets.push(join(stepWtDir, artDirRel, step.writes));
@@ -192,7 +252,22 @@ export function clearStaleStepArtifact(step, wtDir, stepWtDir, artDirRel) {
       throw new Error(`[worktree-isolation] stale step artifact "${p}" still exists after unlink — refusing unsafe dispatch`);
     }
   }
-  return { cleared: true, clearedAtMs: Date.now(), targets };
+  const clearedAtMs = Date.now();
+  const sampleDir = (stepWtDir && !samePath(stepWtDir, wtDir)) ? join(stepWtDir, artDirRel) : artDir;
+  const fsEpochMtimeMs = sampleFsEpochMtimeMs(sampleDir);
+  const claims = readGateClaims(artDir);
+  claims[step.writes] = {
+    stepId: step.id,
+    writes: step.writes,
+    activeDispatchId: null,
+    taskId: null,
+    cleared: true,
+    fsEpochMtimeMs,
+    clearedAtMs,
+    boundAt: null,
+  };
+  writeGateClaims(artDir, claims);
+  return { cleared: true, clearedAtMs, fsEpochMtimeMs, targets };
 }
 
 /**
@@ -233,18 +308,26 @@ export function syncInputsToIsolatedWorktree({ step, wtDir, stepWtDir, artDirRel
 
 /**
  * Sync the isolated step's output artifact and progress checklist back to the
- * integration worktree's artifacts dir.
+ * integration worktree's artifacts dir, preserving the source file's exact `mtime`
+ * (never laundering a stale pre-dispatch file with a fresh copy timestamp!).
  */
-export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDirRel }) {
+export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDirRel, minSourceMtimeMs = null }) {
   if (!stepWtDir || samePath(stepWtDir, wtDir)) return;
   const srcArt = join(stepWtDir, artDirRel);
   const dstArt = join(wtDir, artDirRel);
   mkdirSync(dstArt, { recursive: true });
   for (const fname of [step.writes, step.progress].filter(Boolean)) {
     const src = join(srcArt, fname);
-    if (existsSync(src)) {
-      try { copyFileSync(src, join(dstArt, fname)); } catch { /* best-effort */ }
-    }
+    if (!existsSync(src)) continue;
+    try {
+      const st = statSync(src);
+      if (fname === step.writes && minSourceMtimeMs != null && Number.isFinite(minSourceMtimeMs) && st.mtimeMs < minSourceMtimeMs) {
+        continue;
+      }
+      const dst = join(dstArt, fname);
+      copyFileSync(src, dst);
+      try { utimesSync(dst, st.atime, st.mtime); } catch {}
+    } catch { /* best-effort */ }
   }
 }
 
@@ -401,9 +484,9 @@ export function prepareStepWorktree({
  * Record final commit SHA / dirty status and sync artifacts back to the
  * integration worktree AFTER agent config has been restored.
  */
-export function finalizeStepWorktree({ step, stepCtx, outcome, wtDir, artDirRel, isolatedState }) {
+export function finalizeStepWorktree({ step, stepCtx, outcome, wtDir, artDirRel, isolatedState, minSourceMtimeMs = null }) {
   if (!stepCtx || !stepCtx.isolated) return;
-  syncOutputsFromIsolatedWorktree({ step, stepWtDir: stepCtx.dir, wtDir, artDirRel });
+  syncOutputsFromIsolatedWorktree({ step, stepWtDir: stepCtx.dir, wtDir, artDirRel, minSourceMtimeMs });
   const artDir = join(wtDir, artDirRel);
   const manifest = readWorktreesManifest(artDir);
   const entry = isolatedState[step.id] || manifest.tasks[step.id] || {

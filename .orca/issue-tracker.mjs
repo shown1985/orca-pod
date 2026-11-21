@@ -302,12 +302,32 @@ export function detectIssueProvider({
 
 /**
  * Extract an explicit current-repo issue linkage marker from a task title.
- * Plain prose numbers like `"Retry step #2"` or cross-repo `"owner/repo#17"` are NEVER treated as local issues;
- * requires `[#42]`, `(Issue #42)`, `Issue: #42`, or `(Refs #42)` / `Fixes #42` / `Closes #42`.
+ * Plain prose numbers like `"Retry step #2"`, cross-repo `"owner/repo#17"`, or Markdown links
+ * pointing to external repositories like `[Issue #42](https://github.com/other/repo/issues/42)`
+ * are NEVER treated as local issues!
  */
-export function extractExplicitLocalIssueNumber(text) {
-  const s = String(text || "");
-  const m = s.match(/(?:^|[\s(\[])(?:\[#(\d+)\]|(?:issue|gh|gitea)\s*[:#]?\s*#(\d+)|(?:refs?|closes|fixes|resolves)\s+#(\d+))(?=$|[\s)\],.;:])/i);
+export function extractExplicitLocalIssueNumber(text, { currentHost = null, currentRepo = null } = {}) {
+  let linkedSameRepoNum = null;
+  const sanitizedForScan = String(text || "").replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_full, label, rawUrl) => {
+    const u = String(rawUrl || "").trim();
+    const issueUrlMatch = u.match(/^https?:\/\/([^/\s]+)\/([^/\s]+\/[^/\s]+)\/issues\/(\d+)(?:[/?#].*)?$/i);
+    if (issueUrlMatch && currentRepo) {
+      const linkHost = issueUrlMatch[1].replace(/^\[|\]$/g, "").toLowerCase();
+      const linkRepo = issueUrlMatch[2].replace(/\.git$/i, "").toLowerCase();
+      const wantRepo = String(currentRepo).toLowerCase();
+      const hostOk = !currentHost || linkHost === String(currentHost).replace(/^\[|\]$/g, "").toLowerCase();
+      if (hostOk && linkRepo === wantRepo) {
+        const n = Number(issueUrlMatch[3]);
+        if (Number.isInteger(n) && n > 0 && linkedSameRepoNum == null) linkedSameRepoNum = n;
+        return label;
+      }
+    }
+    // External or non-issue URL: strip `#<digits>` inside the link label so external `#42` never leaks!
+    return String(label || "").replace(/#\d+\b/g, "");
+  });
+  if (linkedSameRepoNum != null) return linkedSameRepoNum;
+
+  const m = sanitizedForScan.match(/(?:^|[\s(\[])(?:\[#(\d+)\]|(?:issue|gh|gitea)\s*[:#]?\s*#(\d+)|(?:refs?|closes|fixes|resolves)\s+#(\d+))(?=$|[\s)\],.;:])/i);
   if (!m) return null;
   const n = Number(m[1] || m[2] || m[3]);
   return Number.isInteger(n) && n > 0 ? n : null;
@@ -316,10 +336,10 @@ export function extractExplicitLocalIssueNumber(text) {
 /**
  * Parse sub-tasks from BACKLOG_DAG.md, MICRO_PLAN.md, or ROOT_CAUSE.md.
  * Hardened against code fences, checked-off `[x]` items, arbitrary `[bracket]` headings,
- * cross-repo `owner/repo#N` references, prose `#N` false links, auto/explicit `T<n>` ID collisions,
- * and short CJK titles.
+ * cross-repo `owner/repo#N` references, external Markdown links `[Issue #42](https://.../other/repo/issues/42)`,
+ * prose `#N` false links, auto/explicit `T<n>` ID collisions, and short CJK titles.
  */
-export function parseBacklogTasks(markdown, { maxTasks = 20 } = {}) {
+export function parseBacklogTasks(markdown, { maxTasks = 20, currentHost = null, currentRepo = null } = {}) {
   if (typeof markdown !== "string" || !markdown.trim()) return [];
   const rawCandidates = [];
 
@@ -336,7 +356,7 @@ export function parseBacklogTasks(markdown, { maxTasks = 20 } = {}) {
     const normId = id ? String(id).trim().replace(/\s+/g, "") : null;
     const num = (Number.isInteger(existingNumber) && existingNumber > 0)
       ? existingNumber
-      : extractExplicitLocalIssueNumber(title);
+      : extractExplicitLocalIssueNumber(title, { currentHost, currentRepo });
 
     const inferredOwner = owner || (/\b(backend|server|api|db|mysql|sql|python)\b|(?:后端|数据库|建表|迁移|接口)/i.test(cleanTitle)
       ? "backend"
@@ -474,15 +494,49 @@ export function parseIssueNumberFromOutput(text) {
 }
 
 /**
+ * Extract an already-created issue URL ONLY from trusted `stdout` (NEVER `stderr` diagnostics!),
+ * requiring exact `host` and `owner/repo` match when known.
+ */
+export function parseTrustedCreatedIssueUrl(stdout = "", { host = null, repo = null } = {}) {
+  if (!stdout) return { number: null, url: null };
+  for (const rawLine of String(stdout).split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const m = line.match(/^(https?:\/\/[^\s"'<>]+\/issues\/(\d+))$/i);
+    if (!m) continue;
+    const urlStr = m[1];
+    const num = Number(m[2]);
+    if (!Number.isInteger(num) || num <= 0) continue;
+    let parsedUrl = null;
+    try { parsedUrl = new URL(urlStr); } catch { continue; }
+    if (host) {
+      const wantHost = String(host).replace(/^\[|\]$/g, "").toLowerCase();
+      const gotHost = parsedUrl.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+      if (gotHost !== wantHost) continue;
+    }
+    if (repo) {
+      const wantSuffix = `/${String(repo).replace(/^\/+|\/+$/g, "").toLowerCase()}/issues/${num}`;
+      const gotPath = parsedUrl.pathname.replace(/\/+$/, "").toLowerCase();
+      if (!gotPath.endsWith(wantSuffix)) continue;
+    }
+    return { number: num, url: urlStr };
+  }
+  return { number: null, url: null };
+}
+
+/**
  * Return `true` ONLY when an issue-create invocation failed BEFORE creating any issue on the forge
- * due to a missing/unknown label rejection (never on timeouts, transport errors, or partial post-create label errors).
+ * due to an explicit missing/unknown LABEL rejection (NEVER on generic 404 "repository" not found,
+ * timeouts, transport errors, or partial post-create label errors).
  */
 export function isMissingLabelError(stderr = "", stdout = "", timedOut = false) {
   if (timedOut) return false;
   const combined = `${stderr}\n${stdout}`;
-  if (/https?:\/\/[^\s"'<>]+\/issues\/\d+/.test(combined)) return false;
+  if (/https?:\/\/[^\s"'<>]+\/issues\/\d+/.test(stdout)) return false;
   if (TRANSPORT_ERR_RE.test(combined)) return false;
-  return /(?:label\s+['"`]?[\w.:-]+['"`]?\s+(?:not found|does not exist)|['"`][^'"`\r\n]+['"`]\s+not found|label[^\r\n]*(?:not found|does not exist|unknown label)|\b422\b[^\r\n]*label)/i.test(combined);
+  if (/\b(?:repository|repo|project|organization|owner|user|endpoint)\b[^\r\n]*not found/i.test(combined) && !/\blabels?\b/i.test(combined)) {
+    return false;
+  }
+  return /\blabels?\b[^\r\n]*(?:not found|does not exist|doesn't exist|unknown|invalid|cannot find)|(?:not found|does not exist|doesn't exist|unknown)\s+\blabels?\b/i.test(combined);
 }
 
 export function createIssueViaCli({
@@ -520,15 +574,15 @@ export function createIssueViaCli({
   };
 
   let res = runCreate(true);
-  // Reconcile ALREADY-CREATED issue URL first! Some CLIs create the issue first, print its URL,
-  // and exit non-zero if a subsequent label attachment fails — NEVER create a duplicate issue in that case!
-  const firstCreated = parseIssueNumberFromOutput(`${res.stdout}\n${res.stderr}`);
+  // P1-07: Reconcile ALREADY-CREATED issue URL ONLY from trusted `stdout` matching exact host + owner/repo!
+  // Never trust an external issue URL mentioned inside `stderr` error diagnostics!
+  const firstCreated = parseTrustedCreatedIssueUrl(res.stdout, { host, repo });
   if (firstCreated.url && firstCreated.number != null) {
     return {
       ok: true,
       number: firstCreated.number,
       url: firstCreated.url,
-      raw: sanitizeText(res.stdout || res.stderr, { maxLen: 240 }),
+      raw: sanitizeText(res.stdout, { maxLen: 240 }),
       labelWarning: !res.ok ? sanitizeText(res.stderr || "label attach failed after create", { maxLen: 200 }) : null,
       error: null,
     };
@@ -542,7 +596,8 @@ export function createIssueViaCli({
     const rawErr = res.stderr || res.stdout || res.error || "issue create failed";
     return { ok: false, number: null, url: null, error: sanitizeText(rawErr, { maxLen: 240 }) };
   }
-  const parsed = parseIssueNumberFromOutput(`${res.stdout}\n${res.stderr}`);
+  const trustedUrl = parseTrustedCreatedIssueUrl(res.stdout, { host, repo });
+  const parsed = trustedUrl.number != null ? trustedUrl : parseIssueNumberFromOutput(res.stdout);
   return {
     ok: parsed.number != null,
     number: parsed.number,
@@ -645,10 +700,22 @@ export function loadIssueState(artDirAbs, matchScope = null) {
       }
     }
 
-    const allowedRunIds = [matchScope.runScopeId, matchScope.priorRunScopeId].filter(Boolean);
-    if (matchScope.requireRunScope && allowedRunIds.length === 0) return null;
-    if (allowedRunIds.length > 0 && (!parsed.runScopeId || !allowedRunIds.includes(parsed.runScopeId))) {
-      return null;
+    const allowedRunIds = [
+      ...new Set(
+        [
+          matchScope.runScopeId,
+          matchScope.priorRunScopeId,
+          ...(Array.isArray(matchScope.priorRunScopeIds) ? matchScope.priorRunScopeIds : []),
+        ].filter(Boolean)
+      ),
+    ];
+    const wantLineage = matchScope.lineageId || null;
+    const lineageMatches = Boolean(wantLineage && parsed.lineageId && parsed.lineageId === wantLineage);
+    if (matchScope.requireRunScope && allowedRunIds.length === 0 && !wantLineage) return null;
+    if ((allowedRunIds.length > 0 || wantLineage) && !lineageMatches) {
+      if (!parsed.runScopeId || !allowedRunIds.includes(parsed.runScopeId)) {
+        return null;
+      }
     }
   }
   return parsed;
@@ -696,6 +763,8 @@ export function syncPlanIssues({
   artifactPath = null,
   runScopeId = null,
   priorRunScopeId = null,
+  priorRunScopeIds = [],
+  lineageId = null,
   requireRunScope = false,
   adoptLegacy = false,
   execFn = defaultExec,
@@ -712,6 +781,8 @@ export function syncPlanIssues({
     epicIssue: config?.epicIssue ?? null,
     runScopeId,
     priorRunScopeId,
+    priorRunScopeIds,
+    lineageId,
     requireRunScope,
     adoptLegacy,
   };
@@ -730,6 +801,7 @@ export function syncPlanIssues({
     schemaVersion: 2,
     scopeKey,
     runScopeId: runScopeId || null,
+    lineageId: lineageId || runScopeId || null,
     provider: providerInfo.provider,
     host: providerInfo.host || null,
     repo: providerInfo.repo || null,
@@ -744,6 +816,9 @@ export function syncPlanIssues({
   existing.schemaVersion = 2;
   existing.scopeKey = scopeKey;
   if (runScopeId) existing.runScopeId = runScopeId;
+  if (lineageId || existing.lineageId || runScopeId) {
+    existing.lineageId = lineageId || existing.lineageId || runScopeId;
+  }
   existing.provider = providerInfo.provider;
   existing.host = providerInfo.host || existing.host || null;
   existing.repo = providerInfo.repo || existing.repo || null;
@@ -806,7 +881,11 @@ export function syncPlanIssues({
   const newlyLinked = [];
   if (artifactPath && existsSync(artifactPath)) {
     const md = readFileSync(artifactPath, "utf8");
-    const parsed = parseBacklogTasks(md, { maxTasks: config.maxSubtasks ?? 20 });
+    const parsed = parseBacklogTasks(md, {
+      maxTasks: config.maxSubtasks ?? 20,
+      currentHost: providerInfo.host || null,
+      currentRepo: providerInfo.repo || null,
+    });
     const existingByTitle = new Map((existing.tasks || []).filter((t) => t.title).map((t) => [t.title.toLowerCase(), t]));
     const existingById = new Map((existing.tasks || []).filter((t) => t.id).map((t) => [String(t.id).toLowerCase(), t]));
     const taskLabels = [...(config.labels || []), config.taskLabel].filter(Boolean);

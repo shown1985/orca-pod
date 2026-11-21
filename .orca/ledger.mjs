@@ -33,6 +33,15 @@ import { pathToFileURL } from "node:url";
 import { classifyMergeDanger } from "./merge-danger.mjs";
 import { sanitizeText, sanitizeValue } from "./lib/sanitize.mjs";
 
+export function computeFileSha256(filePath) {
+  if (!filePath || !existsSync(filePath)) return null;
+  try {
+    return createHash("sha256").update(readFileSync(filePath)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 const SAFE_RUN_KEY_RE = /^[a-zA-Z0-9._-]+$/;
 
@@ -469,7 +478,7 @@ export function createRunLedger({
       return append("issue_links", summary.issues, { critical: false });
     },
 
-    recordStepSettled({ stepId, outcome, note = null, verifyOk = null, verifyReason = null, contractCommit = null }) {
+    recordStepSettled({ stepId, outcome, note = null, verifyOk = null, verifyReason = null, contractCommit = null, artifactSha256 = null, stepHeadSha = null }) {
       const safeNote = note ? sanitizeText(note, { maxLen: 280 }) : null;
       const safeVerify = verifyReason ? sanitizeText(verifyReason, { maxLen: 280 }) : null;
       const cur = summary.steps[stepId] || {};
@@ -480,11 +489,13 @@ export function createRunLedger({
         note: safeNote,
         verifyOk,
         verifyReason: safeVerify,
+        artifactSha256: artifactSha256 || cur.artifactSha256 || null,
+        stepHeadSha: stepHeadSha || cur.stepHeadSha || null,
       };
       if (contractCommit && FULL_SHA_RE.test(contractCommit)) {
         summary.verifiedContractCommit = contractCommit;
       }
-      return append("step_settled", { stepId, outcome, note: safeNote, verifyOk, verifyReason: safeVerify, contractCommit }, { critical: false });
+      return append("step_settled", { stepId, outcome, note: safeNote, verifyOk, verifyReason: safeVerify, contractCommit, artifactSha256: summary.steps[stepId].artifactSha256, stepHeadSha: summary.steps[stepId].stepHeadSha }, { critical: false });
     },
 
     recordAcceptanceLevel(level, { status, evidenceRef, detail = null }) {

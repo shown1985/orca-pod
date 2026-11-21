@@ -544,14 +544,33 @@ scenario("S1b unrestorable leftover manifest dies before materializing", async (
   ok("S1b manifest kept", existsSync(join(r.wt, ".orca-agent-config.json")));
 });
 
-scenario("S1c invalid pre-existing mcp.json dies WITH a manifest (abort window healable)", async () => {
+scenario("S1c invalid pre-existing mcp.json rolls back immediately in flow & flushes manifest when rollback disabled", async () => {
+  const { materializeAgentConfig } = await import(join(REPO, ".orca", "agent-config.mjs"));
+  const unitWt = mkdtempSync(join(tmpdir(), "orca-s1c-unit-"));
+  dirsOfCurrentScenario.push(unitWt);
+  writeFileSync(join(unitWt, ".mcp.json"), "this is not json");
+  let unitDied = false;
+  try {
+    materializeAgentConfig({
+      worktree: unitWt,
+      members: [{ id: "solo", agent: "claude", mcp: ["github"], skills: [] }],
+      cfg: { mcpServers: { github: { command: "npx", args: ["-y", "srv"] } } },
+      configDir: join(REPO, ".orca"),
+      die: (m) => { unitDied = true; throw new Error(m); },
+      warn: () => {},
+      rollbackOnError: false,
+    });
+  } catch {}
+  ok("S1c unit rollbackOnError=false died on invalid .mcp.json", unitDied);
+  ok("S1c unit manifest flushed before mutation for crash window self-heal", existsSync(join(unitWt, ".orca-agent-config.json")));
+
   const r = await runFlow({ name: "s1c", config: "../test/configs/agent-skills.config.json",
     scenario: "agent-config-snap.cjs",
     seedWorktree: [{ file: ".mcp.json", text: "this is not json" }], budgetMs: 90000 });
   ok("S1c not hung", !r.hung);
   eq("S1c exit code", r.code, 1);
   ok("S1c die message", /\.mcp\.json already exists in the worktree and is not valid JSON/.test(r.out + r.err));
-  ok("S1c manifest flushed for self-heal", existsSync(join(r.wt, ".orca-agent-config.json")));
+  ok("S1c immediate rollback cleaned up manifest in same run", !existsSync(join(r.wt, ".orca-agent-config.json")));
   eq("S1c original file untouched", readFileSync(join(r.wt, ".mcp.json"), "utf8"), "this is not json");
 });
 
@@ -1512,10 +1531,17 @@ scenario("P4 Contract-Commit SHA gate rejects stale/short/duplicate SHAs and acc
   });
   ok("P4 duplicate Contract-Commit blocked", dupSha.code !== 0 && /ambiguous Contract-Commit/.test(dupSha.out + dupSha.err));
 
-  const valid = await runFlow({
-    name: "p4-valid", config: "../test/configs/verdict-gate.config.json", args: ["--from", "worker"],
+  const prep = await runFlow({
+    name: "p4-prep", config: "../test/configs/verdict-gate.config.json",
+    args: ["--only", "contract-arch,contract-review"],
     env: { ORCA_VERIFY_HEAD_SHA: HEAD_SHA },
-    seedArtifacts: [{ file: "CONTRACT_REVIEW.md", text: `# Review\nContract-Commit: ${HEAD_SHA}\n\n${filler}\nVERDICT: PASS\n` }],
+  });
+  eq("P4 prep contract-arch + contract-review succeeded", prep.code, 0);
+  rmSync(join(prep.dir, "calls.jsonl"), { force: true });
+
+  const valid = await runFlow({
+    name: "p4-valid", reuseDir: prep.dir, config: "../test/configs/verdict-gate.config.json", args: ["--from", "worker"],
+    env: { ORCA_VERIFY_HEAD_SHA: HEAD_SHA },
   });
   eq("P4 exact 40-char HEAD SHA + VERDICT: PASS allowed", valid.code, 0);
   eq("P4 worker dispatched once", valid.by("orchestration worker-start").length, 1);
@@ -2353,7 +2379,7 @@ scenario("V4 CI/CD Generator (hybrid Python+Vue+Docker CI + Self-Hosted Intranet
   const cdYml = readFileSync(join(tmpV4, ".github", "workflows", "cd-selfhosted.yml"), "utf8");
   ok("V4 CD runs on self-hosted runner", cdYml.includes("runs-on: [self-hosted, linux]"));
   ok("V4 CD documents outbound HTTPS / zero public SSH", /OUTBOUND HTTPS/.test(cdYml) && /ZERO public SSH/.test(cdYml));
-  ok("V4 CD deploys via docker compose up -d --build", cdYml.includes('COMPOSE_FILE="docker-compose.yml"') && cdYml.includes('docker compose -f "$COMPOSE_FILE" up -d --build'));
+  ok("V4 CD deploys via docker compose up -d --build", cdYml.includes('COMPOSE_FILE="docker-compose.yml"') && /docker compose -f "\$COMPOSE_FILE"(?: -f [^\s]+)? up -d --build/.test(cdYml));
   ok("V4 CD has automated health check against configured URL", cdYml.includes("http://127.0.0.1:8000/api/health") && cdYml.includes("curl -fsS"));
 
   // Verify bin/init.mjs on a fresh hybrid project auto-tailors CI workflow!
@@ -3376,8 +3402,8 @@ scenario("V10 Round-2 full hardening (openStatus=false, P0-01..P0-04, P1-01..P1-
       objective: "test objective",
       configFile: "_tmp-v10-unbound.config.json",
     });
-    fakePriorLedger.recordIntent({ requestId: "r1", stepId: "coding", title: "Coding", agent: "opencode2", model: "deepseek-v4.1", family: "deepseek", attempt: 1 });
-    fakePriorLedger.recordDispatchResult({ requestId: "r1", stepId: "coding", dispatchId: "d1", executedFamilies: ["deepseek"] });
+    fakePriorLedger.recordIntent({ requestId: "r1", stepId: "coding", title: "Coding", agent: "opencode2", model: "deepseek-v4.1", requestedModel: "deepseek-v4.1", effort: null, requestedEffort: "high", family: "deepseek", attempt: 1 });
+    fakePriorLedger.recordDispatchResult({ requestId: "r1", stepId: "coding", dispatchId: "d1", effectiveAgent: "opencode", effectiveModel: "deepseek-v4.1", effectiveEffort: null, executedFamilies: ["deepseek"] });
     fakePriorLedger.recordStepSettled({ stepId: "coding", outcome: "succeeded", verifyOk: true });
 
     writeFileSync(unboundCfg, JSON.stringify({
@@ -3397,7 +3423,9 @@ scenario("V10 Round-2 full hardening (openStatus=false, P0-01..P0-04, P1-01..P1-
     eq("V10 P0-03 --only code-review rejects unbound ledger without run-bound status.js", rUnbound.code, 1);
     ok("V10 P0-03 logged missing verified execution record for coding", /no verified execution record for upstream author step "coding"/.test(rUnbound.out + rUnbound.err));
     const ledSums = listLedgerSummaries({ ledgerHome: unboundLedgerHome });
-    ok("V10 P2-01 ledger tracks separate requestedEffort vs effectiveEffort", ledSums.length >= 1);
+    const priorCodingRec = ledSums.find((s) => s.runKey === "unrelated-old-run-key")?.steps?.coding;
+    eq("V10 P2-01 ledger tracks separate requestedEffort vs effectiveEffort",
+      [priorCodingRec?.requestedEffort, priorCodingRec?.effectiveEffort], ["high", null]);
   } finally {
     for (const f of [relPendCfg, stopGotoCfg, unboundCfg]) { try { rmSync(f, { force: true }); } catch {} }
   }
@@ -3532,34 +3560,7 @@ scenario("V10 Round-2 full hardening (openStatus=false, P0-01..P0-04, P1-01..P1-
     eq("V10 P1-10 Psych confirms branch '123' parsed as String (not Integer) and feat/a'b preserved", numParsed.status, 0);
   }
 
-  // Execute extracted CD Step 1 (Provenance Gate)
-  const cdGateScript = extractStepScript(cdYml, "Verify CI gate & allowed target branch");
-  const validSha = "a".repeat(40);
-  const baseGateEnv = {
-    ...process.env,
-    DEPLOY_BRANCH: "main",
-    EXPECTED_FULL_REF: "refs/heads/main",
-    THIS_REPO: "shown1985/sxcj",
-  };
-  eq("V10 P0-04 CD gate REJECTS pull_request workflow_run", spawnSync("bash", ["-c", cdGateScript], {
-    env: { ...baseGateEnv, EVENT_NAME: "workflow_run", CI_CONCLUSION: "success", WR_EVENT: "pull_request", WR_HEAD_REPO: "shown1985/sxcj", WR_HEAD_BRANCH: "main", WR_HEAD_SHA: validSha },
-    encoding: "utf8",
-  }).status, 1);
-  eq("V10 P0-04 CD gate REJECTS fork repository workflow_run", spawnSync("bash", ["-c", cdGateScript], {
-    env: { ...baseGateEnv, EVENT_NAME: "workflow_run", CI_CONCLUSION: "success", WR_EVENT: "push", WR_HEAD_REPO: "attacker/sxcj", WR_HEAD_BRANCH: "main", WR_HEAD_SHA: validSha },
-    encoding: "utf8",
-  }).status, 1);
-  eq("V10 P0-04 CD gate REJECTS tag refs/tags/main on workflow_dispatch", spawnSync("bash", ["-c", cdGateScript], {
-    env: { ...baseGateEnv, EVENT_NAME: "workflow_dispatch", ACTUAL_REF: "refs/tags/main", ACTUAL_REF_TYPE: "tag", DISPATCH_SHA: validSha },
-    encoding: "utf8",
-  }).status, 1);
-  eq("V10 P0-04 CD gate ACCEPTS verified push workflow_run on main", spawnSync("bash", ["-c", cdGateScript], {
-    env: { ...baseGateEnv, EVENT_NAME: "workflow_run", CI_CONCLUSION: "success", WR_EVENT: "push", WR_HEAD_REPO: "shown1985/sxcj", WR_HEAD_BRANCH: "main", WR_HEAD_SHA: validSha },
-    encoding: "utf8",
-  }).status, 0);
-
-  // Execute extracted CD Step 3 (Checked-out commit == live origin/main tip)
-  const cdShaScript = extractStepScript(cdYml, "Verify checked-out commit matches live target branch tip");
+  // Set up temporary git repo with SHA1 (superseded) & SHA2 (live origin/main tip)
   const cdGitDir = join(tmpV10, "cd-git");
   spawnSync("git", ["init", "-b", "main", cdGitDir], { encoding: "utf8" });
   spawnSync("git", ["-C", cdGitDir, "config", "user.email", "ci@local"], { encoding: "utf8" });
@@ -3573,6 +3574,44 @@ scenario("V10 Round-2 full hardening (openStatus=false, P0-01..P0-04, P1-01..P1-
   spawnSync("git", ["-C", cdGitDir, "commit", "-m", "c2"], { encoding: "utf8" });
   const sha2 = spawnSync("git", ["-C", cdGitDir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
   spawnSync("git", ["-C", cdGitDir, "update-ref", "refs/remotes/origin/main", sha2], { encoding: "utf8" });
+
+  // Execute extracted CD Pre-Gate Job Step (Provenance + SHA + live origin/main tip BEFORE self-hosted runner!)
+  const cdGateScript = extractStepScript(cdYml, "Verify CI gate & allowed target branch");
+  const validSha = sha2;
+  const baseGateEnv = {
+    ...process.env,
+    DEPLOY_BRANCH: "main",
+    EXPECTED_FULL_REF: "refs/heads/main",
+    THIS_REPO: "shown1985/sxcj",
+  };
+  eq("V10 P0-04 CD gate REJECTS pull_request workflow_run", spawnSync("bash", ["-c", cdGateScript], {
+    cwd: cdGitDir,
+    env: { ...baseGateEnv, EVENT_NAME: "workflow_run", CI_CONCLUSION: "success", WR_EVENT: "pull_request", WR_HEAD_REPO: "shown1985/sxcj", WR_HEAD_BRANCH: "main", WR_HEAD_SHA: validSha },
+    encoding: "utf8",
+  }).status, 1);
+  eq("V10 P0-04 CD gate REJECTS fork repository workflow_run", spawnSync("bash", ["-c", cdGateScript], {
+    cwd: cdGitDir,
+    env: { ...baseGateEnv, EVENT_NAME: "workflow_run", CI_CONCLUSION: "success", WR_EVENT: "push", WR_HEAD_REPO: "attacker/sxcj", WR_HEAD_BRANCH: "main", WR_HEAD_SHA: validSha },
+    encoding: "utf8",
+  }).status, 1);
+  eq("V10 P0-04 CD gate REJECTS tag refs/tags/main on workflow_dispatch", spawnSync("bash", ["-c", cdGateScript], {
+    cwd: cdGitDir,
+    env: { ...baseGateEnv, EVENT_NAME: "workflow_dispatch", ACTUAL_REF: "refs/tags/main", ACTUAL_REF_TYPE: "tag", DISPATCH_SHA: validSha },
+    encoding: "utf8",
+  }).status, 1);
+  eq("V10 P0-04 CD pre-gate REJECTS superseded SHA1 before self-hosted runner", spawnSync("bash", ["-c", cdGateScript], {
+    cwd: cdGitDir,
+    env: { ...baseGateEnv, EVENT_NAME: "workflow_run", CI_CONCLUSION: "success", WR_EVENT: "push", WR_HEAD_REPO: "shown1985/sxcj", WR_HEAD_BRANCH: "main", WR_HEAD_SHA: sha1 },
+    encoding: "utf8",
+  }).status, 1);
+  eq("V10 P0-04 CD gate ACCEPTS verified push workflow_run on main", spawnSync("bash", ["-c", cdGateScript], {
+    cwd: cdGitDir,
+    env: { ...baseGateEnv, EVENT_NAME: "workflow_run", CI_CONCLUSION: "success", WR_EVENT: "push", WR_HEAD_REPO: "shown1985/sxcj", WR_HEAD_BRANCH: "main", WR_HEAD_SHA: validSha },
+    encoding: "utf8",
+  }).status, 0);
+
+  // Execute extracted CD Step 3 (Checked-out commit == live origin/main tip on self-hosted runner)
+  const cdShaScript = extractStepScript(cdYml, "Verify checked-out commit matches live target branch tip");
   spawnSync("git", ["-C", cdGitDir, "checkout", "--detach", sha1], { encoding: "utf8" });
   eq("V10 P0-04 CD SHA gate REJECTS stale/superseded SHA1 when origin/main is at SHA2", spawnSync("bash", ["-c", cdShaScript], {
     cwd: cdGitDir,
@@ -3593,6 +3632,7 @@ scenario("V10 Round-2 full hardening (openStatus=false, P0-01..P0-04, P1-01..P1-
   writeFileSync(join(mockCdBin, "docker"), `#!/usr/bin/env node
 const a = process.argv.slice(2);
 if (a.includes("config") && a.includes("--services")) {
+  if (process.env.MOCK_CFG_EXIT) process.exit(Number(process.env.MOCK_CFG_EXIT));
   if (process.env.MOCK_CFG_SVCS) console.log(process.env.MOCK_CFG_SVCS);
   process.exit(0);
 }
@@ -3601,9 +3641,13 @@ if (a.includes("ps") && a.includes("--format")) {
   process.stdout.write(process.env.MOCK_PS_JSON || "");
   process.exit(0);
 }
+if (a.includes("inspect")) {
+  process.stdout.write(process.env.MOCK_INSPECT_OUT || "[]");
+  process.exit(0);
+}
 process.exit(0);
 `, { mode: 0o755 });
-  writeFileSync(join(mockCdBin, "curl"), `#!/usr/bin/env node\nprocess.exit(0);\n`, { mode: 0o755 });
+  writeFileSync(join(mockCdBin, "curl"), `#!/usr/bin/env node\nconsole.log("HTTP/1.1 200 OK\\r\\n\\r\\nok");\nprocess.exit(0);\n`, { mode: 0o755 });
 
   const runCdHealth = (extraEnv) => spawnSync("bash", ["-c", cdHealthScript], {
     cwd: cdComposeDir,
@@ -3613,6 +3657,7 @@ process.exit(0);
       COMPOSE_FILE: "docker-compose.prod.yml",
       SERVICE_NAME: "api",
       ORCA_DEPLOY_SHA: sha2,
+      MOCK_CFG_SVCS: "db-migrate\napi\n",
       DEFAULT_HEALTHCHECK_URL: "http://admin:secretpass@127.0.0.1:8000/health?token=secret_tok_999",
       HEALTHCHECK_URL: "",
       DEPLOY_ONESHOT_SERVICES: "",
@@ -3624,10 +3669,9 @@ process.exit(0);
   });
 
   const hMigrationOk = runCdHealth({
-    MOCK_CFG_SVCS: "db-migrate\napi\n",
     MOCK_PS_JSON: JSON.stringify([
-      { Service: "db-migrate", State: "exited", ExitCode: 0 },
-      { Service: "api", State: "running", Health: "healthy", ExitCode: 0 },
+      { Service: "db-migrate", State: "exited", ExitCode: 0, Labels: `io.orca-pod.deploy-sha=${sha2}` },
+      { Service: "api", State: "running", Health: "healthy", ExitCode: 0, Labels: `io.orca-pod.deploy-sha=${sha2}` },
     ]),
   });
   eq("V10 P1-11 CD health ACCEPTS exited(0) db-migrate + running healthy api", hMigrationOk.status, 0);
@@ -3728,7 +3772,10 @@ process.exit(0);
   }));
   eq("V10 P1-03 .opencode/opencode.json overrides root opencode.json in same dir", resolveOpencodeConfig({ projectDir: ocRoot }).model, "anthropic/claude-sonnet-4-5");
   writeFileSync(join(ocChild, "opencode.json"), JSON.stringify({ model: "deepseek/deepseek-v4.1" }));
-  eq("V10 P1-03 deeper subdirectory opencode.json overrides parent .opencode/opencode.json", resolveOpencodeConfig({ projectDir: ocChild }).model, "deepseek/deepseek-v4.1");
+  eq("V10 P1-03 parent .opencode/opencode.json overrides child plain opencode.json (OpenCode merge order)", resolveOpencodeConfig({ projectDir: ocChild }).model, "anthropic/claude-sonnet-4-5");
+  mkdirSync(join(ocChild, ".opencode"), { recursive: true });
+  writeFileSync(join(ocChild, ".opencode", "opencode.json"), JSON.stringify({ model: "kimi/kimi-k3.1" }));
+  eq("V10 P1-03 child .opencode/opencode.json overrides parent .opencode/opencode.json", resolveOpencodeConfig({ projectDir: ocChild }).model, "kimi/kimi-k3.1");
   const blockedEps = discoverOpencodeLocalEndpoints({ projectDir: ocRoot, model: "blocked_local/some-model" });
   eq("V10 P1-03 enabled_providers blocks non-listed explicit provider", blockedEps.length, 0);
 
@@ -3853,6 +3900,698 @@ process.exit(0);
     !redactedJsonSecret.includes("sk_custom_secret_value") &&
     !redactedJsonSecret.includes("cs_999888777") &&
     !redactedJsonSecret.includes("dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"));
+});
+
+// ---------------------------------------------------------------------------
+// V11 — Round-3 Surgical Closure:
+// Exact end-to-end & direct-call verification of ALL 14 remaining Round-2 items
+// (4 P0 + 8 P1 + 2 P2) so zero edge cases remain unverified.
+// ---------------------------------------------------------------------------
+scenario("V11 Round-3 surgical closure: dispatch attribution, 4x Python CI, ledger-bound resume/argv, hosted CD pre-gate, Compose rev, Issue links & escaped-quote redaction", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { statSync } = await import("node:fs");
+  const { sanitizeText } = await import(join(REPO, ".orca", "lib", "sanitize.mjs"));
+  const { verifyStopAndReleaseReceipt, createOrcaClient, sleepMs } = await import(join(REPO, ".orca", "lib", "orca-cli.mjs"));
+  const { createNudgeController } = await import(join(REPO, ".orca", "lib", "nudge.mjs"));
+  const { verifyStepArtifact } = await import(join(REPO, ".orca", "gate-verify.mjs"));
+  const {
+    bindStepArtifactDispatchClaim,
+    clearStaleStepArtifact,
+    syncOutputsFromIsolatedWorktree,
+  } = await import(join(REPO, ".orca", "worktree-isolation.mjs"));
+  const {
+    classifyModelFamily,
+    normalizeCandidate,
+    resolveOpencodeConfig,
+  } = await import(join(REPO, ".orca", "preflight.mjs"));
+  const { materializeAgentConfig, restoreAgentConfig } = await import(join(REPO, ".orca", "agent-config.mjs"));
+  const {
+    parseBacklogTasks,
+    extractExplicitLocalIssueNumber,
+    isMissingLabelError,
+    createIssueViaCli,
+  } = await import(join(REPO, ".orca", "issue-tracker.mjs"));
+  const {
+    detectProjectStacks,
+    renderCiWorkflow,
+    renderSelfHostedCdWorkflow,
+  } = await import(join(REPO, ".orca", "ci-generator.mjs"));
+
+  const tmpV11 = mkdtempSync(join(tmpdir(), "orca-v11-"));
+  dirsOfCurrentScenario.push(tmpV11);
+
+  const extractStepScript = (yml, stepName) => {
+    const lines = yml.split(/\r?\n/);
+    const startIdx = lines.findIndex((l) => l.includes(`- name: ${stepName}`));
+    if (startIdx < 0) return null;
+    let runIdx = -1;
+    for (let i = startIdx + 1; i < Math.min(lines.length, startIdx + 20); i++) {
+      if (/^\s+run:\s*\|\s*$/.test(lines[i])) { runIdx = i; break; }
+    }
+    if (runIdx < 0) return null;
+    const baseIndent = lines[runIdx + 1]?.match(/^(\s*)/)?.[1]?.length || 10;
+    const body = [];
+    for (let i = runIdx + 1; i < lines.length; i++) {
+      const l = lines[i];
+      if (!l.trim()) { body.push(""); continue; }
+      const ind = l.match(/^(\s*)/)[1].length;
+      if (ind < baseIndent) break;
+      body.push(l.slice(baseIndent));
+    }
+    return body.join("\n");
+  };
+
+  // =========================================================================
+  // 1) P0-01 + P1-02 + P2-01: Dispatch attribution, stop/release receipts,
+  //    unattributed start reconciliation, sub-second gate claim & budgets
+  // =========================================================================
+  // 1a) verifyStopAndReleaseReceipt rejects state="fenced" AND rejects empty release status ""
+  const rFenced = verifyStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "d1", state: "fenced", processAction: "closed_agent_terminal" } } };
+    return { ok: true, json: { result: { dispatchId: "d1", status: "released" } } };
+  }, "d1");
+  eq("V11 P0-01 verifyStopAndReleaseReceipt rejects state=fenced without terminal stop state",
+    [rFenced.ok, /worker-stop/.test(rFenced.reason || "")], [false, true]);
+
+  const rEmptyRel = verifyStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "d1", state: "stopped" } } };
+    return { ok: true, json: { result: { dispatchId: "d1", status: "" } } };
+  }, "d1");
+  eq("V11 P0-01 verifyStopAndReleaseReceipt rejects empty release status",
+    [rEmptyRel.ok, /worker-release/.test(rEmptyRel.reason || "")], [false, true]);
+
+  const rValidStopRel = verifyStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "d1", state: "stopped" } } };
+    return { ok: true, json: { result: { dispatchId: "d1", status: "released" } } };
+  }, "d1");
+  eq("V11 P0-01 verifyStopAndReleaseReceipt accepts confirmed stopped + released",
+    [rValidStopRel.ok, rValidStopRel.reason], [true, null]);
+
+  // 1b) workerVitals with stale dispatch-show + unattributed worker-show("completed") + unattributed task-list("succeeded")
+  //     AND unattributed worker-start failure reconciliation + manual->cold attempts merging
+  const mockOrcaScript = join(tmpV11, "mock-orca-v11.cjs");
+  const mockOrcaLog = join(tmpV11, "mock-orca-v11.jsonl");
+  writeFileSync(mockOrcaScript, `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const mode = process.env.MOCK_V11_MODE || "";
+fs.appendFileSync(${JSON.stringify(mockOrcaLog)}, JSON.stringify({ mode, args }) + "\\n");
+const out = (code, obj) => { console.log(JSON.stringify(obj)); process.exit(code); };
+const key = args.slice(0, 2).join(" ");
+if (mode === "vitals_mismatch") {
+  if (key === "orchestration dispatch-show") return out(0, { result: { dispatch: { id: "disp-old", status: "completed" } } });
+  if (key === "orchestration worker-show") return out(0, { result: { status: "completed", outcome: "succeeded" } });
+  if (key === "orchestration task-list") return out(0, { result: { tasks: [{ id: "task-1", status: "completed", result: { outcome: "succeeded" } }] } });
+}
+if (mode === "unattributed_start_fail") {
+  if (key === "terminal create") return out(1, { error: "terminal disabled" });
+  if (key === "orchestration worker-start") return out(1, { error: "internal daemon error without failedStage" });
+  if (key === "orchestration dispatch-show") return out(0, { result: { dispatch: { id: null, status: "unknown" } } });
+}
+if (mode === "manual_then_cold") {
+  if (key === "terminal create") return out(1, { error: "warm terminal unavailable" });
+  if (key === "orchestration worker-start") return out(0, { result: { dispatchId: "disp-cold-1", state: "ready" } });
+}
+out(0, { result: {} });
+`, { mode: 0o755 });
+
+  const prevOrcaCmd = process.env.ORCA_CLI_COMMAND;
+  const prevV11Mode = process.env.MOCK_V11_MODE;
+  try {
+    process.env.ORCA_CLI_COMMAND = mockOrcaScript;
+    const client = createOrcaClient({
+      cfg: { defaults: { startRetries: 2, warmTerminal: true }, warmCommands: { agy: "agy --model claude-sonnet-4-5 --effort high" } },
+      opt: {},
+      objective: "v11",
+      autoRun: true,
+      agentOf: (s) => s.agent,
+      modelOf: (s) => s.model,
+      writeStatus: () => {},
+      log: () => {},
+      warn: () => {},
+      die: (m) => { throw new Error(m); },
+    });
+
+    process.env.MOCK_V11_MODE = "vitals_mismatch";
+    const vit = client.workerVitals("task-1", "run-1", "disp-current");
+    eq("V11 P0-01 workerVitals NEVER settles on unattributed worker-show/task-list when dispatch mismatches",
+      [vit.dispatchMismatch, vit.settled, vit.outcome], [true, false, null]);
+
+    process.env.MOCK_V11_MODE = "unattributed_start_fail";
+    rmSync(mockOrcaLog, { force: true });
+    const ambStart = await client.startWorker(
+      { id: "s1", title: "S1", agent: "codex", model: "gpt-6.2-sol" },
+      "task-1",
+      "name:testlab",
+      { effort: "high" }
+    );
+    const startLogLines = readFileSync(mockOrcaLog, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    eq("V11 P0-01 unattributed worker-start failure marks ambiguous=true and does NOT blindly retry",
+      [ambStart.ok, ambStart.ambiguous, startLogLines.filter((c) => c.args[1] === "worker-start").length],
+      [false, true, 1]);
+    ok("V11 P0-01 unattributed worker-start failure reconciled via dispatch-show",
+      startLogLines.some((c) => c.args[1] === "dispatch-show"));
+
+    // P2-01 + P0-01: manual -> cold transition merges manual attempt before cold attempt & runs beforeEachStartAttempt before EACH attempt!
+    process.env.MOCK_V11_MODE = "manual_then_cold";
+    let hookCalls = 0;
+    const mcRes = await client.startWorker(
+      { id: "s2", title: "S2", agent: "agy", model: "gemini-4-neon" },
+      "task-2",
+      "name:testlab",
+      { effort: "medium", beforeEachStartAttempt: () => { hookCalls++; } }
+    );
+    eq("V11 P2-01 manual->cold start merges manual + cold attempts in order",
+      (mcRes.attempts || []).map((a) => a.mode), ["manual", "cold"]);
+    eq("V11 P0-01 beforeEachStartAttempt fired before manual AND before cold attempt", hookCalls, 2);
+
+    // P1-02: startWorker respects expired deadlineAt immediately
+    const expiredRes = await client.startWorker(
+      { id: "s3", title: "S3", agent: "codex", model: "gpt-6.2-sol" },
+      "task-3",
+      "name:testlab",
+      { deadlineAt: Date.now() - 25 }
+    );
+    eq("V11 P1-02 startWorker aborts immediately when deadlineAt already expired",
+      [expiredRes.ok, expiredRes.deadlineExceeded], [false, true]);
+
+    // P1-02: holdForNudge clamps post-send 3000ms sleep to remaining deadlineAt!
+    const nudgeCtrl = createNudgeController({
+      orca: () => ({ ok: true, json: {} }),
+      pick: (o, keys) => { for (const k of keys) if (o && o[k] != null) return o[k]; },
+      res: (j) => (j && j.result) ? j.result : (j || {}),
+      sleepMs,
+      parkedPromptOf: () => null,
+      nudgeRetriesOf: () => 2,
+      nudgeTimeoutOf: () => 1000,
+      outPath: (w) => `.orca/artifacts/${w}`,
+      artifactReady: () => false,
+      statusSet: () => {},
+      writeStatus: () => {},
+      warn: () => {},
+      settleMember: () => {},
+      syncOutputsFromIsolatedWorktree,
+      getWtDir: () => tmpV11,
+      artDir: ".orca/artifacts",
+    });
+    const tNudge0 = Date.now();
+    nudgeCtrl.holdForNudge({
+      step: { id: "n1", title: "N1", writes: "N.md" },
+      terminal: "term-1",
+      nudge: { left: 2, count: 0, sentAt: 0, phase: null },
+      lastBusy: 0,
+      deadlineAt: Date.now() + 60,
+    }, "succeeded", {});
+    const nudgeElapsed = Date.now() - tNudge0;
+    ok(`V11 P1-02 holdForNudge clamped 3000ms sleep to remaining 60ms budget (elapsed=${nudgeElapsed}ms)`, nudgeElapsed < 1000);
+  } finally {
+    if (prevOrcaCmd === undefined) delete process.env.ORCA_CLI_COMMAND;
+    else process.env.ORCA_CLI_COMMAND = prevOrcaCmd;
+    if (prevV11Mode === undefined) delete process.env.MOCK_V11_MODE;
+    else process.env.MOCK_V11_MODE = prevV11Mode;
+  }
+
+  // 1c) P0-01 sub-second gate artifact freshness + isolated worktree copy timestamp preservation
+  const subMainWt = join(tmpV11, "subsec-main");
+  const subIsoWt = join(tmpV11, "subsec-iso");
+  mkdirSync(join(subMainWt, ".orca", "artifacts"), { recursive: true });
+  mkdirSync(join(subIsoWt, ".orca", "artifacts"), { recursive: true });
+  const reviewStepObj = { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } };
+  const preExistingIsoFile = join(subIsoWt, ".orca", "artifacts", "REVIEW.md");
+  writeFileSync(preExistingIsoFile, "# Pre-dispatch stale file\n\n" + "Filler line.\n".repeat(12) + "\nVERDICT: PASS\n");
+  const preSt = statSync(preExistingIsoFile);
+  await sleepMs(20);
+  const clr = clearStaleStepArtifact(reviewStepObj, subMainWt, null, ".orca/artifacts");
+  bindStepArtifactDispatchClaim(subMainWt, ".orca/artifacts", reviewStepObj, {
+    dispatchId: "disp-subsec-1",
+    taskId: "task-subsec-1",
+    fsEpochMtimeMs: clr.fsEpochMtimeMs,
+    clearedAtMs: clr.clearedAtMs,
+  });
+  // Sync with minSourceMtimeMs MUST skip the pre-dispatch file!
+  syncOutputsFromIsolatedWorktree({
+    step: reviewStepObj,
+    stepWtDir: subIsoWt,
+    wtDir: subMainWt,
+    artDirRel: ".orca/artifacts",
+    minSourceMtimeMs: clr.fsEpochMtimeMs,
+  });
+  eq("V11 P0-01 syncOutputsFromIsolatedWorktree skips pre-dispatch stale artifact",
+    existsSync(join(subMainWt, ".orca", "artifacts", "REVIEW.md")), false);
+  // Even if copied without minSourceMtimeMs, utimesSync preserves original mtimeMs and sub-second verifyStepArtifact REJECTS it!
+  syncOutputsFromIsolatedWorktree({
+    step: reviewStepObj,
+    stepWtDir: subIsoWt,
+    wtDir: subMainWt,
+    artDirRel: ".orca/artifacts",
+  });
+  const copiedSt = statSync(join(subMainWt, ".orca", "artifacts", "REVIEW.md"));
+  ok("V11 P0-01 syncOutputsFromIsolatedWorktree preserved source mtimeMs (did NOT mint fresh copy mtime)",
+    Math.abs(copiedSt.mtimeMs - preSt.mtimeMs) < 5);
+  const subSecVerify = verifyStepArtifact(
+    reviewStepObj,
+    join(subMainWt, ".orca", "artifacts"),
+    subMainWt,
+    50,
+    { mode: "settlement", dispatchId: "disp-subsec-1", fsEpochMtimeMs: clr.fsEpochMtimeMs, minMtimeMs: clr.clearedAtMs, clearedBeforeDispatch: true }
+  );
+  eq("V11 P0-01 sub-second pre-dispatch artifact rejected by verifyStepArtifact", subSecVerify.ok, false);
+
+  // =========================================================================
+  // 2) P0-02 + P2-02: Real Python 3 execution across ALL FOUR CI scripts
+  //    (GitHub bundled, Gitea bundled, generated generic, generated tailored)
+  // =========================================================================
+  const realPy = spawnSync("python3", ["--version"], { encoding: "utf8" });
+  if (!realPy.error && realPy.status === 0) {
+    const ghBundledYml = readFileSync(join(REPO, ".github", "workflows", "ci-release.yml"), "utf8");
+    const giteaBundledYml = readFileSync(join(REPO, ".gitea", "workflows", "ci-release.yml"), "utf8");
+    const genericGenYml = renderCiWorkflow({
+      summary: "Generic",
+      python: [], node: [], go: [], rust: [], dockerfiles: [], composeFile: null, composeFiles: [],
+    }, { platform: "github" });
+
+    // Create a tailored Python project fixture so detectProjectStacks produces renderPythonJob!
+    const customDetectDir = join(tmpV11, "py-custom-detect");
+    mkdirSync(customDetectDir, { recursive: true });
+    writeFileSync(join(customDetectDir, "requirements.txt"), "# offline\n");
+    const customGenYml = renderCiWorkflow(detectProjectStacks(customDetectDir), { platform: "github", includeTokenHub: false });
+
+    const stripPipInstall = (s) => s.replace(/^\s*python3 -m pip install .*$/gm, ":");
+    const fourScripts = [
+      { label: "GitHub bundled", script: stripPipInstall(extractStepScript(ghBundledYml, "Verify Python projects (root / backend)")) },
+      { label: "Gitea bundled", script: stripPipInstall(extractStepScript(giteaBundledYml, "Verify Python projects (root / backend)")) },
+      { label: "Generated generic", script: stripPipInstall(extractStepScript(genericGenYml, "Verify Python projects (root / backend)")) },
+      { label: "Generated tailored", script: stripPipInstall(extractStepScript(customGenYml, "Run Python lint & tests")) },
+    ];
+
+    const noPytestDir = join(tmpV11, "no-pytest");
+    mkdirSync(noPytestDir, { recursive: true });
+    writeFileSync(join(noPytestDir, "pytest.py"), "raise ImportError('offline unittest mode')\n");
+
+    // Case A: Deep failing test at depth 6 (`a/b/c/d/e/unit_test.py`) with `requirements.txt` -> ALL 4 exit exact 1!
+    const deepDir = join(tmpV11, "py-deep");
+    mkdirSync(join(deepDir, "a", "b", "c", "d", "e"), { recursive: true });
+    writeFileSync(join(deepDir, "requirements.txt"), "# deps\n");
+    writeFileSync(join(deepDir, "a", "b", "c", "d", "e", "unit_test.py"),
+      "import unittest\nclass DeepFail(unittest.TestCase):\n    def test_deep(self):\n        self.assertEqual(2 + 2, 99)\n");
+    for (const item of fourScripts) {
+      const rDeep = spawnSync("bash", ["-c", item.script], {
+        cwd: deepDir,
+        env: { ...process.env, PYTHONPATH: noPytestDir },
+        encoding: "utf8",
+      });
+      eq(`V11 P0-02 [${item.label}] deep failing a/b/c/d/e/unit_test.py exits exact 1`, rDeep.status, 1);
+    }
+
+    // Case B: Duplicate basename `dir1/unit_test.py` + `dir2/unit_test.py` without __init__.py -> ALL 4 exit exact 0 and run BOTH!
+    const dupBaseDir = join(tmpV11, "py-dup-basename");
+    mkdirSync(join(dupBaseDir, "dir1"), { recursive: true });
+    mkdirSync(join(dupBaseDir, "dir2"), { recursive: true });
+    writeFileSync(join(dupBaseDir, "requirements.txt"), "# deps\n");
+    writeFileSync(join(dupBaseDir, "dir1", "unit_test.py"),
+      "import pathlib, unittest\nHELPER_VAL = 'one'\nclass U1(unittest.TestCase):\n    def test_one(self):\n        pathlib.Path('ran-dir1.txt').write_text(HELPER_VAL)\n        self.assertEqual(HELPER_VAL, 'one')\n");
+    writeFileSync(join(dupBaseDir, "dir2", "unit_test.py"),
+      "import pathlib, unittest\nHELPER_VAL = 'two'\nclass U2(unittest.TestCase):\n    def test_two(self):\n        pathlib.Path('ran-dir2.txt').write_text(HELPER_VAL)\n        self.assertEqual(HELPER_VAL, 'two')\n");
+    for (const item of fourScripts) {
+      rmSync(join(dupBaseDir, "ran-dir1.txt"), { force: true });
+      rmSync(join(dupBaseDir, "ran-dir2.txt"), { force: true });
+      const rDup = spawnSync("bash", ["-c", item.script], {
+        cwd: dupBaseDir,
+        env: { ...process.env, PYTHONPATH: noPytestDir },
+        encoding: "utf8",
+      });
+      eq(`V11 P0-02 [${item.label}] duplicate-basename dir1/unit_test.py + dir2/unit_test.py exits exact 0`, rDup.status, 0);
+      ok(`V11 P0-02 [${item.label}] executed BOTH dir1 and dir2 test modules without import collision`,
+        existsSync(join(dupBaseDir, "ran-dir1.txt")) && existsSync(join(dupBaseDir, "ran-dir2.txt")));
+    }
+  }
+
+  // =========================================================================
+  // 3) P0-03 + P2-01 + P2-02: Same-repo unbound status.js, skipped review
+  //    provenance & artifact SHA tamper detection, and warm argv embedded --model
+  // =========================================================================
+  eq("V11 P0-03 warm command 'agy --model claude-sonnet-4-5' overrides step model gemini-4-neon -> anthropic",
+    classifyModelFamily("agy --model claude-sonnet-4-5 --effort high", "gemini-4-neon"), "anthropic");
+  const embeddedCand = normalizeCandidate({
+    agent: "agy --model claude-sonnet-4-5 --effort high",
+    model: "gemini-4-neon",
+    effort: "medium",
+  });
+  eq("V11 P2-01 normalizeCandidate extracts embedded argv model & effort while preserving requested fields",
+    [embeddedCand.family, embeddedCand.resolvedModel, embeddedCand.effort, embeddedCand.requestedModel, embeddedCand.requestedEffort],
+    ["anthropic", "claude-sonnet-4-5", "high", "gemini-4-neon", "medium"]);
+
+  const v11CfCfg = join(REPO, ".orca", "_tmp-v11-cf.config.json");
+  const v11IssCfg = join(REPO, ".orca", "_tmp-v11-iss.config.json");
+  try {
+    writeFileSync(v11CfCfg, JSON.stringify({
+      defaults: { timeoutMs: 5000, hardTimeoutMs: 15000, preflight: { enabled: false } },
+      pipeline: [
+        { id: "coding", title: "Coding", agent: "opencode2", model: "deepseek-v4.1", spec: "Code {out}.", writes: "CHANGES.md" },
+        { id: "code-review", title: "Code Review", agent: "codex", model: "gpt-6.2-sol", crossFamilyWith: ["coding"], reads: ["coding"], verify: { requireVerdict: "PASS" }, spec: "Review {out}.", writes: "REVIEW.md" },
+        { id: "pr-submit", title: "PR Submit", agent: "opencode2", model: "deepseek-v4.1", reads: ["code-review"], spec: "Submit {out}.", writes: "PR.md" },
+      ],
+    }));
+
+    // 3a) Same-repo, same-objective status.js WITHOUT ledgerRunKey + `--only code-review` -> MUST FAIL (exit 1)!
+    const unboundStatusPayload = {
+      meta: {
+        objective: "test objective",
+        ledgerRunKey: null,
+        steps: [{ id: "coding", title: "Coding" }, { id: "code-review", title: "Code Review" }, { id: "pr-submit", title: "PR Submit" }],
+      },
+      overall: "failed",
+      steps: [
+        { id: "coding", status: "succeeded", family: "deepseek", executedFamilies: ["deepseek"], agent: "opencode2", model: "deepseek-v4.1" },
+        { id: "code-review", status: "pending" },
+        { id: "pr-submit", status: "pending" },
+      ],
+    };
+    const rSameRepoUnbound = await runFlow({
+      name: "v11-samerepo-unbound",
+      config: "_tmp-v11-cf.config.json",
+      args: ["--only", "code-review"],
+      seedArtifacts: [
+        { file: "CHANGES.md", text: "# Changes\n\n" + "Implemented feature.\n".repeat(12) },
+        { file: "status.js", text: `window.__STATUS=${JSON.stringify(unboundStatusPayload)};window.__ON_STATUS&&window.__ON_STATUS(window.__STATUS);\n` },
+      ],
+      budgetMs: 25000,
+    });
+    eq("V11 P0-03 same-repo status.js without ledgerRunKey is REJECTED on --only code-review", rSameRepoUnbound.code, 1);
+    eq("V11 P0-03 zero review workers dispatched when status.js lacks verified ledger", rSameRepoUnbound.by("orchestration worker-start").length, 0);
+
+    // 3b) Skipping code-review (`--from pr-submit`) with forged REVIEW.md (`VERDICT: PASS`) on disk -> REJECTED!
+    const rSkipUnverifiedReview = await runFlow({
+      name: "v11-skip-unverified-rev",
+      config: "_tmp-v11-cf.config.json",
+      args: ["--from", "pr-submit"],
+      stdinText: "n\n",
+      seedArtifacts: [
+        { file: "CHANGES.md", text: "# Changes\n\n" + "Implemented feature.\n".repeat(12) },
+        { file: "REVIEW.md", text: "# Review\n\n" + "Looks good.\n".repeat(15) + "\nVERDICT: PASS\n" },
+      ],
+      budgetMs: 25000,
+    });
+    eq("V11 P0-03 --from pr-submit rejects skipped REVIEW.md lacking verified ledger record", rSkipUnverifiedReview.code, 1);
+    ok("V11 P0-03 logged skipped review provenance error", /skipped review step "code-review" lacks a verified run-bound ledger record/.test(rSkipUnverifiedReview.out + rSkipUnverifiedReview.err));
+
+    // 3c) Genuine `coding,code-review` run -> tamper `REVIEW.md` on disk -> `--from pr-submit` detects SHA mismatch!
+    const rPrepRev = await runFlow({
+      name: "v11-prep-rev",
+      config: "_tmp-v11-cf.config.json",
+      args: ["--only", "coding,code-review"],
+      budgetMs: 30000,
+    });
+    eq("V11 P0-03 genuine coding,code-review prep succeeded", rPrepRev.code, 0);
+    // First confirm clean `--from pr-submit` succeeds when untampered
+    const rCleanResume = await runFlow({
+      name: "v11-clean-resume",
+      reuseDir: rPrepRev.dir,
+      config: "_tmp-v11-cf.config.json",
+      args: ["--from", "pr-submit"],
+      budgetMs: 25000,
+    });
+    eq("V11 P0-03 untampered ledger-verified --from pr-submit succeeds", rCleanResume.code, 0);
+    // Now tamper REVIEW.md while preserving VERDICT: PASS -> must reject!
+    const revPath = join(rPrepRev.wt, ".orca", "artifacts", "REVIEW.md");
+    writeFileSync(revPath, "# Tampered Review\n\n" + "Injected bypass text.\n".repeat(15) + "\nVERDICT: PASS\n");
+    const rTamperedResume = await runFlow({
+      name: "v11-tampered-resume",
+      reuseDir: rPrepRev.dir,
+      config: "_tmp-v11-cf.config.json",
+      args: ["--from", "pr-submit"],
+      stdinText: "n\n",
+      budgetMs: 25000,
+    });
+    eq("V11 P0-03 tampered REVIEW.md rejected by ledger artifactSha256 check on --from pr-submit", rTamperedResume.code, 1);
+    ok("V11 P0-03 logged artifact modified outside bound ledger", /modified outside bound ledger/.test(rTamperedResume.out + rTamperedResume.err));
+
+    // =========================================================================
+    // 4) P1-05: Consecutive `--from pr-submit` resumes preserve Epic #42 lineage
+    // =========================================================================
+    writeFileSync(v11IssCfg, JSON.stringify({
+      defaults: { timeoutMs: 5000, targetBranch: "dev", issueTracking: { enabled: true, provider: "gh", createEpic: true, createTaskIssues: true } },
+      pipeline: [
+        { id: "po-backlog", title: "PO Backlog", agent: "gemini", model: "gemini-4-neon", syncIssues: true, spec: "Plan {out}.", writes: "BACKLOG.md" },
+        { id: "pr-submit", title: "PR Submit", agent: "opencode2", model: "deepseek-v4.1", reads: ["po-backlog"], linkIssues: true, spec: "PR refs: {issueCloses}", writes: "PR.md" },
+      ],
+    }));
+    const issFlowDir = mkdtempSync(join(tmpdir(), "orca-v11-iss-"));
+    dirsOfCurrentScenario.push(issFlowDir);
+    const issWt = join(issFlowDir, "wt");
+    mkdirSync(issWt, { recursive: true });
+    spawnSync("git", ["init", "-b", "main", issWt], { encoding: "utf8" });
+    spawnSync("git", ["-C", issWt, "remote", "add", "origin", "https://github.com/shown1985/sxcj.git"], { encoding: "utf8" });
+    const mockGhDir = join(tmpV11, "mock-gh-bin");
+    mkdirSync(mockGhDir, { recursive: true });
+    const ghSeqFile = join(tmpV11, "gh-seq.txt");
+    writeFileSync(ghSeqFile, "41", "utf8");
+    writeFileSync(join(mockGhDir, "gh"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const a = process.argv.slice(2);
+if (a[0] === "auth") process.exit(0);
+if (a[0] === "repo" && a[1] === "view") { console.log(JSON.stringify({ defaultBranchRef: { name: "main" } })); process.exit(0); }
+if (a[0] === "issue" && a[1] === "create") {
+  const n = Number(fs.readFileSync(${JSON.stringify(ghSeqFile)}, "utf8")) + 1;
+  fs.writeFileSync(${JSON.stringify(ghSeqFile)}, String(n));
+  console.log("https://github.com/shown1985/sxcj/issues/" + n);
+  process.exit(0);
+}
+process.exit(0);
+`, { mode: 0o755 });
+
+    const issEnv = { PATH: `${mockGhDir}:${process.env.PATH}` };
+    const rIssInit = await runFlow({
+      name: "v11-iss-init",
+      reuseDir: issFlowDir,
+      config: "_tmp-v11-iss.config.json",
+      objective: "Epic Lineage Test",
+      env: issEnv,
+      budgetMs: 30000,
+    });
+    eq("V11 P1-05 initial run with Epic #42 succeeded", rIssInit.code, 0);
+
+    rmSync(join(issFlowDir, "state.json"), { force: true });
+    const rIssRes1 = await runFlow({
+      name: "v11-iss-res1",
+      reuseDir: issFlowDir,
+      config: "_tmp-v11-iss.config.json",
+      objective: "Epic Lineage Test",
+      args: ["--from", "pr-submit"],
+      env: issEnv,
+      budgetMs: 25000,
+    });
+    const specRes1 = Object.values(rIssRes1.state?.tasks || {})[0]?.spec || "";
+    eq("V11 P1-05 first --from pr-submit succeeded with Epic #42", [rIssRes1.code, specRes1.includes("#42")], [0, true]);
+
+    rmSync(join(issFlowDir, "state.json"), { force: true });
+    const rIssRes2 = await runFlow({
+      name: "v11-iss-res2",
+      reuseDir: issFlowDir,
+      config: "_tmp-v11-iss.config.json",
+      objective: "Epic Lineage Test",
+      args: ["--from", "pr-submit"],
+      env: issEnv,
+      budgetMs: 25000,
+    });
+    const specRes2 = Object.values(rIssRes2.state?.tasks || {})[0]?.spec || "";
+    eq("V11 P1-05 SECOND consecutive --from pr-submit STILL preserves Epic #42", [rIssRes2.code, specRes2.includes("#42")], [0, true]);
+  } finally {
+    for (const f of [v11CfCfg, v11IssCfg]) { try { rmSync(f, { force: true }); } catch {} }
+  }
+
+  // =========================================================================
+  // 5) P0-04 + P1-11 + P2-02: Two-job CD architecture (SHA pre-gate on hosted
+  //    runner BEFORE self-hosted runner) & Compose config/starting/revision checks
+  // =========================================================================
+  const cdDir = join(tmpV11, "cd-v11");
+  mkdirSync(cdDir, { recursive: true });
+  writeFileSync(join(cdDir, "docker-compose.prod.yml"), "services:\n  api:\n    image: alpine\n");
+  const cdYml = renderSelfHostedCdWorkflow(detectProjectStacks(cdDir), { deployBranch: "main", serviceName: "api" });
+  const rubyOk = spawnSync("ruby", ["-ryaml", "-e", "puts 'ok'"], { encoding: "utf8" });
+  if (!rubyOk.error && rubyOk.status === 0) {
+    const cdYmlFile = join(tmpV11, "cd-selfhosted.yml");
+    writeFileSync(cdYmlFile, cdYml);
+    const archCheck = spawnSync("ruby", ["-ryaml", "-e", `
+      d = YAML.load_file(${JSON.stringify(cdYmlFile)})
+      jobs = d['jobs']
+      pre = jobs['verify-deploy-source']
+      dep = jobs['deploy-intranet']
+      raise 'missing verify-deploy-source' unless pre && pre['runs-on'] == 'ubuntu-latest'
+      raise 'missing head_sha check on pre-gate if' unless pre['if'].to_s.include?("head_sha != ''")
+      raise 'deploy-intranet must need verify-deploy-source' unless dep && dep['needs'] == 'verify-deploy-source'
+      raise 'deploy-intranet must run on self-hosted' unless Array(dep['runs-on']).include?('self-hosted')
+      raise 'deploy-intranet if must require verified output' unless dep['if'].to_s.include?("needs.verify-deploy-source.outputs.verified == 'true'")
+    `], { encoding: "utf8" });
+    eq("V11 P0-04 Psych verifies SHA & ref pre-gate runs on ubuntu-latest BEFORE self-hosted runner allocation", archCheck.status, 0);
+  }
+
+  const cdHealthBash = extractStepScript(cdYml, "Post-deploy automated health check (PII-safe)");
+  const mockDockerDir = join(tmpV11, "mock-docker");
+  mkdirSync(mockDockerDir, { recursive: true });
+  writeFileSync(join(mockDockerDir, "docker"), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a.includes("config") && a.includes("--services")) {
+  if (process.env.MOCK_CFG_EXIT) process.exit(Number(process.env.MOCK_CFG_EXIT));
+  console.log("api");
+  process.exit(0);
+}
+if (a.includes("ps") && a.includes("--format")) {
+  process.stdout.write(process.env.MOCK_PS_JSON || "[]");
+  process.exit(0);
+}
+if (a.includes("inspect")) {
+  process.stdout.write(process.env.MOCK_INSPECT_OUT || "[]");
+  process.exit(0);
+}
+process.exit(0);
+`, { mode: 0o755 });
+  writeFileSync(join(mockDockerDir, "curl"), "#!/usr/bin/env node\nconsole.log('HTTP/1.1 200 OK\\r\\n\\r\\nok');\nprocess.exit(0);\n", { mode: 0o755 });
+  const expectedRevSha = "b".repeat(40);
+  // Even if directory marker .orca-deploy-sha exists, container revision MUST still be verified!
+  writeFileSync(join(cdDir, ".orca-deploy-sha"), expectedRevSha + "\n");
+  const execHealth = (extra) => spawnSync("bash", ["-c", cdHealthBash], {
+    cwd: cdDir,
+    env: {
+      ...process.env,
+      PATH: `${mockDockerDir}:${process.env.PATH}`,
+      COMPOSE_FILE: "docker-compose.prod.yml",
+      SERVICE_NAME: "api",
+      ORCA_DEPLOY_SHA: expectedRevSha,
+      DEFAULT_HEALTHCHECK_URL: "http://127.0.0.1:8000/health",
+      HEALTHCHECK_URL: "",
+      DEPLOY_ONESHOT_SERVICES: "",
+      HEALTHCHECK_RETRIES: "1",
+      HEALTHCHECK_INTERVAL: "0",
+      ...extra,
+    },
+    encoding: "utf8",
+  });
+  eq("V11 P1-11 compose config --services failure propagates exact exit code 17",
+    execHealth({ MOCK_CFG_EXIT: "17", MOCK_PS_JSON: JSON.stringify([{ Service: "api", State: "running", Health: "healthy", Labels: `io.orca-pod.deploy-sha=${expectedRevSha}` }]) }).status, 17);
+  eq("V11 P1-11 Health=starting is REJECTED (not treated as healthy)",
+    execHealth({ MOCK_PS_JSON: JSON.stringify([{ Service: "api", State: "running", Health: "starting", Labels: `io.orca-pod.deploy-sha=${expectedRevSha}` }]) }).status, 1);
+  eq("V11 P1-11 missing live container revision label is REJECTED even when .orca-deploy-sha file exists",
+    execHealth({ MOCK_PS_JSON: JSON.stringify([{ Service: "api", State: "running", Health: "healthy", Labels: "" }]) }).status, 1);
+  eq("V11 P1-11 mismatched live container revision label is REJECTED",
+    execHealth({ MOCK_PS_JSON: JSON.stringify([{ Service: "api", State: "running", Health: "healthy", Labels: `io.orca-pod.deploy-sha=${"c".repeat(40)}` }]) }).status, 1);
+
+  // =========================================================================
+  // 6) P1-03, P1-04, P1-06, P1-07, P1-09: Remaining targeted boundary checks
+  // =========================================================================
+  // P1-03 exact Codex review reproduction: parent .opencode/opencode.json (Claude) + child opencode.json (GPT) -> Claude!
+  const ocP = join(tmpV11, "oc-repro");
+  const ocSub = join(ocP, "sub");
+  mkdirSync(join(ocP, ".opencode"), { recursive: true });
+  mkdirSync(ocSub, { recursive: true });
+  spawnSync("git", ["init", ocP], { encoding: "utf8" });
+  writeFileSync(join(ocP, ".opencode", "opencode.json"), JSON.stringify({ model: "anthropic/claude-sonnet-4-5" }));
+  writeFileSync(join(ocSub, "opencode.json"), JSON.stringify({ model: "openai/gpt-5" }));
+  eq("V11 P1-03 parent .opencode/opencode.json (Claude) beats child plain opencode.json (GPT)",
+    resolveOpencodeConfig({ projectDir: ocSub }).model, "anthropic/claude-sonnet-4-5");
+
+  // P1-04 multi-MCP partial mount failure rolls back ALREADY-WRITTEN first MCP file immediately!
+  const partialMountWt = join(tmpV11, "partial-mount");
+  mkdirSync(partialMountWt, { recursive: true });
+  writeFileSync(join(partialMountWt, ".mcp.json"), "{ broken json");
+  let partialMountThrew = false;
+  try {
+    materializeAgentConfig({
+      worktree: partialMountWt,
+      members: [
+        { id: "m1", agent: "agy", mcp: ["srvA"], skills: [] },
+        { id: "m2", agent: "claude", mcp: ["srvB"], skills: [] },
+      ],
+      cfg: {
+        mcpServers: {
+          srvA: { command: "node", args: ["a.js"] },
+          srvB: { command: "node", args: ["b.js"] },
+        },
+      },
+      configDir: join(REPO, ".orca"),
+      die: (m) => { partialMountThrew = true; throw new Error(m); },
+      warn: () => {},
+      rollbackOnError: true,
+    });
+  } catch {}
+  eq("V11 P1-04 multi-MCP failure threw and IMMEDIATELY rolled back .agents/mcp_config.json",
+    [partialMountThrew, existsSync(join(partialMountWt, ".agents", "mcp_config.json")), existsSync(join(partialMountWt, ".orca-agent-config.json"))],
+    [true, false, false]);
+
+  // P1-06 external Markdown link `[Issue #42](https://github.com/other/repo/issues/42)` MUST NOT bind local issue #42!
+  const extTasks = parseBacklogTasks(
+    "- [ ] External ref [Issue #42](https://github.com/other/repo/issues/42)\n- [ ] Same repo ref [Issue #77](https://github.com/shown1985/sxcj/issues/77)\n",
+    { currentHost: "github.com", currentRepo: "shown1985/sxcj" }
+  );
+  eq("V11 P1-06 external Markdown link [Issue #42](other/repo) returns null while same-repo link returns 77",
+    [extTasks[0]?.number, extTasks[1]?.number], [null, 77]);
+  eq("V11 P1-06 extractExplicitLocalIssueNumber rejects external link without currentRepo context",
+    extractExplicitLocalIssueNumber("Track [Issue #42](https://github.com/other/repo/issues/42)"), null);
+
+  // P1-07 `HTTP 404: "repository" not found` is NOT a missing-label error & stderr foreign URL is NEVER treated as created!
+  eq('V11 P1-07 HTTP 404: "repository" not found is NOT misclassified as missing label',
+    isMissingLabelError('HTTP 404: "repository" not found', "", false), false);
+  let repo404Calls = 0;
+  const repo404Res = createIssueViaCli({
+    provider: "gh",
+    bin: "gh",
+    repoDir: tmpV11,
+    host: "github.com",
+    repo: "shown1985/sxcj",
+    title: "Test",
+    body: "Body",
+    labels: ["orca-pod"],
+    execFn: () => {
+      repo404Calls++;
+      return { ok: false, status: 1, stdout: "", stderr: 'HTTP 404: "repository" not found; see https://github.com/other/repo/issues/999', timedOut: false };
+    },
+  });
+  eq("V11 P1-07 404 repository not found + foreign URL in stderr fails cleanly in 1 call (ok=false)",
+    [repo404Res.ok, repo404Calls], [false, 1]);
+
+  // P1-09 escaped quotes + spaces in JSON password, unclosed quote tail, and TokenHub redact-BEFORE-slice
+  const escapedSecret = '{"password": "alpha \\"beta\\" gamma secret tail", "ok": 1}';
+  const redEscaped = sanitizeText(escapedSecret);
+  ok("V11 P1-09 sanitizeText completely redacts JSON secret containing escaped quotes and spaces",
+    !redEscaped.includes("alpha") && !redEscaped.includes("beta") && !redEscaped.includes("gamma secret tail") && redEscaped.includes('"ok": 1'));
+
+  const unclosedSecret = '{"api_key": "unclosed_secret_at_truncation_boundary with spaces';
+  ok("V11 P1-09 sanitizeText redacts unclosed truncated JSON secret value",
+    !sanitizeText(unclosedSecret).includes("unclosed_secret_at_truncation_boundary"));
+
+  // Verify TokenHub CI script redacts full rawDiff BEFORE slicing to 40,000 chars!
+  const ghCiYml = readFileSync(join(REPO, ".github", "workflows", "ci-release.yml"), "utf8");
+  const tokenhubStep = extractStepScript(ghCiYml, "Generate Chinese PR Risk Summary via TokenHub API");
+  const nodeHeredocMatch = tokenhubStep.match(/node - <<'EOF'\n([\s\S]*?)\nEOF/);
+  ok("V11 P1-09 extracted TokenHub Node script", Boolean(nodeHeredocMatch));
+  if (nodeHeredocMatch) {
+    const padPrefix = "+ normal line of code padding\n".repeat(1332); // 39,960 chars
+    const straddlingLine = '+ const cfg = {"password": "boundary_straddling_super_secret_value_999888777"};\n';
+    const capturedPayloadFile = join(tmpV11, "tokenhub-captured.json");
+    const harnessJs = [
+      `const Module = require("node:module");`,
+      `const origLoad = Module._load;`,
+      `Module._load = function(req, parent, isMain) {`,
+      `  if (req === "node:child_process" || req === "child_process") {`,
+      `    return { execSync: (cmd) => cmd.startsWith("git diff") ? (${JSON.stringify(padPrefix + straddlingLine)}) : "" };`,
+      `  }`,
+      `  return origLoad.apply(this, arguments);`,
+      `};`,
+      `global.fetch = async (_url, opts) => {`,
+      `  require("node:fs").writeFileSync(${JSON.stringify(capturedPayloadFile)}, opts.body);`,
+      `  return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }] }) };`,
+      `};`,
+      nodeHeredocMatch[1],
+    ].join("\n");
+    const rTh = spawnSync(process.execPath, ["-e", harnessJs], {
+      env: { ...process.env, TOKENHUB_API_KEY: "th_key", TOKENHUB_BASE_URL: "https://example.invalid/v1", TOKENHUB_MODEL: "m", BASE_SHA: "a", HEAD_SHA: "b", PR_NUMBER: "1" },
+      encoding: "utf8",
+    });
+    eq("V11 P1-09 TokenHub boundary test exited 0", rTh.status, 0);
+    const sentBody = existsSync(capturedPayloadFile) ? readFileSync(capturedPayloadFile, "utf8") : "";
+    ok("V11 P1-09 TokenHub redacted straddling credential BEFORE 40,000-char truncation",
+      sentBody.length > 0 && !sentBody.includes("boundary_straddling_super_secret_value_999888777"));
+  }
 });
 
 // ---------------------------------------------------------------------------

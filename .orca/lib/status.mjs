@@ -56,8 +56,10 @@ export function createStatusManager({
   getWt, getWtPin, getWtPath, getRunId, outPath, notifyRun, log, warn,
 }) {
   let resumedLedgerRunKey = null;
+  let resumedLineageId = null;
+  let resumedLineageRunKeys = [];
   const STATUS = {
-    meta: { runId: null, ledgerRunKey: null, objective, config: configFile, worktree: null, startedAt: null, updatedAt: null },
+    meta: { runId: null, ledgerRunKey: null, lineageId: null, lineageRunKeys: [], objective, config: configFile, worktree: null, startedAt: null, updatedAt: null },
     overall: "running",
     steps: allSteps.map((s) => ({
       id: s.id, title: s.title, agent: agentOf(s), writes: s.writes || null, progress: s.progress || null,
@@ -189,9 +191,18 @@ export function createStatusManager({
     try {
       const prev = parseStatusJs(join(dir, "status.js"));
       if (!prev || !Array.isArray(prev.steps) || prev.meta?.config !== STATUS.meta.config) return;
-      // Only adopt previous step execution records when objective matches (same run lineage)
-      if (prev.meta?.objective && STATUS.meta.objective && prev.meta.objective !== STATUS.meta.objective) return;
+      const isPreviewResume = Boolean(process.env.ORCA_STATUS_PREVIEW_RESUME);
+      // P0-03: Require BOTH previous and current objective to exist and match exactly (never adopt objective-less status)
+      if (!isPreviewResume) {
+        if (!prev.meta?.objective || !STATUS.meta.objective || prev.meta.objective !== STATUS.meta.objective) return;
+      }
       if (prev.meta?.ledgerRunKey) resumedLedgerRunKey = prev.meta.ledgerRunKey;
+      resumedLineageId = prev.meta?.lineageId || prev.meta?.ledgerRunKey || null;
+      if (Array.isArray(prev.meta?.lineageRunKeys) && prev.meta.lineageRunKeys.length) {
+        resumedLineageRunKeys = [...new Set(prev.meta.lineageRunKeys.filter((x) => typeof x === "string" && x.trim()))];
+      } else if (resumedLedgerRunKey) {
+        resumedLineageRunKeys = [resumedLedgerRunKey];
+      }
       for (const ps of prev.steps) {
         const cur = statusOf(ps.id);
         if (!cur) continue;
@@ -202,6 +213,7 @@ export function createStatusManager({
             model: ps.model || cur.model || null,
             family: ps.family || cur.family || null,
             executedFamilies: Array.isArray(ps.executedFamilies) ? ps.executedFamilies : (ps.family ? [ps.family] : []),
+            provenanceVerified: false,
             attempt: Math.max(cur.attempt, ps.attempt || 0),
             startedAt: ps.startedAt ?? null,
             endedAt: ps.endedAt ?? null,
@@ -298,7 +310,15 @@ export function createStatusManager({
     STATUS, statusDir, statusOf, statusSet, writeStatus, writeArtifactSnapshot,
     copyRunFiles, archiveCurrentRun, listRuns, printRunList,
     statusBegin, statusEnd, finishStatus, refreshProgress, loadPreviousStatus, initStatus, runPreviewAndExit,
-    setLedgerRunKey: (rk) => { STATUS.meta.ledgerRunKey = rk; },
+    setLedgerRunKey: (rk, { lineageId = null, lineageRunKeys = null } = {}) => {
+      STATUS.meta.ledgerRunKey = rk;
+      STATUS.meta.lineageId = lineageId || resumedLineageId || rk;
+      STATUS.meta.lineageRunKeys = Array.isArray(lineageRunKeys) && lineageRunKeys.length
+        ? [...new Set(lineageRunKeys)]
+        : [...new Set([...resumedLineageRunKeys, rk].filter(Boolean))];
+    },
     getResumedLedgerRunKey: () => resumedLedgerRunKey,
+    getResumedLineageId: () => resumedLineageId,
+    getResumedLineageRunKeys: () => [...resumedLineageRunKeys],
   };
 }

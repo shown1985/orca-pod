@@ -1,26 +1,33 @@
 // Lightweight secret & PII redaction helper for logs, status, issue errors, CI diffs, and ledger.
-// Strips URL basic-auth credentials, query tokens, JSON-quoted secret fields, key-value secrets,
-// Bearer/Basic/token headers, JWTs, API keys, PEM private keys, and email addresses,
-// and truncates untrusted raw output snippets.
+// Strips URL basic-auth credentials, query tokens, JSON-quoted secret fields (including escaped quotes
+// and truncated unclosed tails), key-value secrets, Bearer/Basic/token headers, JWTs, API keys,
+// PEM private keys, and email addresses, and truncates untrusted raw output snippets AFTER redaction.
 // Zero external dependencies (Node >= 18).
 
+const SECRET_KEY_NAMES = "api[_-]?key|apikey|tokenhub[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|client[_-]?secret|webhook[_-]?secret|private[_-]?key|secret|password|passwd|pwd|token|gh[_-]?token|gitea[_-]?token|github[_-]?token|cookie|set-cookie|authorization";
+
 const PEM_BLOCK_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g;
-const URL_BASIC_AUTH_RE = /\b(https?:\/\/)([^/\s:@]+):([^/\s@]+)@/gi;
-const URL_SENSITIVE_QUERY_RE = /([?&](?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|secret|client[_-]?secret|password|passwd|auth|key|signature|sig)=)([^&#\s"']+)/gi;
+const URL_BASIC_AUTH_RE = /\b([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^/\s@]+)@/gi;
+const URL_SENSITIVE_QUERY_RE = /([?&](?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|secret|client[_-]?secret|password|passwd|pwd|auth|key|signature|sig)=)([^&#\s"']+)/gi;
 const AUTH_HEADER_RE = /\b((?:Authorization\s*[:=]\s*["']?)?(?:Bearer|Basic|token))\s+[A-Za-z0-9._~+/=-]{8,}/gi;
-const JWT_RE = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+const JWT_RE = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b/g;
 const KNOWN_TOKEN_PREFIX_RE = /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16})\b/g;
 
-// JSON / YAML / JS object quoted key-value pairs: `"access_token": "secret..."` or `'apiKey': '...'`
-const JSON_KV_SECRET_RE = /(["'])(api[_-]?key|apikey|tokenhub[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|client[_-]?secret|webhook[_-]?secret|private[_-]?key|secret|password|passwd|token|gh[_-]?token|gitea[_-]?token|github[_-]?token|cookie|set-cookie|authorization)\1(\s*:\s*)(["'])([^"'\r\n]+)\4/gi;
+// JSON / YAML / JS quoted key-value pairs supporting escaped quotes (`\"` / `\'`) and spaces inside values!
+const JSON_DQ_KV_SECRET_RE = new RegExp(`(["'])(${SECRET_KEY_NAMES})\\1(\\s*:\\s*)"(?:\\\\.|[^"\\\\\\r\\n])*"`, "gi");
+const JSON_SQ_KV_SECRET_RE = new RegExp(`(["'])(${SECRET_KEY_NAMES})\\1(\\s*:\\s*)'(?:\\\\.|[^'\\\\\\r\\n])*'`, "gi");
+// Unclosed / truncated quoted secret value at end-of-line or end-of-input: omit remainder conservatively!
+const JSON_UNCLOSED_KV_SECRET_RE = new RegExp(`(["'])(${SECRET_KEY_NAMES})\\1(\\s*:\\s*)(["'])(?:\\\\.|(?!\\4)[^\\r\\n])*$`, "gim");
 
-// Unquoted env / CLI / config key-value pairs: `access_token=xyz`, `API_KEY: "xyz"`
-const KV_SECRET_RE = /\b(api[_-]?key|apikey|tokenhub[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|client[_-]?secret|webhook[_-]?secret|private[_-]?key|secret|password|passwd|token|gh[_-]?token|gitea[_-]?token|github[_-]?token|cookie)(\s*[:=]\s*)(["']?)([^\s"',;}{\r\n]+)\3/gi;
+// Unquoted key with quoted value (supporting escaped quotes) or unquoted token value, plus unclosed quoted tail:
+const KV_QUOTED_SECRET_RE = new RegExp(`\\b(${SECRET_KEY_NAMES})(\\s*[:=]\\s*)(["'])(?:\\\\.|(?!\\3)[^\\\\\\r\\n])*\\3`, "gi");
+const KV_UNCLOSED_QUOTED_SECRET_RE = new RegExp(`\\b(${SECRET_KEY_NAMES})(\\s*[:=]\\s*)(["'])(?:\\\\.|(?!\\3)[^\\r\\n])*$`, "gim");
+const KV_BARE_SECRET_RE = new RegExp(`\\b(${SECRET_KEY_NAMES})(\\s*[:=]\\s*)(?!\\[REDACTED)([^\\s"',;}{\\r\\n]+)`, "gi");
 
 // Match standard email addresses while avoiding SCP-style git remotes like git@github.com:org/repo
 const EMAIL_RE = /\b(?!git@[A-Za-z0-9.-]+:)[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b(?![:/])/g;
 
-const SENSITIVE_OBJECT_KEY_RE = /(?:password|passwd|secret|token|apikey|api_key|privatekey|private_key|authorization|cookie|credential)/i;
+const SENSITIVE_OBJECT_KEY_RE = /(?:password|passwd|pwd|secret|token|apikey|api_key|privatekey|private_key|authorization|cookie|credential)/i;
 
 export function sanitizeText(input, { maxLen = 0 } = {}) {
   if (input == null) return input;
@@ -30,11 +37,15 @@ export function sanitizeText(input, { maxLen = 0 } = {}) {
   text = text.replace(PEM_BLOCK_RE, "[REDACTED_PRIVATE_KEY]");
   text = text.replace(URL_BASIC_AUTH_RE, "$1[REDACTED]:[REDACTED]@");
   text = text.replace(URL_SENSITIVE_QUERY_RE, "$1[REDACTED]");
-  text = text.replace(JSON_KV_SECRET_RE, (_, qk, key, sep, qv) => `${qk}${key}${qk}${sep}${qv}[REDACTED]${qv}`);
+  text = text.replace(JSON_DQ_KV_SECRET_RE, (_, qk, key, sep) => `${qk}${key}${qk}${sep}"[REDACTED]"`);
+  text = text.replace(JSON_SQ_KV_SECRET_RE, (_, qk, key, sep) => `${qk}${key}${qk}${sep}'[REDACTED]'`);
+  text = text.replace(JSON_UNCLOSED_KV_SECRET_RE, (_, qk, key, sep, qv) => `${qk}${key}${qk}${sep}${qv}[REDACTED]${qv}`);
   text = text.replace(AUTH_HEADER_RE, (_, prefix) => `${prefix} [REDACTED]`);
   text = text.replace(JWT_RE, "[REDACTED_JWT]");
   text = text.replace(KNOWN_TOKEN_PREFIX_RE, "[REDACTED_TOKEN]");
-  text = text.replace(KV_SECRET_RE, (_, key, sep, quote) => `${key}${sep}${quote}[REDACTED]${quote}`);
+  text = text.replace(KV_QUOTED_SECRET_RE, (_, key, sep, q) => `${key}${sep}${q}[REDACTED]${q}`);
+  text = text.replace(KV_UNCLOSED_QUOTED_SECRET_RE, (_, key, sep, q) => `${key}${sep}${q}[REDACTED]${q}`);
+  text = text.replace(KV_BARE_SECRET_RE, (_, key, sep) => `${key}${sep}[REDACTED]`);
   text = text.replace(EMAIL_RE, "[REDACTED_EMAIL]");
 
   if (maxLen > 0 && text.length > maxLen) {

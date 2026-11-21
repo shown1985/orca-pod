@@ -15,11 +15,30 @@ export function createNudgeController({
     return id || null;
   }
 
+  function remainingBudgetMs(m) {
+    const capAt = Math.min(
+      Number.isFinite(m.deadlineAt) ? m.deadlineAt : Infinity,
+      Number.isFinite(m.maxDeadlineAt) ? m.maxDeadlineAt : Infinity,
+    );
+    return Number.isFinite(capAt) ? (capAt - Date.now()) : Infinity;
+  }
+
   function send(m, text) {
-    const s = orca(["terminal", "send", "--terminal", m.terminal, "--text", text, "--enter"]);
+    const remBefore = remainingBudgetMs(m);
+    if (remBefore <= 0) return false;
+    const rpcTimeout = Number.isFinite(remBefore) ? Math.max(250, remBefore) : undefined;
+    const s = orca(["terminal", "send", "--terminal", m.terminal, "--text", text, "--enter"], { timeoutMs: rpcTimeout });
     if (!s.ok) { warn(`nudge send '${m.step.title}' failed: ${s.stderr || s.raw}`); return false; }
-    sleepMs(3000);
-    orca(["terminal", "send", "--terminal", m.terminal, "--text", "", "--enter"]);
+    const remSleep = remainingBudgetMs(m);
+    if (remSleep > 0) {
+      sleepMs(Math.min(3000, remSleep));
+    }
+    const remAfter = remainingBudgetMs(m);
+    if (remAfter > 0) {
+      orca(["terminal", "send", "--terminal", m.terminal, "--text", "", "--enter"], {
+        timeoutMs: Number.isFinite(remAfter) ? Math.max(250, remAfter) : undefined,
+      });
+    }
     m.nudge.left--; m.nudge.count++; m.nudge.sentAt = Date.now();
     m.lastBusy = Date.now();
     warn(`[nudge] ${m.nudge.count}/${nudgeRetriesOf(m.step)} sent to "${m.step.title}" (artifact \`${outPath(m.step.writes)}\` missing)`);
@@ -61,13 +80,13 @@ export function createNudgeController({
   }
 
   function nudgePoll(m) {
-    if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: getWtDir() || ".", artDirRel: artDir });
+    if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: getWtDir() || ".", artDirRel: artDir, minSourceMtimeMs: m.fsEpochMtimeMs ?? m.clearedAtMs });
     if (artifactReady(m.step.id)) {
       m.note = `artifact recovered via nudge (${m.nudge.count} sent)`;
       settleMember(m, m.nudge.outcome || "succeeded", m.nudge.done);
       return;
     }
-    const hitDeadline = m.deadlineAt ? (Date.now() >= m.deadlineAt) : (Date.now() - m.startedAt >= m.hardCapMs);
+    const hitDeadline = remainingBudgetMs(m) <= 0 || (!m.deadlineAt && Date.now() - m.startedAt >= m.hardCapMs);
     if (hitDeadline) {
       m.note = "artifact still missing after hard cap";
       settleMember(m, "failed", m.nudge.done);

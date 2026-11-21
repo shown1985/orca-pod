@@ -324,13 +324,40 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
     if (opts.clearedBeforeDispatch === false) {
       return { ok: false, reason: `stale artifact guard: ${step.writes} was not cleared prior to dispatch` };
     }
-    if (opts.minMtimeMs != null && Number.isFinite(opts.minMtimeMs)) {
-      // Allow 1s filesystem timestamp resolution floor (HFS+/ext4/FAT/APFS coarse stat)
-      const floorMs = Math.floor(opts.minMtimeMs / 1000) * 1000;
-      if (st.mtimeMs < floorMs) {
+    const thresholdMs = (opts.fsEpochMtimeMs != null && Number.isFinite(opts.fsEpochMtimeMs))
+      ? opts.fsEpochMtimeMs
+      : ((opts.minMtimeMs != null && Number.isFinite(opts.minMtimeMs)) ? opts.minMtimeMs : null);
+    if (thresholdMs != null && st.mtimeMs < thresholdMs) {
+      return {
+        ok: false,
+        reason: `stale artifact: ${step.writes} mtime (${st.mtimeMs.toFixed(3)}) predates current dispatch (${thresholdMs.toFixed(3)})`,
+      };
+    }
+    if (opts.dispatchId) {
+      const claimFile = join(artDir, ".dispatch-gate-claims.json");
+      if (!existsSync(claimFile)) {
         return {
           ok: false,
-          reason: `stale artifact: ${step.writes} mtime (${Math.round(st.mtimeMs)}) predates current dispatch (${Math.round(opts.minMtimeMs)})`,
+          reason: `unattributed gate artifact: missing dispatch provenance claim for ${step.writes} (expected dispatch ${opts.dispatchId})`,
+        };
+      }
+      let claim = null;
+      try {
+        const claims = JSON.parse(readFileSync(claimFile, "utf8"));
+        claim = claims?.[step.writes] || null;
+      } catch {
+        claim = null;
+      }
+      if (!claim || claim.cleared !== true || claim.activeDispatchId !== opts.dispatchId) {
+        return {
+          ok: false,
+          reason: `unattributed gate artifact: ${step.writes} provenance (${claim?.activeDispatchId || "none"}) does not match active dispatch ${opts.dispatchId}`,
+        };
+      }
+      if (claim.fsEpochMtimeMs != null && Number.isFinite(claim.fsEpochMtimeMs) && st.mtimeMs < claim.fsEpochMtimeMs) {
+        return {
+          ok: false,
+          reason: `stale gate artifact: ${step.writes} mtime (${st.mtimeMs.toFixed(3)}) predates dispatch ${opts.dispatchId} epoch (${claim.fsEpochMtimeMs.toFixed(3)})`,
         };
       }
     }
@@ -340,6 +367,18 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
   }
   let text = "";
   try { text = readFileSync(filePath, "utf8"); } catch (e) { return { ok: false, reason: `read failed: ${e.message}` }; }
+  if ((opts.mode || "settlement") === "settlement" && opts.dispatchId) {
+    for (const raw of text.split(/\r?\n/)) {
+      const cleaned = normalizeMarkerLine(raw);
+      const dm = /^(?:\*\*|__)?Dispatch-ID(?:\*\*|__)?\s*:\s*`?([^`\s*]+)`?$/i.exec(cleaned);
+      if (dm && dm[1] !== opts.dispatchId) {
+        return {
+          ok: false,
+          reason: `mismatched Dispatch-ID header in ${step.writes}: found "${dm[1]}", expected "${opts.dispatchId}"`,
+        };
+      }
+    }
+  }
   return verifyArtifactContent(text, step.verify, { gitDir, artDir, mode: opts.mode || "settlement", targetBranch: opts.targetBranch || "dev", allowOneWayMerge: Boolean(opts.allowOneWayMerge), preStepTargetSha: opts.preStepTargetSha || null, preStepOriginTargetSha: opts.preStepOriginTargetSha || null, preStepRemoteTargetSha: opts.preStepRemoteTargetSha || null, preStepRemoteError: opts.preStepRemoteError || null, preStepHasOrigin: Boolean(opts.preStepHasOrigin), preStepHeadSha: opts.preStepHeadSha || null, mergeDangerThresholds: opts.mergeDangerThresholds || null });
 }
 

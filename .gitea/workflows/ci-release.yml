@@ -83,9 +83,9 @@ jobs:
             if [ ! -d "$dir" ]; then continue; fi
             first_dir_py_test=""
             if [ "$dir" = "." ]; then
-              first_dir_py_test="$(find . -maxdepth 4 \( -path './.venv' -o -path './venv' -o -path './node_modules' -o -path './.git' -o -path './__pycache__' -o -path './backend' -o -path './server' -o -path './api' -o -path './frontend' -o -path './web' -o -path './client' -o -path './ui' \) -prune -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)"
+              first_dir_py_test="$(find . \( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'node_modules' -o -name '__pycache__' -o -name 'build' -o -name 'dist' -o -name '.tox' -o -name '.mypy_cache' -o -name '.pytest_cache' -o -name '.orca' -o -path './backend' -o -path './server' -o -path './api' -o -path './frontend' -o -path './web' -o -path './client' -o -path './ui' \) -prune -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)"
             else
-              first_dir_py_test="$(find "$dir" -maxdepth 4 \( -path "$dir/.venv" -o -path "$dir/venv" -o -path "$dir/node_modules" -o -path "$dir/.git" -o -path "$dir/__pycache__" \) -prune -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)"
+              first_dir_py_test="$(find "$dir" \( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'node_modules' -o -name '__pycache__' -o -name 'build' -o -name 'dist' -o -name '.tox' -o -name '.mypy_cache' -o -name '.pytest_cache' -o -name '.orca' \) -prune -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)"
             fi
             if [ -f "$dir/pyproject.toml" ] || [ -f "$dir/requirements.txt" ] || [ -f "$dir/requirements-dev.txt" ] || [ -f "$dir/setup.py" ] || [ -f "$dir/setup.cfg" ] || [ -f "$dir/Pipfile" ] || [ -f "$dir/pytest.ini" ] || [ -f "$dir/tox.ini" ] || [ -n "$first_dir_py_test" ]; then
               echo "=== Python verify: $dir ==="
@@ -102,10 +102,12 @@ jobs:
                 elif [ -f pyproject.toml ] || [ -f setup.py ]; then
                   python3 -m pip install -e .
                 fi
+                is_root_dir=0
                 if [ "$dir" = "." ]; then
-                  first_py_test="$(find . -maxdepth 4 \( -path './.venv' -o -path './venv' -o -path './node_modules' -o -path './.git' -o -path './__pycache__' -o -path './backend' -o -path './server' -o -path './api' -o -path './frontend' -o -path './web' -o -path './client' -o -path './ui' \) -prune -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)"
+                  is_root_dir=1
+                  first_py_test="$(find . \( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'node_modules' -o -name '__pycache__' -o -name 'build' -o -name 'dist' -o -name '.tox' -o -name '.mypy_cache' -o -name '.pytest_cache' -o -name '.orca' -o -path './backend' -o -path './server' -o -path './api' -o -path './frontend' -o -path './web' -o -path './client' -o -path './ui' \) -prune -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)"
                 else
-                  first_py_test="$(find . -maxdepth 4 \( -path './.venv' -o -path './venv' -o -path './node_modules' -o -path './.git' -o -path './__pycache__' \) -prune -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)"
+                  first_py_test="$(find . \( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'node_modules' -o -name '__pycache__' -o -name 'build' -o -name 'dist' -o -name '.tox' -o -name '.mypy_cache' -o -name '.pytest_cache' -o -name '.orca' \) -prune -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)"
                 fi
                 wants_pytest=0
                 if [ -f pytest.ini ] || [ -f conftest.py ] || grep -qi "pytest" pyproject.toml setup.cfg tox.ini requirements*.txt 2>/dev/null; then
@@ -115,37 +117,63 @@ jobs:
                   if ! python3 -c "import pytest" >/dev/null 2>&1; then
                     python3 -m pip install pytest
                   fi
-                  python3 -m pytest -q
+                  if python3 -m pytest --help 2>&1 | grep -q -- '--import-mode'; then
+                    python3 -m pytest --import-mode=importlib -q
+                  else
+                    python3 -m pytest -q
+                  fi
                 elif [ -n "$first_py_test" ]; then
                   if python3 -c "import pytest" >/dev/null 2>&1; then
-                    python3 -m pytest -q
+                    if python3 -m pytest --help 2>&1 | grep -q -- '--import-mode'; then
+                      python3 -m pytest --import-mode=importlib -q
+                    else
+                      python3 -m pytest -q
+                    fi
                   else
-                    python3 - <<'PY'
-          import os, sys, unittest
-          SKIP = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", ".tox", ".orca"}
-          test_dirs = []
+                    ORCA_PY_ROOT_PRUNE="$is_root_dir" python3 - <<'PY'
+          import importlib.util, os, sys, unittest
+          SKIP = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", ".tox", ".mypy_cache", ".pytest_cache", ".orca"}
+          ROOT_SUBPROJECTS = {"backend", "server", "api", "frontend", "web", "client", "ui"}
+          prune_root = os.environ.get("ORCA_PY_ROOT_PRUNE") == "1"
+          test_files = []
           for root, dirs, files in os.walk("."):
-              dirs[:] = sorted(d for d in dirs if d not in SKIP and not d.startswith("."))
-              if any((f.startswith("test_") and f.endswith(".py")) or f.endswith("_test.py") for f in files):
-                  test_dirs.append(root)
+              rel_root = os.path.normpath(root)
+              dirs[:] = sorted(
+                  d for d in dirs
+                  if d not in SKIP
+                  and not d.startswith(".")
+                  and not (prune_root and rel_root == "." and d in ROOT_SUBPROJECTS)
+              )
+              for f in sorted(files):
+                  if (f.startswith("test_") and f.endswith(".py")) or f.endswith("_test.py"):
+                      test_files.append(os.path.abspath(os.path.join(root, f)))
+          if not test_files:
+              sys.stderr.write("ERROR: Expected Python test files, but none were found during walk!\n")
+              sys.exit(1)
+          cwd_abs = os.path.abspath(".")
           loader = unittest.TestLoader()
           suite = unittest.TestSuite()
-          seen_ids = set()
-          def collect(s):
-              for item in s:
-                  if isinstance(item, unittest.TestSuite):
-                      collect(item)
-                  else:
-                      tid = item.id()
-                      if tid not in seen_ids:
-                          seen_ids.add(tid)
-                          suite.addTest(item)
-          for d in test_dirs:
-              abs_d = os.path.abspath(d)
-              if abs_d not in sys.path:
-                  sys.path.insert(0, abs_d)
-              for pat in ("test_*.py", "*_test.py"):
-                  collect(loader.discover(start_dir=d, pattern=pat, top_level_dir=d))
+          for idx, fpath in enumerate(test_files):
+              fdir = os.path.dirname(fpath)
+              stem = os.path.splitext(os.path.basename(fpath))[0]
+              mod_name = f"_orca_ut_{idx}_{stem}"
+              added_paths = []
+              for p in (fdir, cwd_abs):
+                  if p not in sys.path:
+                      sys.path.insert(0, p)
+                      added_paths.append(p)
+              try:
+                  spec = importlib.util.spec_from_file_location(mod_name, fpath)
+                  if spec is None or spec.loader is None:
+                      raise ImportError(f"Could not create module spec for {fpath}")
+                  mod = importlib.util.module_from_spec(spec)
+                  sys.modules[mod_name] = mod
+                  spec.loader.exec_module(mod)
+                  suite.addTests(loader.loadTestsFromModule(mod))
+              finally:
+                  for p in added_paths:
+                      if p in sys.path:
+                          sys.path.remove(p)
           if suite.countTestCases() == 0:
               sys.stderr.write("ERROR: Python test files matched on disk, but unittest discovered 0 test cases!\n")
               sys.exit(1)
@@ -224,19 +252,30 @@ jobs:
           const apiKey = process.env.TOKENHUB_API_KEY;
           const baseUrl = process.env.TOKENHUB_BASE_URL.replace(/\/+$/, "");
           const model = process.env.TOKENHUB_MODEL;
+          const secretKeys = "api[_-]?key|apikey|tokenhub[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|client[_-]?secret|webhook[_-]?secret|private[_-]?key|secret|password|passwd|pwd|token|gh[_-]?token|gitea[_-]?token|github[_-]?token|cookie|set-cookie|authorization";
           const rawDiff = execSync(
             `git diff "${process.env.BASE_SHA}...${process.env.HEAD_SHA}" -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)*.pem' ':(exclude)*.key' ':(exclude).env*'`,
             { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }
-          ).slice(0, 40000);
-          const diff = rawDiff
+          );
+          const redactedFull = rawDiff
             .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, "[REDACTED_PRIVATE_KEY]")
-            .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)([^\/\s:@]+:[^\/\s@]+)@/gi, "$1[REDACTED_CREDENTIALS]@")
-            .replace(/([?&](?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|auth|secret|password|passwd|pwd|key|sig|signature)=)([^&\s"'#]+)/gi, "$1[REDACTED]")
-            .replace(/(["'](?:[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|session[_-]?token|client[_-]?secret|private[_-]?key|secret|password|passwd|pwd|cookie|authorization)|token)["']\s*:\s*)(["'])(?:\\.|(?!\2)[^\\])*\2/gi, '$1"[REDACTED]"')
-            .replace(/(\b(?:authorization|bearer|x-api-key|api[_-]?key|access[_-]?token|refresh[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?key|password|passwd|pwd|session[_-]?token|cookie)\b\s*[:=]\s*)(?:bearer\s+|token\s+|basic\s+)?(["']?)([^\s"',;\n}]{4,})\2/gi, "$1[REDACTED]")
-            .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_JWT]")
-            .replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{12,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})\b/g, "[REDACTED_TOKEN]")
-            .replace(/\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})(?!:)\b/g, "[REDACTED_EMAIL]");
+            .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)([^\/\s:@]+:[^\/\s@]+)@/gi, "$1[REDACTED]:[REDACTED]@")
+            .replace(/([?&](?:api[_-]?key|apikey|token|access[_-]?token|refresh[_-]?token|auth|secret|client[_-]?secret|password|passwd|pwd|key|sig|signature)=)([^&\s"'#]+)/gi, "$1[REDACTED]")
+            .replace(new RegExp(`(["'])(${secretKeys})\\1(\\s*:\\s*)"(?:\\\\.|[^"\\\\\\r\\n])*"`, "gi"), '$1$2$1$3"[REDACTED]"')
+            .replace(new RegExp(`(["'])(${secretKeys})\\1(\\s*:\\s*)'(?:\\\\.|[^'\\\\\\r\\n])*'`, "gi"), "$1$2$1$3'[REDACTED]'")
+            .replace(new RegExp(`(["'])(${secretKeys})\\1(\\s*:\\s*)(["'])(?:\\\\.|(?!\\4)[^\\r\\n])*$`, "gim"), "$1$2$1$3$4[REDACTED]$4")
+            .replace(/\b((?:Authorization\s*[:=]\s*["']?)?(?:Bearer|Basic|token))\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [REDACTED]")
+            .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b/g, "[REDACTED_JWT]")
+            .replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,})\b/g, "[REDACTED_TOKEN]")
+            .replace(new RegExp(`\\b(${secretKeys})(\\s*[:=]\\s*)(["'])(?:\\\\.|(?!\\3)[^\\\\\\r\\n])*\\3`, "gi"), "$1$2$3[REDACTED]$3")
+            .replace(new RegExp(`\\b(${secretKeys})(\\s*[:=]\\s*)(?!\\[REDACTED)([^\\s"',;}{\\r\\n]+)`, "gi"), "$1$2[REDACTED]")
+            .replace(/\b(?!git@[A-Za-z0-9.-]+:)[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b(?![:/])/g, "[REDACTED_EMAIL]");
+          let diff = redactedFull;
+          if (diff.length > 40000) {
+            const cut = diff.slice(0, 40000);
+            const nl = cut.lastIndexOf("\n");
+            diff = nl > 0 ? cut.slice(0, nl + 1) : cut;
+          }
           if (!diff.trim()) process.exit(0);
           (async () => {
             const resp = await fetch(`${baseUrl}/chat/completions`, {

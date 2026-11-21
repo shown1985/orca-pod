@@ -2,10 +2,10 @@
 // Stack-aware CI/CD workflow generator for Orca-Pod.
 // Detects project tech stacks (Python, Node/Vue/React/Vite, Go, Rust, Docker Compose)
 // including hybrid/monorepo layouts (e.g. backend/ + frontend/), generates executable
-// GitHub Actions / Gitea Actions CI workflows with strict exit codes, zero-SIGPIPE test
-// discovery, least-privilege permissions, safe YAML/Actions-expression serialization, and
-// optionally generates a provenance-gated, PII-safe intranet Self-Hosted Runner CD workflow
-// (preserving existing cd-selfhosted.yml unless --force is explicitly passed).
+// GitHub Actions / Gitea Actions CI workflows with strict exit codes, full-depth zero-SIGPIPE
+// isolated test discovery, redact-before-truncate diff sanitization, least-privilege permissions,
+// safe YAML/Actions-expression serialization, and a two-job cloud-pre-gated PII-safe intranet
+// Self-Hosted Runner CD workflow (preserving existing cd-selfhosted.yml unless --force is passed).
 // Zero external dependencies (Node >= 18).
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 const SKIP_DIRS = new Set([
   ".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
   ".orca", ".github", ".gitea", ".next", ".nuxt", "target", "vendor", "coverage",
+  ".tox", ".mypy_cache", ".pytest_cache",
 ]);
 
 const PROD_COMPOSE_NAMES = [
@@ -35,8 +36,7 @@ const ALL_COMPOSE_NAMES = [...PROD_COMPOSE_NAMES, ...DEV_COMPOSE_NAMES];
 const SAFE_SIMPLE_TOKEN_RE = /^[A-Za-z0-9._/-]+$/;
 
 /**
- * Serialize any scalar value safely as a double-quoted YAML 1.2 string
- * (handles colons, spaces, quotes, brackets, numeric-looking strings, and strips newlines).
+ * Serialize any scalar value safely as a double-quoted YAML 1.2 string.
  */
 export function yamlScalar(val) {
   const s = String(val ?? "").replace(/\r?\n/g, " ");
@@ -45,8 +45,8 @@ export function yamlScalar(val) {
 
 /**
  * Emit an unquoted YAML identifier ONLY when it starts with an ASCII letter and is not a
- * YAML 1.1/1.2 boolean/null keyword. Numeric-only refs like `"123"` or `"1.2"` or refs with
- * quotes/slashes/spaces are ALWAYS quoted via `yamlScalar` so YAML parsers never coerce them!
+ * YAML 1.1/1.2 boolean/null keyword. Numeric-only refs like `"123"` or refs with quotes/slashes
+ * are ALWAYS quoted via `yamlScalar`.
  */
 export function yamlTokenOrQuoted(val) {
   const s = String(val ?? "").trim();
@@ -77,9 +77,12 @@ function readTextSafe(p) {
   try { return readFileSync(p, "utf8"); } catch { return ""; }
 }
 
-function hasPythonTestFiles(rootDir, maxDepth = 4) {
-  const walk = (dir, depth) => {
-    if (depth > maxDepth) return false;
+/**
+ * Full-depth recursive Python test file detector (no depth cap, so deeply nested suites like
+ * `a/b/c/d/e/unit_test.py` are NEVER missed!).
+ */
+function hasPythonTestFiles(rootDir) {
+  const walk = (dir) => {
     let entries = [];
     try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return false; }
     for (const ent of entries) {
@@ -89,13 +92,13 @@ function hasPythonTestFiles(rootDir, maxDepth = 4) {
         if ((ent.name.startsWith("test_") && ent.name.endsWith(".py")) || ent.name.endsWith("_test.py")) {
           return true;
         }
-      } else if (ent.isDirectory() && depth < maxDepth) {
-        if (walk(full, depth + 1)) return true;
+      } else if (ent.isDirectory()) {
+        if (walk(full)) return true;
       }
     }
     return false;
   };
-  return walk(rootDir, 0);
+  return walk(rootDir);
 }
 
 function candidateDirs(projectDir) {
@@ -134,17 +137,16 @@ function detectPythonInDir(projectDir, relDir) {
   const pipfile = existsSync(join(abs, "Pipfile"));
   const pytestIni = existsSync(join(abs, "pytest.ini"));
   const toxIni = existsSync(join(abs, "tox.ini"));
-  const hasTestFiles = relDir === "." ? false : hasPythonTestFiles(abs, 4);
+  const hasTestFiles = relDir === "." ? false : hasPythonTestFiles(abs);
   const hasRootOnlyPyTests = relDir === "." && !pyproject && !reqTxt && !reqDev && !setupPy && !setupCfg && !pipfile && !pytestIni && !toxIni
     ? (() => {
-      // Check root or tests/cases dirs that aren't separate backend/server/api subprojects
       try {
         for (const ent of readdirSync(projectDir, { withFileTypes: true })) {
           if (SKIP_DIRS.has(ent.name) || ent.name.startsWith(".")) continue;
           if (/^(?:backend|server|api|apps|packages|services|frontend|web|client|ui)$/.test(ent.name)) continue;
           const full = join(projectDir, ent.name);
           if (ent.isFile() && ((ent.name.startsWith("test_") && ent.name.endsWith(".py")) || ent.name.endsWith("_test.py"))) return true;
-          if (ent.isDirectory() && hasPythonTestFiles(full, 3)) return true;
+          if (ent.isDirectory() && hasPythonTestFiles(full)) return true;
         }
       } catch {}
       return false;
@@ -370,45 +372,77 @@ function renderWorkingDirDefaults(dir) {
 }
 
 /**
- * Shared inline Python stdlib `unittest` runner that walks ALL subdirectories without
- * requiring `__init__.py`, discovers BOTH `test_*.py` and `*_test.py` with `top_level_dir=d`,
- * and fails closed (`sys.exit(1)`) if test files exist on disk yet 0 test cases were discovered!
+ * Shared inline Python stdlib `unittest` runner:
+ *   - Full-depth walk with ZERO depth cap (identical traversal rules to `find` detection!)
+ *   - Loads each discovered `test_*.py` / `*_test.py` file via `importlib.util.spec_from_file_location`
+ *     under a unique synthetic module name `_orca_ut_<idx>_<stem>` so same-basename files across
+ *     multiple directories (e.g. `dir1/unit_test.py` + `dir2/unit_test.py`) NEVER collide in `sys.modules`!
+ *   - Fails closed (`sys.exit(1)`) if 0 test cases are discovered!
  * Note: heredoc body & closing `PY` sit at column 0 of the shell script (10 spaces in YAML).
  */
-function renderUnittestFallbackLines(callIndent = "") {
+function renderUnittestFallbackLines(callIndent = "", envPrefix = "") {
   return [
-    `${callIndent}python3 - <<'PY'`,
-    `import os, sys, unittest`,
-    `SKIP = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", ".tox", ".orca"}`,
-    `test_dirs = []`,
+    `${callIndent}${envPrefix}python3 - <<'PY'`,
+    `import importlib.util, os, sys, unittest`,
+    `SKIP = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", ".tox", ".mypy_cache", ".pytest_cache", ".orca"}`,
+    `ROOT_SUBPROJECTS = {"backend", "server", "api", "frontend", "web", "client", "ui"}`,
+    `prune_root = os.environ.get("ORCA_PY_ROOT_PRUNE") == "1"`,
+    `test_files = []`,
     `for root, dirs, files in os.walk("."):`,
-    `    dirs[:] = sorted(d for d in dirs if d not in SKIP and not d.startswith("."))`,
-    `    if any((f.startswith("test_") and f.endswith(".py")) or f.endswith("_test.py") for f in files):`,
-    `        test_dirs.append(root)`,
+    `    rel_root = os.path.normpath(root)`,
+    `    dirs[:] = sorted(`,
+    `        d for d in dirs`,
+    `        if d not in SKIP`,
+    `        and not d.startswith(".")`,
+    `        and not (prune_root and rel_root == "." and d in ROOT_SUBPROJECTS)`,
+    `    )`,
+    `    for f in sorted(files):`,
+    `        if (f.startswith("test_") and f.endswith(".py")) or f.endswith("_test.py"):`,
+    `            test_files.append(os.path.abspath(os.path.join(root, f)))`,
+    `if not test_files:`,
+    `    sys.stderr.write("ERROR: Expected Python test files, but none were found during walk!\\n")`,
+    `    sys.exit(1)`,
+    `cwd_abs = os.path.abspath(".")`,
     `loader = unittest.TestLoader()`,
     `suite = unittest.TestSuite()`,
-    `seen_ids = set()`,
-    `def collect(s):`,
-    `    for item in s:`,
-    `        if isinstance(item, unittest.TestSuite):`,
-    `            collect(item)`,
-    `        else:`,
-    `            tid = item.id()`,
-    `            if tid not in seen_ids:`,
-    `                seen_ids.add(tid)`,
-    `                suite.addTest(item)`,
-    `for d in test_dirs:`,
-    `    abs_d = os.path.abspath(d)`,
-    `    if abs_d not in sys.path:`,
-    `        sys.path.insert(0, abs_d)`,
-    `    for pat in ("test_*.py", "*_test.py"):`,
-    `        collect(loader.discover(start_dir=d, pattern=pat, top_level_dir=d))`,
+    `for idx, fpath in enumerate(test_files):`,
+    `    fdir = os.path.dirname(fpath)`,
+    `    stem = os.path.splitext(os.path.basename(fpath))[0]`,
+    `    mod_name = f"_orca_ut_{idx}_{stem}"`,
+    `    added_paths = []`,
+    `    for p in (fdir, cwd_abs):`,
+    `        if p not in sys.path:`,
+    `            sys.path.insert(0, p)`,
+    `            added_paths.append(p)`,
+    `    try:`,
+    `        spec = importlib.util.spec_from_file_location(mod_name, fpath)`,
+    `        if spec is None or spec.loader is None:`,
+    `            raise ImportError(f"Could not create module spec for {fpath}")`,
+    `        mod = importlib.util.module_from_spec(spec)`,
+    `        sys.modules[mod_name] = mod`,
+    `        spec.loader.exec_module(mod)`,
+    `        suite.addTests(loader.loadTestsFromModule(mod))`,
+    `    finally:`,
+    `        for p in added_paths:`,
+    `            if p in sys.path:`,
+    `                sys.path.remove(p)`,
     `if suite.countTestCases() == 0:`,
     `    sys.stderr.write("ERROR: Python test files matched on disk, but unittest discovered 0 test cases!\\n")`,
     `    sys.exit(1)`,
     `res = unittest.TextTestRunner(verbosity=1).run(suite)`,
     `sys.exit(0 if res.wasSuccessful() else 1)`,
     `PY`,
+  ];
+}
+
+function renderPytestRunLines(indent = "", runPrefix = "") {
+  const runner = runPrefix ? `${runPrefix}pytest` : `python3 -m pytest`;
+  return [
+    `${indent}if ${runner} --help 2>&1 | grep -q -- '--import-mode'; then`,
+    `${indent}  ${runner} --import-mode=importlib -q`,
+    `${indent}else`,
+    `${indent}  ${runner} -q`,
+    `${indent}fi`,
   ];
 }
 
@@ -438,19 +472,24 @@ function renderPythonJob(py, idx, usedJobIds) {
   }
 
   const runPrefix = py.packageManager === "uv" ? "uv run " : py.packageManager === "poetry" ? "poetry run " : "";
+  const pruneExpr = py.dir === "."
+    ? "\\( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'node_modules' -o -name '__pycache__' -o -name 'build' -o -name 'dist' -o -name '.tox' -o -name '.mypy_cache' -o -name '.pytest_cache' -o -name '.orca' -o -path './backend' -o -path './server' -o -path './api' -o -path './frontend' -o -path './web' -o -path './client' -o -path './ui' \\)"
+    : "\\( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'node_modules' -o -name '__pycache__' -o -name 'build' -o -name 'dist' -o -name '.tox' -o -name '.mypy_cache' -o -name '.pytest_cache' -o -name '.orca' \\)";
+  const envPrune = py.dir === "." ? "ORCA_PY_ROOT_PRUNE=1 " : "";
+
   const testLines = ["set -euo pipefail"];
   if (py.hasRuff) testLines.push(`${runPrefix}ruff check .`);
   else if (py.hasFlake8) testLines.push(`${runPrefix}flake8 .`);
   if (py.hasPytest) {
-    testLines.push(runPrefix ? `${runPrefix}pytest -q` : "python3 -m pytest -q");
+    testLines.push(...renderPytestRunLines("", runPrefix));
   } else {
     testLines.push(
-      "first_py_test=\"$(find . -maxdepth 4 \\( -path './.venv' -o -path './venv' -o -path './node_modules' -o -path './.git' -o -path './__pycache__' \\) -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit)\"",
+      `first_py_test="$(find . ${pruneExpr} -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit)"`,
       "if [ -n \"$first_py_test\" ]; then",
       "  if python3 -c \"import pytest\" >/dev/null 2>&1; then",
-      "    python3 -m pytest -q",
+      ...renderPytestRunLines("    ", runPrefix),
       "  else",
-      ...renderUnittestFallbackLines("    "),
+      ...renderUnittestFallbackLines("    ", envPrune),
       "  fi",
       "else",
       "  python3 -m compileall -q .",
@@ -642,7 +681,9 @@ function renderDockerJob(detection, usedJobIds) {
 
 export function renderGenericAutoDetectJob(usedJobIds = new Set()) {
   const jobId = allocateJobId("verify", ".", 0, usedJobIds);
-  const pyUnittestLines = renderUnittestFallbackLines("          ").map((l) => `          ${l}`);
+  const pyUnittestLines = renderUnittestFallbackLines("          ", 'ORCA_PY_ROOT_PRUNE="$is_root_dir" ').map((l) => `          ${l}`);
+  const pytestGenericLines18 = renderPytestRunLines("                  ", "");
+  const pytestGenericLines20 = renderPytestRunLines("                    ", "");
   const yaml = [
     `  ${jobId}:`,
     `    name: "Auto-Detect Stack Verification (Python / Node / Go / Rust / Docker)"`,
@@ -716,9 +757,9 @@ export function renderGenericAutoDetectJob(usedJobIds = new Set()) {
     `            if [ ! -d "$dir" ]; then continue; fi`,
     `            first_dir_py_test=""`,
     `            if [ "$dir" = "." ]; then`,
-    `              first_dir_py_test="$(find . -maxdepth 4 \\( -path './.venv' -o -path './venv' -o -path './node_modules' -o -path './.git' -o -path './__pycache__' -o -path './backend' -o -path './server' -o -path './api' -o -path './frontend' -o -path './web' -o -path './client' -o -path './ui' \\) -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit)"`,
+    `              first_dir_py_test="$(find . \\( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'node_modules' -o -name '__pycache__' -o -name 'build' -o -name 'dist' -o -name '.tox' -o -name '.mypy_cache' -o -name '.pytest_cache' -o -name '.orca' -o -path './backend' -o -path './server' -o -path './api' -o -path './frontend' -o -path './web' -o -path './client' -o -path './ui' \\) -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit)"`,
     `            else`,
-    `              first_dir_py_test="$(find "$dir" -maxdepth 4 \\( -path "$dir/.venv" -o -path "$dir/venv" -o -path "$dir/node_modules" -o -path "$dir/.git" -o -path "$dir/__pycache__" \\) -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit)"`,
+    `              first_dir_py_test="$(find "$dir" \\( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'node_modules' -o -name '__pycache__' -o -name 'build' -o -name 'dist' -o -name '.tox' -o -name '.mypy_cache' -o -name '.pytest_cache' -o -name '.orca' \\) -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit)"`,
     `            fi`,
     `            if [ -f "$dir/pyproject.toml" ] || [ -f "$dir/requirements.txt" ] || [ -f "$dir/requirements-dev.txt" ] || [ -f "$dir/setup.py" ] || [ -f "$dir/setup.cfg" ] || [ -f "$dir/Pipfile" ] || [ -f "$dir/pytest.ini" ] || [ -f "$dir/tox.ini" ] || [ -n "$first_dir_py_test" ]; then`,
     `              echo "=== Python verify: $dir ==="`,
@@ -735,10 +776,12 @@ export function renderGenericAutoDetectJob(usedJobIds = new Set()) {
     `                elif [ -f pyproject.toml ] || [ -f setup.py ]; then`,
     `                  python3 -m pip install -e .`,
     `                fi`,
+    `                is_root_dir=0`,
     `                if [ "$dir" = "." ]; then`,
-    `                  first_py_test="$(find . -maxdepth 4 \\( -path './.venv' -o -path './venv' -o -path './node_modules' -o -path './.git' -o -path './__pycache__' -o -path './backend' -o -path './server' -o -path './api' -o -path './frontend' -o -path './web' -o -path './client' -o -path './ui' \\) -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit)"`,
+    `                  is_root_dir=1`,
+    `                  first_py_test="$(find . \\( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'node_modules' -o -name '__pycache__' -o -name 'build' -o -name 'dist' -o -name '.tox' -o -name '.mypy_cache' -o -name '.pytest_cache' -o -name '.orca' -o -path './backend' -o -path './server' -o -path './api' -o -path './frontend' -o -path './web' -o -path './client' -o -path './ui' \\) -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit)"`,
     `                else`,
-    `                  first_py_test="$(find . -maxdepth 4 \\( -path './.venv' -o -path './venv' -o -path './node_modules' -o -path './.git' -o -path './__pycache__' \\) -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit)"`,
+    `                  first_py_test="$(find . \\( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'node_modules' -o -name '__pycache__' -o -name 'build' -o -name 'dist' -o -name '.tox' -o -name '.mypy_cache' -o -name '.pytest_cache' -o -name '.orca' \\) -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit)"`,
     `                fi`,
     `                wants_pytest=0`,
     `                if [ -f pytest.ini ] || [ -f conftest.py ] || grep -qi "pytest" pyproject.toml setup.cfg tox.ini requirements*.txt 2>/dev/null; then`,
@@ -748,10 +791,10 @@ export function renderGenericAutoDetectJob(usedJobIds = new Set()) {
     `                  if ! python3 -c "import pytest" >/dev/null 2>&1; then`,
     `                    python3 -m pip install pytest`,
     `                  fi`,
-    `                  python3 -m pytest -q`,
+    ...pytestGenericLines18,
     `                elif [ -n "$first_py_test" ]; then`,
     `                  if python3 -c "import pytest" >/dev/null 2>&1; then`,
-    `                    python3 -m pytest -q`,
+    ...pytestGenericLines20,
     `                  else`,
     ...pyUnittestLines,
     `                  fi`,
@@ -843,6 +886,8 @@ function renderTokenHubJob(needsIds, platform = "github", usedJobIds = new Set()
       `            execSync(\`gh pr comment "\${process.env.PR_NUMBER}" --body-file /tmp/pr-summary.md\`, { stdio: "inherit" });`,
     ];
 
+  // P1-09: Redact on FULL rawDiff BEFORE truncating to 40,000 chars, support escaped quotes
+  // inside JSON strings, and drop any incomplete trailing partial line at the slice boundary!
   return [
     `  ${jobId}:`,
     `    name: "Headless PR Risk Summary (TokenHub API)"`,
@@ -877,19 +922,30 @@ function renderTokenHubJob(needsIds, platform = "github", usedJobIds = new Set()
     `          const apiKey = process.env.TOKENHUB_API_KEY;`,
     `          const baseUrl = process.env.TOKENHUB_BASE_URL.replace(/\\/+$/, "");`,
     `          const model = process.env.TOKENHUB_MODEL;`,
+    `          const secretKeys = "api[_-]?key|apikey|tokenhub[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|client[_-]?secret|webhook[_-]?secret|private[_-]?key|secret|password|passwd|pwd|token|gh[_-]?token|gitea[_-]?token|github[_-]?token|cookie|set-cookie|authorization";`,
     `          const rawDiff = execSync(`,
     `            \`git diff "\${process.env.BASE_SHA}...\${process.env.HEAD_SHA}" -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)*.pem' ':(exclude)*.key' ':(exclude).env*'\`,`,
     `            { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }`,
-    `          ).slice(0, 40000);`,
-    `          const diff = rawDiff`,
+    `          );`,
+    `          const redactedFull = rawDiff`,
     `            .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\\s\\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, "[REDACTED_PRIVATE_KEY]")`,
-    `            .replace(/(\\b[a-z][a-z0-9+.-]*:\\/\\/)([^\\/\\s:@]+:[^\\/\\s@]+)@/gi, "$1[REDACTED_CREDENTIALS]@")`,
-    `            .replace(/([?&](?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|auth|secret|password|passwd|pwd|key|sig|signature)=)([^&\\s"'#]+)/gi, "$1[REDACTED]")`,
-    `            .replace(/(["'](?:[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|session[_-]?token|client[_-]?secret|private[_-]?key|secret|password|passwd|pwd|cookie|authorization)|token)["']\\s*:\\s*)(["'])(?:\\\\.|(?!\\2)[^\\\\])*\\2/gi, '$1"[REDACTED]"')`,
-    `            .replace(/(\\b(?:authorization|bearer|x-api-key|api[_-]?key|access[_-]?token|refresh[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?key|password|passwd|pwd|session[_-]?token|cookie)\\b\\s*[:=]\\s*)(?:bearer\\s+|token\\s+|basic\\s+)?(["']?)([^\\s"',;\\n}]{4,})\\2/gi, "$1[REDACTED]")`,
-    `            .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b/g, "[REDACTED_JWT]")`,
-    `            .replace(/\\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{12,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})\\b/g, "[REDACTED_TOKEN]")`,
-    `            .replace(/\\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})(?!:)\\b/g, "[REDACTED_EMAIL]");`,
+    `            .replace(/(\\b[a-z][a-z0-9+.-]*:\\/\\/)([^\\/\\s:@]+:[^\\/\\s@]+)@/gi, "$1[REDACTED]:[REDACTED]@")`,
+    `            .replace(/([?&](?:api[_-]?key|apikey|token|access[_-]?token|refresh[_-]?token|auth|secret|client[_-]?secret|password|passwd|pwd|key|sig|signature)=)([^&\\s"'#]+)/gi, "$1[REDACTED]")`,
+    `            .replace(new RegExp(\`(["'])(\${secretKeys})\\\\1(\\\\s*:\\\\s*)"(?:\\\\\\\\.|[^"\\\\\\\\\\\\r\\\\n])*"\`, "gi"), '$1$2$1$3"[REDACTED]"')`,
+    `            .replace(new RegExp(\`(["'])(\${secretKeys})\\\\1(\\\\s*:\\\\s*)'(?:\\\\\\\\.|[^'\\\\\\\\\\\\r\\\\n])*'\`, "gi"), "$1$2$1$3'[REDACTED]'")`,
+    `            .replace(new RegExp(\`(["'])(\${secretKeys})\\\\1(\\\\s*:\\\\s*)(["'])(?:\\\\\\\\.|(?!\\\\4)[^\\\\r\\\\n])*$\`, "gim"), "$1$2$1$3$4[REDACTED]$4")`,
+    `            .replace(/\\b((?:Authorization\\s*[:=]\\s*["']?)?(?:Bearer|Basic|token))\\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [REDACTED]")`,
+    `            .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}\\b/g, "[REDACTED_JWT]")`,
+    `            .replace(/\\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,})\\b/g, "[REDACTED_TOKEN]")`,
+    `            .replace(new RegExp(\`\\\\b(\${secretKeys})(\\\\s*[:=]\\\\s*)(["'])(?:\\\\\\\\.|(?!\\\\3)[^\\\\\\\\\\\\r\\\\n])*\\\\3\`, "gi"), "$1$2$3[REDACTED]$3")`,
+    `            .replace(new RegExp(\`\\\\b(\${secretKeys})(\\\\s*[:=]\\\\s*)(?!\\\\[REDACTED)([^\\\\s"',;}{\\\\r\\\\n]+)\`, "gi"), "$1$2[REDACTED]")`,
+    `            .replace(/\\b(?!git@[A-Za-z0-9.-]+:)[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b(?![:/])/g, "[REDACTED_EMAIL]");`,
+    `          let diff = redactedFull;`,
+    `          if (diff.length > 40000) {`,
+    `            const cut = diff.slice(0, 40000);`,
+    `            const nl = cut.lastIndexOf("\\n");`,
+    `            diff = nl > 0 ? cut.slice(0, nl + 1) : cut;`,
+    `          }`,
     `          if (!diff.trim()) process.exit(0);`,
     `          (async () => {`,
     `            const resp = await fetch(\`\${baseUrl}/chat/completions\`, {`,
@@ -958,26 +1014,45 @@ export function renderCiWorkflow(detection, {
   return `${header}\n${bodyParts.join("\n\n")}\n`;
 }
 
+/**
+ * P1-11: Structured Docker Compose `ps --all --format json` & runtime revision verifier:
+ *   - Propagates non-zero exit codes from BOTH `docker compose config --services` AND `docker compose ps`!
+ *   - Rejects `Health == "starting"` or `"unhealthy"` (requires `Health == "healthy"` whenever a healthcheck exists)!
+ *   - Requires `ORCA_DEPLOY_SHA` to be non-empty AND verified against live container label/env
+ *     (`io.orca-pod.deploy-sha` or `ORCA_DEPLOY_SHA` via `Labels` or `docker inspect`)!
+ */
 function renderComposeStateVerifyFunc() {
   return [
     `          verify_compose_state() {`,
     `            local phase="$1"`,
+    `            if [ -z "\${ORCA_DEPLOY_SHA:-}" ]; then`,
+    `              echo "::error::[$phase] Missing ORCA_DEPLOY_SHA for live runtime revision verification!" >&2`,
+    `              return 1`,
+    `            fi`,
+    `            local cfg_services=""`,
+    `            local cfg_rc=0`,
+    `            cfg_services="$(docker compose -f "$COMPOSE_FILE" config --services)" || cfg_rc=$?`,
+    `            if [ "$cfg_rc" -ne 0 ]; then`,
+    `              return "$cfg_rc"`,
+    `            fi`,
     `            local ps_json=""`,
     `            local ps_rc=0`,
     `            ps_json="$(docker compose -f "$COMPOSE_FILE" ps --all --format json)" || ps_rc=$?`,
     `            if [ "$ps_rc" -ne 0 ]; then`,
     `              return "$ps_rc"`,
     `            fi`,
-    `            local cfg_services=""`,
-    `            cfg_services="$(docker compose -f "$COMPOSE_FILE" config --services 2>/dev/null || true)"`,
-    `            PS_JSON="$ps_json" CFG_SERVICES="$cfg_services" REQUIRED_SERVICE="\${SERVICE_NAME:-}" ONESHOT_SERVICES="\${DEPLOY_ONESHOT_SERVICES:-}" PHASE="$phase" python3 - <<'PY'`,
-    `          import json, os, re, sys`,
+    `            PS_JSON="$ps_json" CFG_SERVICES="$cfg_services" REQUIRED_SERVICE="\${SERVICE_NAME:-}" ONESHOT_SERVICES="\${DEPLOY_ONESHOT_SERVICES:-}" EXPECTED_REV="$ORCA_DEPLOY_SHA" PHASE="$phase" python3 - <<'PY'`,
+    `          import json, os, re, subprocess, sys`,
     `          raw = (os.environ.get("PS_JSON") or "").strip()`,
     `          phase = os.environ.get("PHASE") or "check"`,
     `          req_svc = (os.environ.get("REQUIRED_SERVICE") or "").strip()`,
+    `          expected_rev = (os.environ.get("EXPECTED_REV") or "").strip()`,
     `          cfg_svcs = [s.strip() for s in (os.environ.get("CFG_SERVICES") or "").splitlines() if s.strip()]`,
     `          oneshot_explicit = {s.strip().lower() for s in re.split(r"[,\\s]+", os.environ.get("ONESHOT_SERVICES") or "") if s.strip()}`,
     `          oneshot_re = re.compile(r"^(?:.*[-_])?(?:migrate|migrations|migration|db-migrate|init|db-init|seed|setup|bootstrap)(?:[-_].*)?$", re.I)`,
+    `          if not expected_rev:`,
+    `              sys.stderr.write(f"::error::[{phase}] Missing expected deploy revision!\\n")`,
+    `              sys.exit(1)`,
     `          if not raw:`,
     `              sys.stderr.write(f"::error::[{phase}] docker compose ps returned empty output!\\n")`,
     `              sys.exit(1)`,
@@ -997,6 +1072,32 @@ function renderComposeStateVerifyFunc() {
     `              if req_svc and low == req_svc.lower():`,
     `                  return False`,
     `              return low in oneshot_explicit or bool(oneshot_re.match(low))`,
+    `          def extract_container_rev(c):`,
+    `              labels_raw = c.get("Labels")`,
+    `              if isinstance(labels_raw, dict):`,
+    `                  v = labels_raw.get("io.orca-pod.deploy-sha") or labels_raw.get("org.opencontainers.image.revision")`,
+    `                  if v: return str(v).strip()`,
+    `              elif isinstance(labels_raw, str) and labels_raw:`,
+    `                  for kv in labels_raw.split(","):`,
+    `                      if "=" in kv:`,
+    `                          k, val = kv.split("=", 1)`,
+    `                          if k.strip() in ("io.orca-pod.deploy-sha", "org.opencontainers.image.revision") and val.strip():`,
+    `                              return val.strip()`,
+    `              cid = str(c.get("ID") or c.get("Name") or "").strip()`,
+    `              if cid:`,
+    `                  insp = subprocess.run(["docker", "inspect", "--format", "{{json .Config}}", cid], capture_output=True, text=True)`,
+    `                  if insp.returncode == 0 and insp.stdout.strip():`,
+    `                      try:`,
+    `                          cfg = json.loads(insp.stdout.strip()) or {}`,
+    `                          lbls = cfg.get("Labels") or {}`,
+    `                          if lbls.get("io.orca-pod.deploy-sha"):`,
+    `                              return str(lbls["io.orca-pod.deploy-sha"]).strip()`,
+    `                          for env_entry in (cfg.get("Env") or []):`,
+    `                              if isinstance(env_entry, str) and env_entry.startswith("ORCA_DEPLOY_SHA="):`,
+    `                                  return env_entry.split("=", 1)[1].strip()`,
+    `                      except Exception:`,
+    `                          pass`,
+    `              return None`,
     `          running_svcs = set()`,
     `          completed_oneshots = set()`,
     `          for c in items:`,
@@ -1019,7 +1120,10 @@ function renderComposeStateVerifyFunc() {
     `              if not state and status_txt:`,
     `                  state = "exited" if status_txt.lower().startswith("exited") else ("running" if status_txt.lower().startswith("up") else status_txt.lower())`,
     `              if is_oneshot(svc):`,
-    `                  if state == "running" and health != "unhealthy":`,
+    `                  if state == "running":`,
+    `                      if health and health != "healthy":`,
+    `                          sys.stderr.write(f"::error::[{phase}] Service '{svc}' health is '{health}' (must be 'healthy')!\\n")`,
+    `                          sys.exit(1)`,
     `                      running_svcs.add(svc)`,
     `                  elif state == "exited" and exit_code == 0:`,
     `                      completed_oneshots.add(svc)`,
@@ -1027,10 +1131,17 @@ function renderComposeStateVerifyFunc() {
     `                      sys.stderr.write(f"::error::[{phase}] One-shot task service '{svc}' failed (state={state}, exitCode={exit_code})!\\n")`,
     `                      sys.exit(1)`,
     `              else:`,
-    `                  if state != "running" or health == "unhealthy":`,
-    `                      sys.stderr.write(f"::error::[{phase}] Long-running service '{svc}' is not healthy/running (state={state}, health={health or 'n/a'}, exitCode={exit_code})!\\n")`,
+    `                  if state != "running":`,
+    `                      sys.stderr.write(f"::error::[{phase}] Long-running service '{svc}' is not running (state={state}, exitCode={exit_code})!\\n")`,
+    `                      sys.exit(1)`,
+    `                  if health and health != "healthy":`,
+    `                      sys.stderr.write(f"::error::[{phase}] Long-running service '{svc}' health is '{health}' (must be 'healthy', not '{health}')!\\n")`,
     `                      sys.exit(1)`,
     `                  running_svcs.add(svc)`,
+    `              actual_rev = extract_container_rev(c)`,
+    `              if actual_rev != expected_rev:`,
+    `                  sys.stderr.write(f"::error::[{phase}] Container for service '{svc}' revision mismatch (got={actual_rev or 'missing'}, expected={expected_rev})!\\n")`,
+    `                  sys.exit(1)`,
     `          if len(running_svcs) == 0:`,
     `              sys.stderr.write(f"::error::[{phase}] Zero long-running services are in running state!\\n")`,
     `              sys.exit(1)`,
@@ -1070,29 +1181,44 @@ export function renderSelfHostedCdWorkflow(detection, {
       `      - name: ${yamlScalar(`Deploy with Docker Compose (${composeFile})`)}`,
       `        env:`,
       `          COMPOSE_FILE: ${yamlScalar(composeFile)}`,
-      `          ORCA_DEPLOY_SHA: \${{ github.event.workflow_run.head_sha || github.sha }}`,
+      `          ORCA_DEPLOY_SHA: \${{ needs.verify-deploy-source.outputs.deploy_sha }}`,
       ...(deployDir ? [`          DEPLOY_DIR: ${yamlScalar(deployDir)}`] : []),
       `        run: |`,
       `          set -euo pipefail`,
       ...cdEnterLines,
       ...(SAFE_SIMPLE_TOKEN_RE.test(composeFile) ? [`          COMPOSE_FILE="${composeFile}"`] : []),
       `          echo "Building & starting services via $COMPOSE_FILE (rev=\${ORCA_DEPLOY_SHA:0:12}) ..."`,
-      `          docker compose -f "$COMPOSE_FILE" up -d --build --remove-orphans --wait --wait-timeout 120`,
+      `          declared_svcs="$(docker compose -f "$COMPOSE_FILE" config --services)"`,
+      `          COMPOSE_SVCS="$declared_svcs" DEPLOY_SHA="$ORCA_DEPLOY_SHA" python3 - <<'PY' > .orca-compose-rev.yml`,
+      `          import json, os, sys`,
+      `          svcs = [s.strip() for s in (os.environ.get("COMPOSE_SVCS") or "").splitlines() if s.strip()]`,
+      `          sha = (os.environ.get("DEPLOY_SHA") or "").strip()`,
+      `          if not svcs or not sha:`,
+      `              sys.exit(1)`,
+      `          doc = {"services": {s: {"labels": {"io.orca-pod.deploy-sha": sha}, "environment": {"ORCA_DEPLOY_SHA": sha}} for s in svcs}}`,
+      `          print(json.dumps(doc, indent=2))`,
+      `          PY`,
+      `          trap 'rm -f .orca-compose-rev.yml' EXIT`,
+      `          docker compose -f "$COMPOSE_FILE" -f .orca-compose-rev.yml up -d --build --remove-orphans --wait --wait-timeout 120`,
       `          docker compose -f "$COMPOSE_FILE" ps`,
     ]
     : [
       `      - name: Run intranet deploy hook`,
       `        env:`,
-      `          ORCA_DEPLOY_SHA: \${{ github.event.workflow_run.head_sha || github.sha }}`,
+      `          ORCA_DEPLOY_SHA: \${{ needs.verify-deploy-source.outputs.deploy_sha }}`,
       ...(deployDir ? [`          DEPLOY_DIR: ${yamlScalar(deployDir)}`] : []),
       ...(serviceName ? [`          SERVICE_NAME: ${yamlScalar(serviceName)}`] : []),
       `        run: |`,
       `          set -euo pipefail`,
       ...cdEnterLines,
       `          if [ -x ./scripts/deploy.sh ]; then`,
-      `            ./scripts/deploy.sh`,
+      `            ORCA_DEPLOY_SHA="$ORCA_DEPLOY_SHA" ./scripts/deploy.sh`,
       ...(serviceName
-        ? [`          elif command -v systemctl >/dev/null 2>&1 && [ -n "\${SERVICE_NAME:-}" ]; then`, `            sudo systemctl restart "$SERVICE_NAME"`]
+        ? [
+          `          elif command -v systemctl >/dev/null 2>&1 && [ -n "\${SERVICE_NAME:-}" ]; then`,
+          `            sudo systemctl restart "$SERVICE_NAME"`,
+          `            systemctl is-active --quiet "$SERVICE_NAME"`,
+        ]
         : []),
       `          else`,
       `            echo "::error::No docker-compose file or executable ./scripts/deploy.sh found."`,
@@ -1106,7 +1232,7 @@ export function renderSelfHostedCdWorkflow(detection, {
     ...(composeFile ? [`          COMPOSE_FILE: ${yamlScalar(composeFile)}`] : []),
     ...(deployDir ? [`          DEPLOY_DIR: ${yamlScalar(deployDir)}`] : []),
     ...(serviceName ? [`          SERVICE_NAME: ${yamlScalar(serviceName)}`] : []),
-    `          ORCA_DEPLOY_SHA: \${{ github.event.workflow_run.head_sha || github.sha }}`,
+    `          ORCA_DEPLOY_SHA: \${{ needs.verify-deploy-source.outputs.deploy_sha }}`,
     `          DEFAULT_HEALTHCHECK_URL: ${yamlScalar(healthUrl)}`,
     `          HEALTHCHECK_URL: \${{ vars.DEPLOY_HEALTHCHECK_URL }}`,
     `          DEPLOY_ONESHOT_SERVICES: \${{ vars.DEPLOY_ONESHOT_SERVICES }}`,
@@ -1115,21 +1241,24 @@ export function renderSelfHostedCdWorkflow(detection, {
     `        run: |`,
     `          set -euo pipefail`,
     ...cdEnterLines,
-    ...(deployDir
-      ? [
-        `          if [ -f .orca-deploy-sha ] && [ "$(cat .orca-deploy-sha)" != "$ORCA_DEPLOY_SHA" ]; then`,
-        `            echo "::error::Deploy directory revision mismatch!"`,
-        `            exit 1`,
-        `          fi`,
-      ]
-      : []),
+    `          if [ -z "\${ORCA_DEPLOY_SHA:-}" ]; then`,
+    `            echo "::error::Missing ORCA_DEPLOY_SHA for post-deploy runtime verification!"`,
+    `            exit 1`,
+    `          fi`,
     `          TARGET_URL="\${HEALTHCHECK_URL:-$DEFAULT_HEALTHCHECK_URL}"`,
     ...(composeFile
       ? [
         ...renderComposeStateVerifyFunc(),
-        `          echo "Verifying Docker Compose service states (without dumping raw application logs)..."`,
+        `          echo "Verifying Docker Compose service states, healthchecks & deployed revision (without dumping raw application logs)..."`,
         `          pre_rc=0`,
-        `          verify_compose_state "pre-http" || pre_rc=$?`,
+        `          for i in $(seq 1 "$HEALTHCHECK_RETRIES"); do`,
+        `            pre_rc=0`,
+        `            verify_compose_state "pre-http" && break || pre_rc=$?`,
+        `            if [ "$pre_rc" -ne 1 ] || [ "$i" -eq "$HEALTHCHECK_RETRIES" ]; then`,
+        `              break`,
+        `            fi`,
+        `            sleep "$HEALTHCHECK_INTERVAL"`,
+        `          done`,
         `          if [ "$pre_rc" -ne 0 ]; then`,
         `            docker compose -f "$COMPOSE_FILE" ps --all || true`,
         `            exit "$pre_rc"`,
@@ -1139,10 +1268,21 @@ export function renderSelfHostedCdWorkflow(detection, {
     `          echo "Probing configured health endpoint (retries=$HEALTHCHECK_RETRIES, interval=\${HEALTHCHECK_INTERVAL}s)..."`,
     `          ok=0`,
     `          for i in $(seq 1 "$HEALTHCHECK_RETRIES"); do`,
-    `            if curl -fsS --max-time 5 "$TARGET_URL" >/dev/null 2>&1; then`,
-    `              echo "Health check PASSED on attempt $i/$HEALTHCHECK_RETRIES"`,
-    `              ok=1`,
-    `              break`,
+    `            resp_hdr_body="$(curl -fsSi --max-time 5 "$TARGET_URL" 2>/dev/null || true)"`,
+    `            if [ -n "$resp_hdr_body" ]; then`,
+    ...(composeFile
+      ? [
+        `              echo "Health check PASSED on attempt $i/$HEALTHCHECK_RETRIES"`,
+        `              ok=1`,
+        `              break`,
+      ]
+      : [
+        `              if printf '%s' "$resp_hdr_body" | grep -Fq "$ORCA_DEPLOY_SHA"; then`,
+        `                echo "Health check & runtime revision PASSED on attempt $i/$HEALTHCHECK_RETRIES"`,
+        `                ok=1`,
+        `                break`,
+        `              fi`,
+      ]),
     `            fi`,
     `            echo "Attempt $i/$HEALTHCHECK_RETRIES not ready yet; sleeping \${HEALTHCHECK_INTERVAL}s..."`,
     `            sleep "$HEALTHCHECK_INTERVAL"`,
@@ -1170,21 +1310,19 @@ export function renderSelfHostedCdWorkflow(detection, {
       `      - name: ${yamlScalar(`Sync checkout to deploy directory (${deployDir})`)}`,
       `        env:`,
       `          DEPLOY_DIR: ${yamlScalar(deployDir)}`,
-      `          ORCA_DEPLOY_SHA: \${{ github.event.workflow_run.head_sha || github.sha }}`,
       `        run: |`,
       `          set -euo pipefail`,
       `          mkdir -p "$DEPLOY_DIR"`,
       `          rsync -a --delete --exclude '.git' --exclude '.env' --exclude '.env.*' ./ "$DEPLOY_DIR/"`,
-      `          printf '%s' "$ORCA_DEPLOY_SHA" > "$DEPLOY_DIR/.orca-deploy-sha"`,
     ]
     : [];
 
   return [
     `# Generated by orca-pod ci-generator — Intranet Self-Hosted Runner CD`,
-    `# Architecture: Self-Hosted Runner runs inside your private/home intranet and pulls`,
-    `# jobs via OUTBOUND HTTPS (443) only — ZERO public SSH / port forwarding required.`,
+    `# Architecture: Two-stage provenance gate — Job 1 ('verify-deploy-source') runs on GitHub-hosted`,
+    `# ubuntu-latest to verify exact push ref & live deployable SHA BEFORE allocating any intranet`,
+    `# self-hosted runner; Job 2 ('deploy-intranet') pulls via OUTBOUND HTTPS (443) only — ZERO public SSH.`,
     `# Security/PII: Container stdout logs and raw health URLs are NEVER printed to cloud Actions logs.`,
-    `# Setup on intranet host: Repo Settings -> Actions -> Runners -> New self-hosted runner.`,
     `name: CD — Intranet Self-Hosted Deploy`,
     ``,
     `on:`,
@@ -1207,15 +1345,26 @@ export function renderSelfHostedCdWorkflow(detection, {
     `  cancel-in-progress: false`,
     ``,
     `jobs:`,
-    `  deploy-intranet:`,
-    `    name: "Deploy to Private/Intranet Host"`,
+    `  verify-deploy-source:`,
+    `    name: "Verify Deploy Provenance & Live Branch Tip (Cloud Pre-Gate)"`,
+    `    runs-on: ubuntu-latest`,
     `    if: >-`,
-    `      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.head_branch == ${exprBranch}) ||`,
-    `      (github.event_name == 'workflow_dispatch' && github.ref_type == 'branch' && github.ref == ${exprFullRef})`,
-    `    runs-on: ${labelsYaml}`,
-    `    timeout-minutes: 20`,
+    `      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.head_branch == ${exprBranch} && github.event.workflow_run.head_sha != '') ||`,
+    `      (github.event_name == 'workflow_dispatch' && github.ref_type == 'branch' && github.ref == ${exprFullRef} && github.sha != '')`,
+    `    outputs:`,
+    `      verified: \${{ steps.gate.outputs.verified }}`,
+    `      deploy_sha: \${{ steps.gate.outputs.deploy_sha }}`,
+    `      deploy_ref: \${{ steps.gate.outputs.deploy_ref }}`,
     `    steps:`,
+    `      - name: Checkout target branch tip`,
+    `        uses: actions/checkout@v4`,
+    `        with:`,
+    `          ref: ${yamlScalar(`refs/heads/${deployBranch}`)}`,
+    `          fetch-depth: 0`,
+    `          persist-credentials: false`,
+    ``,
     `      - name: Verify CI gate & allowed target branch`,
+    `        id: gate`,
     `        env:`,
     `          DEPLOY_BRANCH: ${yamlScalar(deployBranch)}`,
     `          EXPECTED_FULL_REF: ${yamlScalar(`refs/heads/${deployBranch}`)}`,
@@ -1231,6 +1380,7 @@ export function renderSelfHostedCdWorkflow(detection, {
     `          DISPATCH_SHA: \${{ github.sha }}`,
     `        run: |`,
     `          set -euo pipefail`,
+    `          CANDIDATE_SHA=""`,
     `          if [ "$EVENT_NAME" = "workflow_run" ]; then`,
     `            if [ "$CI_CONCLUSION" != "success" ]; then`,
     `              echo "::error::Refusing deploy because upstream CI conclusion=$CI_CONCLUSION"`,
@@ -1252,6 +1402,7 @@ export function renderSelfHostedCdWorkflow(detection, {
     `              echo "::error::Missing or invalid 40-char workflow_run.head_sha!"`,
     `              exit 1`,
     `            fi`,
+    `            CANDIDATE_SHA="$WR_HEAD_SHA"`,
     `          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then`,
     `            if [ -n "$ACTUAL_REF_TYPE" ] && [ "$ACTUAL_REF_TYPE" != "branch" ]; then`,
     `              echo "::error::Manual deploy requires ref_type=branch (got '$ACTUAL_REF_TYPE')!"`,
@@ -1265,24 +1416,56 @@ export function renderSelfHostedCdWorkflow(detection, {
     `              echo "::error::Missing or invalid 40-char github.sha!"`,
     `              exit 1`,
     `            fi`,
+    `            CANDIDATE_SHA="$DISPATCH_SHA"`,
     `          else`,
     `            echo "::error::Unsupported trigger event '$EVENT_NAME'!"`,
     `            exit 1`,
     `          fi`,
+    `          REMOTE_BRANCH_SHA="$(git rev-parse --verify --quiet "refs/remotes/origin/$DEPLOY_BRANCH^{commit}" || true)"`,
+    `          if [ -z "$REMOTE_BRANCH_SHA" ]; then`,
+    `            echo "::error::Could not resolve refs/remotes/origin/$DEPLOY_BRANCH in pre-gate checkout!"`,
+    `            exit 1`,
+    `          fi`,
+    `          if [ "$CANDIDATE_SHA" != "$REMOTE_BRANCH_SHA" ]; then`,
+    `            echo "::error::Refusing stale/superseded or off-branch revision ($CANDIDATE_SHA != origin/$DEPLOY_BRANCH @ $REMOTE_BRANCH_SHA)!"`,
+    `            exit 1`,
+    `          fi`,
+    `          if [ -n "\${GITHUB_OUTPUT:-}" ]; then`,
+    `            {`,
+    `              echo "verified=true"`,
+    `              echo "deploy_sha=$CANDIDATE_SHA"`,
+    `              echo "deploy_ref=$EXPECTED_FULL_REF"`,
+    `            } >> "$GITHUB_OUTPUT"`,
+    `          fi`,
     ``,
+    `  deploy-intranet:`,
+    `    name: "Deploy to Private/Intranet Host"`,
+    `    needs: verify-deploy-source`,
+    `    if: >-`,
+    `      needs.verify-deploy-source.result == 'success' &&`,
+    `      needs.verify-deploy-source.outputs.verified == 'true' &&`,
+    `      needs.verify-deploy-source.outputs.deploy_sha != '' &&`,
+    `      needs.verify-deploy-source.outputs.deploy_ref == ${exprFullRef}`,
+    `    runs-on: ${labelsYaml}`,
+    `    timeout-minutes: 20`,
+    `    steps:`,
     `      - name: Checkout verified revision`,
     `        uses: actions/checkout@v4`,
     `        with:`,
-    `          ref: \${{ github.event.workflow_run.head_sha || github.sha }}`,
+    `          ref: \${{ needs.verify-deploy-source.outputs.deploy_sha }}`,
     `          fetch-depth: 0`,
     `          persist-credentials: false`,
     ``,
     `      - name: Verify checked-out commit matches live target branch tip`,
     `        env:`,
     `          DEPLOY_BRANCH: ${yamlScalar(deployBranch)}`,
-    `          EXPECTED_SHA: \${{ github.event.workflow_run.head_sha || github.sha }}`,
+    `          EXPECTED_SHA: \${{ needs.verify-deploy-source.outputs.deploy_sha }}`,
     `        run: |`,
     `          set -euo pipefail`,
+    `          if ! printf '%s' "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'; then`,
+    `            echo "::error::Invalid verified EXPECTED_SHA!"`,
+    `            exit 1`,
+    `          fi`,
     `          ACTUAL_HEAD="$(git rev-parse HEAD)"`,
     `          if [ "$ACTUAL_HEAD" != "$EXPECTED_SHA" ]; then`,
     `            echo "::error::Checked-out HEAD ($ACTUAL_HEAD) does not match expected verified SHA ($EXPECTED_SHA)!"`,

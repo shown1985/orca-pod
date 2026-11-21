@@ -156,10 +156,18 @@ export function resolveOpencodeConfig({ projectDir = process.cwd(), configPaths 
       process.env.OPENCODE_CONFIG || null,
     ].filter(Boolean);
 
-    for (const dir of collectOpencodeSearchDirs(projectDir)) {
+    const searchDirs = collectOpencodeSearchDirs(projectDir);
+    // P1-03: Align strictly with OpenCode's documented config precedence:
+    // 1) All plain `opencode.json` / `opencode.jsonc` files across directory hierarchy first
+    for (const dir of searchDirs) {
       orderedPaths.push(
         join(dir, "opencode.json"),
         join(dir, "opencode.jsonc"),
+      );
+    }
+    // 2) All `.opencode/opencode.json` / `.opencode/opencode.jsonc` files across directory hierarchy second
+    for (const dir of searchDirs) {
+      orderedPaths.push(
         join(dir, ".opencode", "opencode.json"),
         join(dir, ".opencode", "opencode.jsonc"),
       );
@@ -210,16 +218,63 @@ export function resolveOpencodeConfig({ projectDir = process.cwd(), configPaths 
   };
 }
 
-export function resolveEffectiveCandidateModel(agent, model = null, { projectDir = null, configPaths = null } = {}) {
-  if (model != null && String(model).trim() && String(model).trim().toLowerCase() !== "default") {
-    return String(model).trim();
+/**
+ * Parse an agent CLI command string (e.g. `agy --model claude-sonnet-4-5 --effort high`)
+ * to extract `baseAgent`, any embedded `--model`/`-m`, and any embedded `--effort` flag.
+ * Because `buildAgentCommand` preserves embedded flags over step-level `model`/`effort`,
+ * embedded flags are authoritative for actual runtime argv and cross-family classification!
+ */
+export function parseAgentCommandSpec(agentCmd) {
+  const raw = String(agentCmd || "").trim();
+  const baseAgent = (raw.split(/\s+/)[0] || "").trim();
+  const lowerBase = baseAgent.toLowerCase();
+  const isKiro = lowerBase === "kiro-cli" || lowerBase === "kiro";
+  let embeddedModel = null;
+  let embeddedEffort = null;
+  const modelMatch = raw.match(/(?:^|\s)(?:--model|-m)(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))/);
+  if (modelMatch) {
+    const mv = (modelMatch[1] || modelMatch[2] || modelMatch[3] || "").trim();
+    if (mv && mv.toLowerCase() !== "default") embeddedModel = mv;
   }
-  const baseAgent = String(agent || "").trim().split(/\s+/)[0].toLowerCase();
-  if ((baseAgent === "opencode" || baseAgent === "opencode2") && (projectDir || configPaths)) {
+  const effortMatch = raw.match(/(?:^|\s)--effort(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))/);
+  if (effortMatch) {
+    const ev = (effortMatch[1] || effortMatch[2] || effortMatch[3] || "").trim();
+    if (ev) embeddedEffort = ev;
+  }
+  return { raw, baseAgent, lowerBase, isKiro, embeddedModel, embeddedEffort };
+}
+
+export function resolveEffectiveLaunchSpec(agent, model = null, effort = null, { projectDir = null, configPaths = null } = {}) {
+  const parsed = parseAgentCommandSpec(agent);
+  const reqModel = (model != null && String(model).trim() && String(model).trim().toLowerCase() !== "default")
+    ? String(model).trim()
+    : null;
+  const reqEffort = (effort != null && String(effort).trim()) ? String(effort).trim() : null;
+
+  let passedModel = null;
+  if (!parsed.isKiro) {
+    passedModel = parsed.embeddedModel || reqModel || null;
+  }
+  let configModel = null;
+  if (!passedModel && (parsed.lowerBase === "opencode" || parsed.lowerBase === "opencode2") && (projectDir || configPaths)) {
     const oc = resolveOpencodeConfig({ projectDir: projectDir || process.cwd(), configPaths });
-    if (oc.configuredModel) return oc.configuredModel;
+    if (oc.configuredModel) configModel = oc.configuredModel;
   }
-  return null;
+  const effectiveModel = passedModel || configModel || null;
+  const effectiveEffort = parsed.embeddedEffort || reqEffort || null;
+  return {
+    agent: parsed.raw,
+    baseAgent: parsed.baseAgent,
+    embeddedModel: parsed.embeddedModel,
+    embeddedEffort: parsed.embeddedEffort,
+    passedModel,
+    effectiveModel,
+    effectiveEffort,
+  };
+}
+
+export function resolveEffectiveCandidateModel(agent, model = null, { projectDir = null, configPaths = null } = {}) {
+  return resolveEffectiveLaunchSpec(agent, model, null, { projectDir, configPaths }).effectiveModel;
 }
 
 function matchModelIdFamily(modelStr) {
@@ -250,17 +305,14 @@ function matchModelIdFamily(modelStr) {
  *   - Synthetic test harness `"stub"` returns `"stub"`.
  */
 export function classifyModelFamily(agent, model = null, { projectDir = null, configPaths = null } = {}) {
-  const baseAgent = String(agent || "").trim().split(/\s+/)[0].toLowerCase();
-  const explicitModel = (model != null && String(model).trim() && String(model).trim().toLowerCase() !== "default")
-    ? String(model).trim()
-    : null;
+  const launch = resolveEffectiveLaunchSpec(agent, model, null, { projectDir, configPaths });
+  const baseAgent = launch.baseAgent.toLowerCase();
 
   if (!baseAgent) return "unknown";
-  if (baseAgent === "stub" && !explicitModel) return "stub";
+  if (baseAgent === "stub" && !launch.effectiveModel) return "stub";
 
-  const effModel = explicitModel || resolveEffectiveCandidateModel(baseAgent, null, { projectDir, configPaths });
-  if (effModel) {
-    return matchModelIdFamily(effModel) || "unknown";
+  if (launch.effectiveModel) {
+    return matchModelIdFamily(launch.effectiveModel) || "unknown";
   }
 
   // Single-vendor CLIs with deterministic provider identity when model is omitted
@@ -558,32 +610,37 @@ export function normalizeCandidate(raw, isPrimary = false, { projectDir = null }
   if (typeof raw === "string") {
     const trimmed = raw.trim();
     if (!trimmed) return null;
-    const resolvedModel = resolveEffectiveCandidateModel(trimmed, null, { projectDir });
+    const launch = resolveEffectiveLaunchSpec(trimmed, null, null, { projectDir });
     return {
       agent: trimmed,
-      model: null,
-      resolvedModel,
-      effort: null,
+      model: launch.passedModel || null,
+      requestedModel: null,
+      resolvedModel: launch.effectiveModel,
+      effort: launch.effectiveEffort || null,
+      requestedEffort: null,
       preflight: null,
       isPrimary,
-      family: classifyModelFamily(trimmed, resolvedModel, { projectDir }),
+      family: classifyModelFamily(trimmed, null, { projectDir }),
     };
   }
   if (typeof raw !== "object" || !raw.agent) return null;
   const agent = String(raw.agent).trim();
   if (!agent) return null;
-  const model = raw.model != null && String(raw.model).trim() && String(raw.model).trim() !== "default"
+  const reqModel = raw.model != null && String(raw.model).trim() && String(raw.model).trim() !== "default"
     ? String(raw.model).trim()
     : null;
-  const resolvedModel = model || resolveEffectiveCandidateModel(agent, null, { projectDir });
+  const reqEffort = raw.effort ? String(raw.effort).trim() : null;
+  const launch = resolveEffectiveLaunchSpec(agent, reqModel, reqEffort, { projectDir });
   return {
     agent,
-    model,
-    resolvedModel,
-    effort: raw.effort ? String(raw.effort).trim() : null,
+    model: launch.passedModel || null,
+    requestedModel: reqModel,
+    resolvedModel: launch.effectiveModel,
+    effort: launch.effectiveEffort || null,
+    requestedEffort: reqEffort,
     preflight: raw.preflight && typeof raw.preflight === "object" ? raw.preflight : null,
     isPrimary,
-    family: classifyModelFamily(agent, resolvedModel, { projectDir }),
+    family: classifyModelFamily(agent, reqModel, { projectDir }),
   };
 }
 

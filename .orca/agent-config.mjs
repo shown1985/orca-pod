@@ -177,7 +177,7 @@ function pathSkillText(def, configDir, die) {
 }
 
 // --- Materialize: union of the group's refs per harness -> worktree files ---
-export function materializeAgentConfig({ worktree, members, cfg, configDir, die, warn, quietRestore = false }) {
+export function materializeAgentConfig({ worktree, members, cfg, configDir, die, warn, quietRestore = false, rollbackOnError = false }) {
   // Self-heal first: a manifest left by a crashed previous group must never be
   // overwritten (its created/modified entries would be lost). If the restore
   // could not fully complete (manifest kept), die — materializing on top would
@@ -240,89 +240,93 @@ export function materializeAgentConfig({ worktree, members, cfg, configDir, die,
   if (!mcpRefs.size && !skillRefs.size) return;
 
   const plan = newPlan(worktree, die);
-
-  // MCP JSON files, merged PER TARGET FILE (e.g. agy + antigravity share .agents/mcp_config.json,
-  // opencode + opencode2 share opencode.json) so parallel aliases never overwrite each other!
-  const mcpByFile = new Map(); // mcpFile -> { mcpKey, harnesses: [], names: Set }
-  for (const [h, names] of mcpRefs) {
-    const a = ADAPTERS[h];
-    if (!mcpByFile.has(a.mcpFile)) {
-      mcpByFile.set(a.mcpFile, { mcpKey: a.mcpKey, harnesses: [], names: new Set() });
-    }
-    const bucket = mcpByFile.get(a.mcpFile);
-    bucket.harnesses.push(h);
-    for (const n of names) bucket.names.add(n);
-  }
-  const warned = new Set();   // env-warn dedupe shared across servers
-  for (const [mcpFile, bucket] of mcpByFile) {
-    const orig = plan.rememberFile(mcpFile);
-    let doc = {};
-    if (orig != null) {
-      try { doc = JSON.parse(orig); } catch (e) { die(`${mcpFile} already exists in the worktree and is not valid JSON: ${e.message}`); }
-    }
-    doc[bucket.mcpKey] = { ...(doc[bucket.mcpKey] || {}) };
-    for (const name of bucket.names)
-      doc[bucket.mcpKey][name] = expandEnvDeep(mcp[name], warn, `mcp server "${name}"`, warned);
-    plan.write(mcpFile, JSON.stringify(doc, null, 2) + "\n");
-    warn(`[agent-config] ${bucket.harnesses.join("+")}: ${bucket.names.size} mcp server(s) -> ${mcpFile}`);
-  }
-
-  // Skills: deduplicate shared skillDir entries (e.g. agy + antigravity -> .agents/skills/<name>)
-  // and merge section-channel skills PER FILE (codex + opencode share AGENTS.md).
-  const sectionSkills = new Map();   // file -> Map(name -> def)
-  const writtenSkillDirs = new Set(); // `${skillDir}/${name}` written in this plan
-  for (const [h, names] of skillRefs) {
-    const a = ADAPTERS[h];
-    let wrote = 0;
-    for (const name of names) {
-      const def = skills[name];
-      if (a.skillDir) {
-        const rel = `${a.skillDir}/${name}`;
-        if (writtenSkillDirs.has(rel)) continue;
-        if (existsSync(join(worktree, rel))) {
-          warn(`[agent-config] ${rel} already exists in the worktree — keeping yours, skipping skill "${name}".`);
-          continue;
-        }
-        writtenSkillDirs.add(rel);
-        plan.trackDir(rel);
-        mkdirSync(join(worktree, rel), { recursive: true });
-        if (def.path != null) {
-          const src = resolve(configDir, def.path);
-          // A single FILE becomes <skillDir>/<name>/SKILL.md (cpSync(file, dir)
-          // throws ERR_FS_CP_NON_DIR_TO_DIR); a directory is copied verbatim.
-          if (statSync(src).isFile())
-            writeFileSync(join(worktree, rel, "SKILL.md"), readFileSync(src, "utf8"));
-          else cpSync(src, join(worktree, rel), { recursive: true });
-        } else {
-          writeFileSync(join(worktree, rel, "SKILL.md"), inlineSkillMd(name, def));
-        }
-        wrote++;
-      } else if (a.ruleDir) {
-        const body = def.path != null ? pathSkillText(def, configDir, die) : def.prompt;
-        const desc = def.path != null ? name : def.description;
-        plan.write(`${a.ruleDir}/${name}.mdc`, `---\ndescription: ${desc}\n---\n\n${body}\n`);
-        wrote++;
-      } else if (a.skillSection) {
-        if (!sectionSkills.has(a.skillSection)) sectionSkills.set(a.skillSection, new Map());
-        sectionSkills.get(a.skillSection).set(name, def);
-        wrote++;
+  let completed = false;
+  try {
+    // MCP JSON files, merged PER TARGET FILE (e.g. agy + antigravity share .agents/mcp_config.json,
+    // opencode + opencode2 share opencode.json) so parallel aliases never overwrite each other!
+    const mcpByFile = new Map(); // mcpFile -> { mcpKey, harnesses: [], names: Set }
+    for (const [h, names] of mcpRefs) {
+      const a = ADAPTERS[h];
+      if (!mcpByFile.has(a.mcpFile)) {
+        mcpByFile.set(a.mcpFile, { mcpKey: a.mcpKey, harnesses: [], names: new Set() });
       }
+      const bucket = mcpByFile.get(a.mcpFile);
+      bucket.harnesses.push(h);
+      for (const n of names) bucket.names.add(n);
     }
-    if (wrote) warn(`[agent-config] ${h}: ${wrote} skill(s) -> ${a.skillDir || a.ruleDir || a.skillSection}`);
-  }
-  for (const [file, defs] of sectionSkills) {
-    const orig = plan.rememberFile(file);
-    const prev = orig == null ? "" : orig;
-    // Idempotent: strip any previous managed section before appending.
-    const stripped = prev.replace(SECTION_RX, "").replace(/\n*$/, "\n");
-    const items = [...defs.entries()].map(([name, def]) =>
-      `### ${name}\n\n${def.path != null ? pathSkillText(def, configDir, die) : def.prompt}\n`).join("\n");
-    plan.write(file, `${stripped}\n${SECTION_BEGIN}\n\n## Skills (managed by orca-flow)\n\n${items}\n${SECTION_END}\n`);
-  }
+    const warned = new Set();   // env-warn dedupe shared across servers
+    for (const [mcpFile, bucket] of mcpByFile) {
+      const orig = plan.rememberFile(mcpFile);
+      let doc = {};
+      if (orig != null) {
+        try { doc = JSON.parse(orig); } catch (e) { die(`${mcpFile} already exists in the worktree and is not valid JSON: ${e.message}`); }
+      }
+      doc[bucket.mcpKey] = { ...(doc[bucket.mcpKey] || {}) };
+      for (const name of bucket.names)
+        doc[bucket.mcpKey][name] = expandEnvDeep(mcp[name], warn, `mcp server "${name}"`, warned);
+      plan.write(mcpFile, JSON.stringify(doc, null, 2) + "\n");
+      warn(`[agent-config] ${bucket.harnesses.join("+")}: ${bucket.names.size} mcp server(s) -> ${mcpFile}`);
+    }
 
-  // Every plan op already flushed; one explicit final flush keeps the manifest
-  // invariant obvious at the exit point.
-  plan.flush();
+    // Skills: deduplicate shared skillDir entries (e.g. agy + antigravity -> .agents/skills/<name>)
+    // and merge section-channel skills PER FILE (codex + opencode share AGENTS.md).
+    const sectionSkills = new Map();   // file -> Map(name -> def)
+    const writtenSkillDirs = new Set(); // `${skillDir}/${name}` written in this plan
+    for (const [h, names] of skillRefs) {
+      const a = ADAPTERS[h];
+      let wrote = 0;
+      for (const name of names) {
+        const def = skills[name];
+        if (a.skillDir) {
+          const rel = `${a.skillDir}/${name}`;
+          if (writtenSkillDirs.has(rel)) continue;
+          if (existsSync(join(worktree, rel))) {
+            warn(`[agent-config] ${rel} already exists in the worktree — keeping yours, skipping skill "${name}".`);
+            continue;
+          }
+          writtenSkillDirs.add(rel);
+          plan.trackDir(rel);
+          mkdirSync(join(worktree, rel), { recursive: true });
+          if (def.path != null) {
+            const src = resolve(configDir, def.path);
+            if (statSync(src).isFile())
+              writeFileSync(join(worktree, rel, "SKILL.md"), readFileSync(src, "utf8"));
+            else cpSync(src, join(worktree, rel), { recursive: true });
+          } else {
+            writeFileSync(join(worktree, rel, "SKILL.md"), inlineSkillMd(name, def));
+          }
+          wrote++;
+        } else if (a.ruleDir) {
+          const body = def.path != null ? pathSkillText(def, configDir, die) : def.prompt;
+          const desc = def.path != null ? name : def.description;
+          plan.write(`${a.ruleDir}/${name}.mdc`, `---\ndescription: ${desc}\n---\n\n${body}\n`);
+          wrote++;
+        } else if (a.skillSection) {
+          if (!sectionSkills.has(a.skillSection)) sectionSkills.set(a.skillSection, new Map());
+          sectionSkills.get(a.skillSection).set(name, def);
+          wrote++;
+        }
+      }
+      if (wrote) warn(`[agent-config] ${h}: ${wrote} skill(s) -> ${a.skillDir || a.ruleDir || a.skillSection}`);
+    }
+    for (const [file, defs] of sectionSkills) {
+      const orig = plan.rememberFile(file);
+      const prev = orig == null ? "" : orig;
+      const stripped = prev.replace(SECTION_RX, "").replace(/\n*$/, "\n");
+      const items = [...defs.entries()].map(([name, def]) =>
+        `### ${name}\n\n${def.path != null ? pathSkillText(def, configDir, die) : def.prompt}\n`).join("\n");
+      plan.write(file, `${stripped}\n${SECTION_BEGIN}\n\n## Skills (managed by orca-flow)\n\n${items}\n${SECTION_END}\n`);
+    }
+
+    plan.flush();
+    completed = true;
+  } finally {
+    if (!completed && rollbackOnError) {
+      // P1-04: Attempt immediate rollback of any partially mutated files/dirs; if restore fails,
+      // restoreAgentConfig preserves `.orca-agent-config.json` and logs clear diagnostics!
+      try { restoreAgentConfig({ worktree, warn }); } catch (e) { warn(`[agent-config] immediate rollback failed (${e.message}) — manifest kept for self-heal.`); }
+    }
+  }
 }
 
 // --- Restore: created -> delete, modified -> original back, manifest -> gone.

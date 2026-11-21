@@ -12,11 +12,13 @@ import {
   WORKTREES_MANIFEST,
   recordVerifiedContractCommit,
   clearStaleStepArtifact,
+  bindStepArtifactDispatchClaim,
   syncOutputsFromIsolatedWorktree,
   prepareStepWorktree,
   finalizeStepWorktree,
   renderIsolatedWorktreeNote,
 } from "../worktree-isolation.mjs";
+import { computeFileSha256 } from "../ledger.mjs";
 import {
   classifyMergeDanger,
   snapshotTargetRefs,
@@ -26,6 +28,7 @@ import { initMemberHealth, evaluateMemberHealth } from "../health.mjs";
 import { createWatchdogTracker, evaluateWatchdog } from "../watchdog.mjs";
 import {
   classifyModelFamily,
+  resolveEffectiveLaunchSpec,
   resolveEffectiveCandidateModel,
   isCrossFamilyReviewStep,
   resolveAuthorStepIds,
@@ -122,14 +125,16 @@ export function createRunner({
   const isPureStubPipeline = allSteps.every((s) => agentOf(s) === "stub" && !modelOf(s) && !s.crossFamilyWith);
 
   function recordExecutedStep(stepId, agent, model, worktreeDir = null) {
-    const cleanModel = (model && model !== "default")
-      ? model
-      : resolveEffectiveCandidateModel(agent, null, { projectDir: worktreeDir || getWtDir() || process.cwd() });
-    const family = classifyModelFamily(agent, cleanModel, { projectDir: worktreeDir || getWtDir() || process.cwd() });
+    const pDir = worktreeDir || getWtDir() || process.cwd();
+    const launch = resolveEffectiveLaunchSpec(agent, model, null, { projectDir: pDir });
+    const cleanModel = launch.effectiveModel;
+    const family = classifyModelFamily(agent, model, { projectDir: pDir });
 
-    // Seed from bound previous status if resuming so earlier attempts' families are never lost
+    // Seed from previous status ONLY if its provenance was verified against a bound ledger!
     const prevSt = statusOf ? statusOf(stepId) : null;
-    const prevFamilies = Array.isArray(prevSt?.executedFamilies) ? prevSt.executedFamilies : [];
+    const prevFamilies = (prevSt?.provenanceVerified === true && Array.isArray(prevSt?.executedFamilies))
+      ? prevSt.executedFamilies
+      : [];
     const prevInfo = executedStepInfo[stepId] || {
       executedFamilies: [...prevFamilies],
       contributions: prevFamilies.map((f) => ({ agent: prevSt?.agent || agent, model: prevSt?.model || "default", family: f })),
@@ -150,14 +155,15 @@ export function createRunner({
       model: cleanModel || "default",
       family,
       executedFamilies: famList,
+      provenanceVerified: true,
     });
     return executedStepInfo[stepId];
   }
 
   /**
    * Resolve ALL executed author families for `authorId`.
-   * During real execution (`!dryRun`), NEVER guesses from static step config — requires
-   * verified execution evidence from this run or the run-bound resumed `status.js` / `ledger`!
+   * During real execution (`!dryRun`), NEVER trusts unverified `status.js` or static step config —
+   * requires in-process execution OR a run/lineage-bound ledger record with dispatch + artifact SHA proof!
    */
   function getAuthorExecutionEvidence(authorId, { dryRun = false, projectDir = null } = {}) {
     const defStep = byId[authorId];
@@ -179,25 +185,49 @@ export function createRunner({
       return { ok: true, families: info.executedFamilies, contributions: info.contributions };
     }
 
-    // Check run-bound resumed status.js + run-bound ledger (strictly matched by ledgerRunKey/runId + objective!)
+    // P0-03: Strictly require BOTH a succeeded status entry AND a verified run-bound ledger record!
+    // Never trust a bare/unbound `status.js` lacking a matching ledger run record!
     const st = statusOf ? statusOf(authorId) : null;
     const boundLedger = getBoundPreviousLedger ? getBoundPreviousLedger() : null;
     const ls = boundLedger?.steps?.[authorId] || null;
 
     if (st && st.status === "succeeded") {
-      const fams = Array.isArray(st.executedFamilies) && st.executedFamilies.length
-        ? st.executedFamilies
-        : (Array.isArray(ls?.executedFamilies) && ls.executedFamilies.length
-          ? ls.executedFamilies
-          : (st.family ? [st.family] : (ls?.family ? [ls.family] : [])));
-      if (fams.length > 0 && (!fams.includes("unknown") || isPureStubPipeline)) {
+      if (isPureStubPipeline) {
+        return { ok: true, families: ["stub"], contributions: [{ agent: "stub", model: "default", family: "stub" }] };
+      }
+      if (!boundLedger || !ls) {
+        return {
+          ok: false,
+          reason: `no verified execution record for upstream author step "${authorId}" in bound run ledger (unbound status.js is not trusted)`,
+        };
+      }
+      if (ls.outcome !== "succeeded" || (!ls.dispatchId && !ls.terminal)) {
+        return {
+          ok: false,
+          reason: `ledger record for upstream author step "${authorId}" is incomplete or not succeeded (outcome=${ls.outcome || "unknown"})`,
+        };
+      }
+      if (ls.artifactSha256 && defStep?.writes) {
+        const curArtPath = join(getWtDir() || ".", artDir, defStep.writes);
+        const curArtSha = computeFileSha256(curArtPath);
+        if (!curArtSha || curArtSha !== ls.artifactSha256) {
+          return {
+            ok: false,
+            reason: `artifact "${defStep.writes}" for author step "${authorId}" no longer matches its ledger-recorded SHA-256`,
+          };
+        }
+      }
+      const fams = Array.isArray(ls.executedFamilies) && ls.executedFamilies.length
+        ? ls.executedFamilies
+        : (ls.family ? [ls.family] : []);
+      if (fams.length > 0 && !fams.includes("unknown")) {
         return {
           ok: true,
           families: [...new Set(fams)],
-          contributions: fams.map((f) => ({ agent: st.agent || ls?.agent || "unknown", model: st.model || ls?.model || "default", family: f })),
+          contributions: fams.map((f) => ({ agent: ls.agent || st.agent || "unknown", model: ls.model || st.model || "default", family: f })),
         };
       }
-      return { ok: false, reason: `resumed author step "${authorId}" lacks proven model family in bound run state` };
+      return { ok: false, reason: `resumed author step "${authorId}" lacks proven model family in bound run ledger` };
     }
 
     if (dryRun && defStep) {
@@ -211,6 +241,41 @@ export function createRunner({
     }
 
     return { ok: false, reason: `no verified execution record for upstream author step "${authorId}" in current/resumed run` };
+  }
+
+  function verifySkippedReviewProvenance(reviewStep, wtDir) {
+    const boundLedger = getBoundPreviousLedger ? getBoundPreviousLedger() : null;
+    const ls = boundLedger?.steps?.[reviewStep.id] || null;
+    if (!boundLedger || !ls) {
+      return { ok: false, reason: `skipped review step "${reviewStep.id}" lacks a verified run-bound ledger record` };
+    }
+    if (ls.outcome !== "succeeded" || ls.verifyOk === false || (!ls.dispatchId && !ls.terminal)) {
+      return { ok: false, reason: `skipped review step "${reviewStep.id}" is not verified succeeded in bound ledger` };
+    }
+    if (ls.artifactSha256 && reviewStep.writes) {
+      const curSha = computeFileSha256(join(wtDir, artDir, reviewStep.writes));
+      if (!curSha || curSha !== ls.artifactSha256) {
+        return { ok: false, reason: `artifact "${reviewStep.writes}" for skipped review "${reviewStep.id}" was modified outside bound ledger` };
+      }
+    }
+    const revFams = Array.isArray(ls.executedFamilies) && ls.executedFamilies.length
+      ? ls.executedFamilies
+      : (ls.family ? [ls.family] : []);
+    if (!revFams.length || revFams.includes("unknown")) {
+      return { ok: false, reason: `skipped review step "${reviewStep.id}" has unproven model family in ledger` };
+    }
+    for (const authorId of resolveAuthorStepIds(reviewStep, byId)) {
+      const ev = getAuthorExecutionEvidence(authorId, { dryRun: false, projectDir: wtDir });
+      if (ev.skippedDisabled) continue;
+      if (!ev.ok) {
+        return { ok: false, reason: `skipped review step "${reviewStep.id}" upstream author "${authorId}" unverified: ${ev.reason}` };
+      }
+      const overlap = ev.families.find((f) => revFams.includes(f));
+      if (overlap) {
+        return { ok: false, reason: `skipped review step "${reviewStep.id}" family "${overlap}" conflicts with upstream author "${authorId}"` };
+      }
+    }
+    return { ok: true, reason: null };
   }
 
   function computeReviewIsolationContext(step, { dryRun = false, projectDir = null } = {}) {
@@ -383,7 +448,7 @@ export function createRunner({
     m.outcome = outcome;
     m.done = done || null;
     if (m.ctx?.isolated)
-      syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: getWtDir() || ".", artDirRel: artDir });
+      syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: getWtDir() || ".", artDirRel: artDir, minSourceMtimeMs: m.fsEpochMtimeMs ?? m.clearedAtMs });
     refreshProgress(m.step);
     writeArtifactSnapshot(m.step);
     statusEnd(m.step.id, outcome, m.note);
@@ -415,17 +480,15 @@ export function createRunner({
     const LEDGER = getLedger();
     if (m.terminal) {
       if (m.dispatchId) {
-        const ws = orca(["orchestration", "worker-stop", "--dispatch", m.dispatchId]);
-        const wsJson = res(ws.json);
-        const stopState = pick(wsJson, ["state", "status", "stopStatus"]);
-        const procAction = pick(wsJson, ["processAction"]);
-        if (!ws.ok || stopState === "stop_unknown" || procAction === "stop_unknown") {
-          return { ok: false, reason: `worker-stop (${m.dispatchId}) failed: ${sanitizeText(ws.stderr || ws.raw || stopState || "unconfirmed", { maxLen: 200 })}` };
+        const sr = verifyStopAndReleaseReceipt(orca, m.dispatchId);
+        if (!sr.ok) {
+          return { ok: false, reason: sr.reason };
         }
       }
       const tc = orca(["terminal", "close", "--terminal", m.terminal]);
-      if (!tc.ok) {
-        return { ok: false, reason: `terminal close (${m.terminal}) failed: ${sanitizeText(tc.stderr || tc.raw || "unconfirmed", { maxLen: 200 })}` };
+      const tcAction = String(pick(res(tc.json), ["status", "action"]) || "").toLowerCase();
+      if (!tc.ok || tcAction === "kept_open" || tcAction === "retained") {
+        return { ok: false, reason: `terminal close (${m.terminal}) failed: ${sanitizeText(tc.stderr || tc.raw || tcAction || "unconfirmed", { maxLen: 200 })}` };
       }
       LEDGER?.recordWorkerStopped?.({
         stepId: m.step.id,
@@ -484,16 +547,17 @@ export function createRunner({
     const hasRefs = Boolean((step.skills || []).length || (step.mcp || []).length);
     if (!hasRefs && !sharedPrepared?.some((p) => (p.step.skills || []).length || (p.step.mcp || []).length)) return;
     const mountDie = (msg) => { throw new FlowFatalError(msg); };
+    // P1-04: Register worktree in materializedDirs BEFORE mutating files and enable immediate rollback on partial error!
+    if (!materializedDirs.includes(worktreeDir)) materializedDirs.push(worktreeDir);
     if (sharedPrepared && sharedPrepared.length > 0) {
       const membersSpec = sharedPrepared.map((p) => ({
         ...p.step,
         agent: p.step.id === step.id ? activeAgent : (executedStepInfo[p.step.id]?.agent || agentOf(p.step)),
       }));
-      materializeAgentConfig({ worktree: worktreeDir, members: membersSpec, cfg, configDir: here, die: mountDie, warn, quietRestore: true });
+      materializeAgentConfig({ worktree: worktreeDir, members: membersSpec, cfg, configDir: here, die: mountDie, warn, quietRestore: true, rollbackOnError: true });
     } else {
-      materializeAgentConfig({ worktree: worktreeDir, members: [{ ...step, agent: activeAgent }], cfg, configDir: here, die: mountDie, warn, quietRestore: true });
+      materializeAgentConfig({ worktree: worktreeDir, members: [{ ...step, agent: activeAgent }], cfg, configDir: here, die: mountDie, warn, quietRestore: true, rollbackOnError: true });
     }
-    if (!materializedDirs.includes(worktreeDir)) materializedDirs.push(worktreeDir);
   }
 
   function clearStepArtifactStrict(step, wtRootDir, worktreeDir) {
@@ -611,44 +675,81 @@ export function createRunner({
       warn(`[preflight] "${step.title}" all candidate pre-checks failed (${preflightRes.failures.map((f) => `${f.agent}: ${f.reason}`).join("; ")}); attempting primary anyway.`);
     }
 
+    // P1-02: Compute single absolute `effectiveStepStart`, `effectiveDeadlineAt`, and `effectiveMaxDeadlineAt`
+    // BEFORE preflight, candidate retries, warm polls, or cold-start retries!
+    const effectiveStepStart = slotStartedAt ?? Date.now();
+    const interactiveNow = !autoRun && step.interactive;
+    const baseIdleMs = timeoutOf(step);
+    const baseHardMs = step.hardTimeoutMs ?? cfg.defaults?.hardTimeoutMs ?? 4 * baseIdleMs;
+    const maxIdleMs = interactiveNow ? Math.max(baseIdleMs, 3600000) : baseIdleMs;
+    const rawHardCapMs = interactiveNow ? Math.max(baseHardMs, 14400000) : baseHardMs;
+    const stepMaxRtRaw = step.watchdog?.maxRuntimeMs ?? cfg.defaults?.watchdog?.maxRuntimeMs ?? 0;
+    const stepMaxRtMs = Number.isFinite(stepMaxRtRaw) && stepMaxRtRaw > 0 ? stepMaxRtRaw : 0;
+    const maxDeadlineAt = slotMaxDeadlineAt ?? (stepMaxRtMs > 0 ? effectiveStepStart + stepMaxRtMs : Infinity);
+    const hardCapMs = stepMaxRtMs > 0 ? Math.min(rawHardCapMs, stepMaxRtMs) : rawHardCapMs;
+    const deadlineAt = slotDeadlineAt ? Math.min(slotDeadlineAt, maxDeadlineAt) : Math.min(effectiveStepStart + hardCapMs, maxDeadlineAt);
+
     let started = null;
     let launchedAt = Date.now();
-    let clearedInfo = { cleared: true, clearedAtMs: launchedAt };
+    let clearedInfo = { cleared: true, clearedAtMs: launchedAt, fsEpochMtimeMs: launchedAt };
     let requestId = null;
     let currentRetryOf = retryOfDispatchId;
     const superseded = new Set(supersededDispatches || []);
     if (retryOfDispatchId) superseded.add(retryOfDispatchId);
 
     while (candIndex < fullChain.length) {
-      // P1-02: Respect absolute slot deadline before launching another candidate!
-      if (slotMaxDeadlineAt && Date.now() >= slotMaxDeadlineAt) {
-        throw new FlowFatalError(`"${step.title}" reached strict maxRuntimeMs ceiling before fallback launch.`);
+      if (Date.now() >= deadlineAt) {
+        const elapsedMs = Date.now() - effectiveStepStart;
+        const mins = Math.round(elapsedMs / 60000);
+        const secs = Math.round(elapsedMs / 1000);
+        const hitCeil = maxDeadlineAt < Infinity && Date.now() >= maxDeadlineAt;
+        log(`[warn] "${step.title}" not settled after ${mins}min; leaving its terminal open and stopping the pipeline.${hitCeil ? ` [reached maxRuntimeMs ceiling at ${secs}s]` : ""}`);
+        const note = hitCeil ? `reached maxRuntimeMs ceiling (${secs}s) — not settled after ${mins}min` : `not settled after ${mins}min`;
+        statusEnd(step.id, "still-running", note);
+        return {
+          step, ctx: stepCtx, taskId, dispatchId: null, terminal: null, requestId,
+          clearedAtMs: clearedInfo.clearedAtMs, fsEpochMtimeMs: clearedInfo.fsEpochMtimeMs, clearedBeforeDispatch: Boolean(clearedInfo.cleared),
+          supersededDispatches: superseded, crossRejected, sharedWorktree,
+          candidateChain: fullChain, candidateIndex: candIndex, activeCandidate: activeCand,
+          preStepTargetSha: preRefs.localSha, preStepOriginTargetSha: preRefs.originSha,
+          preStepRemoteTargetSha: preRefs.remoteSha, preStepRemoteError: preRefs.remoteError,
+          preStepHasOrigin: preRefs.hasOrigin, preStepHeadSha: preRefs.headSha,
+          health: null, watchdog: null, maxIdleMs, hardCapMs: Math.max(0, deadlineAt - effectiveStepStart),
+          deadlineAt, maxDeadlineAt, sliceMs: 250, stepStartedAt: effectiveStepStart, startedAt: launchedAt,
+          lastBusy: launchedAt, lastPreview: undefined, quietWarned: false, parkedSeen: new Set(), parkedLabel: null,
+          settled: true, done: null, note, outcome: "still-running",
+          nudge: { left: 0, phase: null, sentAt: 0, count: 0, outcome: null, done: null },
+        };
       }
       activeCand = fullChain[candIndex];
       if (activeCand.agent !== agentOf(step)) {
         rematerializeForCandidate(step, activeCand.agent, worktreeDir, sharedPrepared, materializedDirs);
       }
-      clearedInfo = clearStepArtifactStrict(step, wtRootDir, worktreeDir);
 
+      const launchSpec = resolveEffectiveLaunchSpec(
+        activeCand.agent,
+        activeCand.isPrimary ? (activeCand.requestedModel ?? modelOf(step)) : (activeCand.requestedModel ?? activeCand.model),
+        activeCand.isPrimary ? (activeCand.requestedEffort ?? step.effort ?? null) : (activeCand.requestedEffort ?? activeCand.effort),
+        { projectDir: worktreeDir }
+      );
       const wtTag = stepCtx?.isolated ? `, worktree=${stepCtx.wtName}, branch=${stepCtx.branch}` : "";
-      const modelTag = activeCand.model ? `, model=${activeCand.model}` : "";
-      const effortTag = activeCand.effort ? `, effort=${activeCand.effort}` : "";
+      const modelTag = launchSpec.passedModel ? `, model=${launchSpec.passedModel}` : "";
+      const effortTag = launchSpec.effectiveEffort ? `, effort=${launchSpec.effectiveEffort}` : "";
       log(`> ${step.title}  (agent=${activeCand.agent}${modelTag}${effortTag}, task=${taskId}${wtTag})`);
       requestId = `req-${++attemptSeq}-${step.id}`;
-      const requestedModel = activeCand.isPrimary ? (activeCand.model || effectiveModel(step)) : activeCand.model;
-      const requestedEffort = activeCand.effort || (activeCand.isPrimary ? (step.effort || null) : null);
-      const resolvedModel = requestedModel || activeCand.resolvedModel || null;
-      const recordedFamily = classifyModelFamily(activeCand.agent, resolvedModel, { projectDir: worktreeDir });
+      const requestedModel = activeCand.isPrimary ? (modelOf(step) || null) : (activeCand.requestedModel || activeCand.model || null);
+      const requestedEffort = activeCand.isPrimary ? (step.effort || cfg?.defaults?.effort || null) : (activeCand.requestedEffort || activeCand.effort || null);
+      const recordedFamily = classifyModelFamily(activeCand.agent, requestedModel, { projectDir: worktreeDir });
       if (LEDGER) {
         LEDGER.recordIntent({
           requestId,
           stepId: step.id,
           title: step.title,
           agent: activeCand.agent,
-          model: resolvedModel || requestedModel,
+          model: launchSpec.effectiveModel || requestedModel,
           requestedModel: requestedModel || "default",
           requestedEffort: requestedEffort || null,
-          effort: requestedEffort,
+          effort: launchSpec.effectiveEffort,
           family: recordedFamily,
           attempt: attemptSeq,
           worktree: stepCtx?.isolated ? stepCtx.wtName : (getWt() || "integration"),
@@ -658,10 +759,15 @@ export function createRunner({
       launchedAt = Date.now();
       started = startWorker(step, taskId, stepCtx?.selector || null, {
         agentOverride: activeCand.agent,
-        modelOverride: activeCand.model,
-        effortOverride: activeCand.effort,
+        modelOverride: launchSpec.passedModel,
+        effortOverride: launchSpec.effectiveEffort,
         worktreePath: worktreeDir,
         retryOfDispatchId: currentRetryOf,
+        deadlineAt,
+        beforeEachStartAttempt: () => {
+          clearedInfo = clearStepArtifactStrict(step, wtRootDir, worktreeDir);
+          return clearedInfo;
+        },
         allowError: true,
         onBeforeManualDispatch: currentRetryOf ? () => {
           const u = orca(["orchestration", "task-update", "--id", taskId, "--status", "ready"]);
@@ -669,14 +775,40 @@ export function createRunner({
           return u.ok;
         } : null,
       });
+      if (started?.lastClearedInfo) {
+        clearedInfo = started.lastClearedInfo;
+      }
 
       if (started?.attempts?.length && LEDGER?.recordStartAttempts) {
         LEDGER.recordStartAttempts({ requestId, stepId: step.id, attempts: started.attempts });
       }
 
-      // If startWorker actually created a dispatch (even if it later failed), record its family contribution!
       if (started?.dispatchId) {
-        recordExecutedStep(step.id, activeCand.agent, resolvedModel || requestedModel, worktreeDir);
+        recordExecutedStep(step.id, activeCand.agent, started.effectiveModel || launchSpec.effectiveModel || requestedModel, worktreeDir);
+      }
+
+      if (started?.deadlineExceeded) {
+        const elapsedMs = Date.now() - effectiveStepStart;
+        const mins = Math.round(elapsedMs / 60000);
+        const secs = Math.round(elapsedMs / 1000);
+        const hitCeil = maxDeadlineAt < Infinity && Date.now() >= maxDeadlineAt;
+        log(`[warn] "${step.title}" not settled after ${mins}min; leaving its terminal open and stopping the pipeline.${hitCeil ? ` [reached maxRuntimeMs ceiling at ${secs}s]` : ""}`);
+        const note = hitCeil ? `reached maxRuntimeMs ceiling (${secs}s) — not settled after ${mins}min` : `not settled after ${mins}min`;
+        statusEnd(step.id, "still-running", note);
+        return {
+          step, ctx: stepCtx, taskId, dispatchId: started.dispatchId || null, terminal: started.terminal || null, requestId,
+          clearedAtMs: clearedInfo.clearedAtMs, fsEpochMtimeMs: clearedInfo.fsEpochMtimeMs, clearedBeforeDispatch: Boolean(clearedInfo.cleared),
+          supersededDispatches: superseded, crossRejected, sharedWorktree,
+          candidateChain: fullChain, candidateIndex: candIndex, activeCandidate: activeCand,
+          preStepTargetSha: preRefs.localSha, preStepOriginTargetSha: preRefs.originSha,
+          preStepRemoteTargetSha: preRefs.remoteSha, preStepRemoteError: preRefs.remoteError,
+          preStepHasOrigin: preRefs.hasOrigin, preStepHeadSha: preRefs.headSha,
+          health: null, watchdog: null, maxIdleMs, hardCapMs: Math.max(0, deadlineAt - effectiveStepStart),
+          deadlineAt, maxDeadlineAt, sliceMs: 250, stepStartedAt: effectiveStepStart, startedAt: launchedAt,
+          lastBusy: launchedAt, lastPreview: undefined, quietWarned: false, parkedSeen: new Set(), parkedLabel: null,
+          settled: true, done: null, note, outcome: "still-running",
+          nudge: { left: 0, phase: null, sentAt: 0, count: 0, outcome: null, done: null },
+        };
       }
 
       if (started && started.ok !== false) break;
@@ -727,12 +859,20 @@ export function createRunner({
       candIndex = nextIdx;
     }
 
-    const finalRequestedModel = activeCand.isPrimary ? (activeCand.model || effectiveModel(step)) : activeCand.model;
-    const finalModel = started.effectiveModel || finalRequestedModel || activeCand.resolvedModel || null;
+    const finalRequestedModel = activeCand.isPrimary ? (modelOf(step) || null) : (activeCand.requestedModel || activeCand.model || null);
+    const finalModel = started.effectiveModel || activeCand.resolvedModel || finalRequestedModel || null;
     const execRec = recordExecutedStep(step.id, activeCand.agent, finalModel, worktreeDir);
 
     const dispatchedAt = Date.now();
     const { dispatchId, terminal } = started;
+    if (dispatchId) {
+      bindStepArtifactDispatchClaim(wtRootDir, artDir, step, {
+        dispatchId,
+        taskId,
+        fsEpochMtimeMs: clearedInfo.fsEpochMtimeMs,
+        clearedAtMs: clearedInfo.clearedAtMs,
+      });
+    }
     const receiptTurnStart = started.receiptTurnStart || (terminal ? "observed" : null);
     const health = initMemberHealth({
       startedAt: launchedAt, dispatchedAt, receiptTurnStart,
@@ -743,8 +883,6 @@ export function createRunner({
     const artifactPath = step.writes ? join(artDirPath, step.writes) : null;
     const progressPath = step.progress ? join(artDirPath, step.progress) : null;
 
-    // P1-02: Preserve single absolute `stepStartedAt`, `deadlineAt`, and `maxDeadlineAt` across fallbacks!
-    const effectiveStepStart = slotStartedAt ?? launchedAt;
     const watchdog = createWatchdogTracker({
       step, cfg, startedAt: effectiveStepStart, worktreeDir, artifactPath, progressPath, artDirPath, sharedWorktree,
     });
@@ -767,20 +905,13 @@ export function createRunner({
       model: finalModel || "default",
       family: execRec.family,
       executedFamilies: execRec.executedFamilies,
+      provenanceVerified: true,
       health: health.state,
       turnStart: health.turnStart,
       ...(candIndex > 0 ? { note: `fallback active: ${activeCand.agent}${activeCand.model ? ` (${activeCand.model})` : ""}` } : {}),
     });
 
-    const interactiveNow = !autoRun && step.interactive;
-    const baseIdleMs = timeoutOf(step);
-    const baseHardMs = step.hardTimeoutMs ?? cfg.defaults?.hardTimeoutMs ?? 4 * baseIdleMs;
-    const maxIdleMs = interactiveNow ? Math.max(baseIdleMs, 3600000) : baseIdleMs;
-    const rawHardCapMs = interactiveNow ? Math.max(baseHardMs, 14400000) : baseHardMs;
     const maxRtMs = watchdog.config.maxRuntimeMs > 0 ? watchdog.config.maxRuntimeMs : 0;
-    const maxDeadlineAt = slotMaxDeadlineAt ?? (maxRtMs > 0 ? effectiveStepStart + maxRtMs : Infinity);
-    const hardCapMs = maxRtMs > 0 ? Math.min(rawHardCapMs, maxRtMs) : rawHardCapMs;
-    const deadlineAt = slotDeadlineAt ? Math.min(slotDeadlineAt, maxDeadlineAt) : Math.min(effectiveStepStart + hardCapMs, maxDeadlineAt);
     const wdSliceCap = watchdog.config.stallTimeoutMs > 0 ? Math.max(1000, Math.floor(watchdog.config.stallTimeoutMs / 2)) : 120000;
     const sliceCandidates = [120000, maxIdleMs, hardCapMs, health.turnStartWindowMs, health.turnStartEscalateMs, wdSliceCap];
     if (maxRtMs > 0) sliceCandidates.push(maxRtMs);
@@ -788,6 +919,7 @@ export function createRunner({
     return {
       step, ctx: stepCtx, taskId, dispatchId, terminal, requestId,
       clearedAtMs: clearedInfo.clearedAtMs,
+      fsEpochMtimeMs: clearedInfo.fsEpochMtimeMs,
       clearedBeforeDispatch: Boolean(clearedInfo.cleared),
       supersededDispatches: superseded,
       crossRejected,
@@ -833,8 +965,8 @@ export function createRunner({
       const sharedMembers = sharedPrepared.map((p) => ({ ...p.step, agent: agentOf(p.step) }));
       const mountDie = (msg) => { throw new FlowFatalError(msg); };
       if (sharedMembers.length) {
-        // Push to materializedDirs ONLY AFTER materializeAgentConfig completes so S1c abort-window
-        // keeps `.orca-agent-config.json` flushed on disk for startup self-heal!
+        // P1-04: Register worktree BEFORE mutating any MCP/skill file and roll back immediately on partial error!
+        materializedDirs.push(wtDir);
         materializeAgentConfig({
           worktree: wtDir,
           members: sharedMembers,
@@ -842,10 +974,11 @@ export function createRunner({
           configDir: here,
           die: mountDie,
           warn,
+          rollbackOnError: true,
         });
-        materializedDirs.push(wtDir);
       }
       for (const p of prepared.filter((x) => x.ctx.isolated)) {
+        materializedDirs.push(p.ctx.dir);
         materializeAgentConfig({
           worktree: p.ctx.dir,
           members: [{ ...p.step, agent: agentOf(p.step) }],
@@ -853,8 +986,8 @@ export function createRunner({
           configDir: here,
           die: mountDie,
           warn,
+          rollbackOnError: true,
         });
-        materializedDirs.push(p.ctx.dir);
       }
       for (const s of members) statusBegin(s.id);
       M = [];
@@ -870,18 +1003,21 @@ export function createRunner({
       while (true) {
         const open = M.filter((m) => !m.settled);
         if (!open.length) break;
-        // P1-02: Include left-open `still-running` members when determining if shared worktree has concurrent writers!
         const activeSharedCount = M.filter((m) => !m.ctx?.isolated && (!m.settled || m.outcome === "still-running")).length;
-        // P1-02: Bound check --wait timeout strictly by each member's remaining absolute deadline budget!
+        // P1-02: Bound BOTH `check --wait --timeout-ms` AND the child process `timeoutMs` by remaining deadline budget!
         const nowBeforeWait = Date.now();
+        const minRemDeadlineMs = Math.min(...open.map((m) => m.deadlineAt - nowBeforeWait));
         const slice = Math.max(50, Math.min(...open.map((m) => Math.min(m.sliceMs, Math.max(50, m.deadlineAt - nowBeforeWait)))));
+        const checkProcTimeoutMs = Number.isFinite(minRemDeadlineMs)
+          ? Math.max(250, Math.min(slice + 5000, Math.max(250, minRemDeadlineMs + 500)))
+          : (slice + 5000);
 
         for (const m of open) {
-          if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir, artDirRel: artDir });
+          if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir, artDirRel: artDir, minSourceMtimeMs: m.fsEpochMtimeMs ?? m.clearedAtMs });
           refreshProgress(m.step); writeArtifactSnapshot(m.step);
         }
         writeStatus();
-        const wait = orca(["orchestration", "check", "--run", runId, "--wait", "--types", "worker_done,escalation,question", "--timeout-ms", String(slice)], { timeoutMs: slice + 60000 });
+        const wait = orca(["orchestration", "check", "--run", runId, "--wait", "--types", "worker_done,escalation,question", "--timeout-ms", String(slice)], { timeoutMs: checkProcTimeoutMs });
         const d = res(wait.json);
         const did = pick(d, ["deliveryId", "delivery_id"]) ?? pick(d.delivery || {}, ["id"]);
         const msgs = pick(d, ["messages", "msgs"]) || [];
@@ -908,7 +1044,7 @@ export function createRunner({
           if (m.nudge.phase === "post-done") { nudgeCtrl.nudgePoll(m); continue; }
           const wd = msgs.find((msg) => matchesMemberDone(msg, m));
           if (wd) {
-            if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir, artDirRel: artDir });
+            if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir, artDirRel: artDir, minSourceMtimeMs: m.fsEpochMtimeMs ?? m.clearedAtMs });
             if (m.health) {
               evaluateMemberHealth(m.health, { startedAt: m.startedAt, workerDone: true });
               statusSet(m.step.id, { health: m.health.state, turnStart: m.health.turnStart });
@@ -924,7 +1060,7 @@ export function createRunner({
             const drid = pick(dr, ["deliveryId", "delivery_id"]) ?? pick(dr.delivery || {}, ["id"]);
             const drained = (pick(dr, ["messages", "msgs"]) || []).find((msg) => matchesMemberDone(msg, m)) || null;
             if (drid) orca(["orchestration", "check", "--run", runId, "--ack", drid]);
-            if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir, artDirRel: artDir });
+            if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir, artDirRel: artDir, minSourceMtimeMs: m.fsEpochMtimeMs ?? m.clearedAtMs });
             const vout = (drained && outcomeOf(drained)) || v.outcome || "unknown";
             const vdone = drained || { dispatchId: m.dispatchId, payload: JSON.stringify({ outcome: vout, dispatchId: m.dispatchId }) };
             if (!nudgeCtrl.holdForNudge(m, vout, vdone)) settleMember(m, m.outcome || vout, vdone);
@@ -1167,7 +1303,7 @@ export function createRunner({
     } finally {
       for (const d of new Set(materializedDirs)) restoreAgentConfig({ worktree: d, warn });
       for (const m of M) {
-        if (m.ctx?.isolated) finalizeStepWorktree({ step: m.step, stepCtx: m.ctx, outcome: m.outcome, wtDir, artDirRel: artDir, isolatedState });
+        if (m.ctx?.isolated) finalizeStepWorktree({ step: m.step, stepCtx: m.ctx, outcome: m.outcome, wtDir, artDirRel: artDir, isolatedState, minSourceMtimeMs: m.fsEpochMtimeMs ?? m.clearedAtMs });
       }
     }
     if (fatalErr) {
@@ -1216,8 +1352,20 @@ export function createRunner({
     const wtDir = getWtDir() || ".";
     for (const id of (step.reads || [])) {
       if (!byId[id] || byId[id].enabled === false) continue;
-      const v = verifyStepArtifact(byId[id], join(wtDir, artDir), wtDir, readinessMinBytes, { mode: "readiness" });
-      if (!v.ok) missing.push({ id, title: byId[id].title, path: outPath(byId[id].writes), reason: v.reason });
+      const prodStep = byId[id];
+      const v = verifyStepArtifact(prodStep, join(wtDir, artDir), wtDir, readinessMinBytes, { mode: "readiness" });
+      if (!v.ok) {
+        missing.push({ id, title: prodStep.title, path: outPath(prodStep.writes), reason: v.reason });
+        continue;
+      }
+      // P0-03: When resuming past a skipped cross-family review step, verify that its PASS verdict
+      // is backed by a verified run-bound ledger record proving cross-family independence!
+      if (!enabledIds.has(id) && !executedStepInfo[id] && isCrossFamilyReviewStep(prodStep) && !isPureStubPipeline) {
+        const revProv = verifySkippedReviewProvenance(prodStep, wtDir);
+        if (!revProv.ok) {
+          missing.push({ id, title: prodStep.title, path: outPath(prodStep.writes), reason: revProv.reason });
+        }
+      }
     }
     return missing;
   }
@@ -1255,12 +1403,19 @@ export function createRunner({
         }
         const repairedCheck = verifyStepArtifact(step, join(wtDir, artDir), wtDir, readinessMinBytes, {
           mode: "settlement",
+          dispatchId: r.dispatchId || null,
+          fsEpochMtimeMs: r.fsEpochMtimeMs,
           minMtimeMs: r.clearedAtMs,
           clearedBeforeDispatch: r.clearedBeforeDispatch,
         });
         if (repairedCheck.ok) {
           if (step.verify?.requireContractCommit && repairedCheck.contractCommit)
             recordVerifiedContractCommit(join(wtDir, artDir), repairedCheck.contractCommit, wtDir);
+          const LEDGER = getLedger();
+          if (LEDGER) {
+            const artSha = step.writes ? computeFileSha256(join(wtDir, artDir, step.writes)) : null;
+            LEDGER.recordStepSettled({ stepId: step.id, outcome: r.outcome, note: r.note || null, verifyOk: true, contractCommit: repairedCheck.contractCommit || null, artifactSha256: artSha });
+          }
           if (r.outcome === "succeeded" && step.gate && !autoRun) runGate(step);
           log(`[readiness] "${step.title}" artifact ready -> ${outPath(step.writes)}`);
           break;

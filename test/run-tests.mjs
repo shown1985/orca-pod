@@ -4021,8 +4021,8 @@ if (mode === "manual_then_cold") {
   if (key === "terminal create") return out(0, { result: { handle: "term-man-1" } });
   if (key === "terminal show") {
     const closedFlag = ${JSON.stringify(join(tmpV11, "term-man-1.closed"))};
-    if (fs.existsSync(closedFlag)) return out(0, { result: { terminal: {} } });
-    return out(0, { result: { terminal: { lastOutputAt: 1000, preview: "ready prompt" } } });
+    if (fs.existsSync(closedFlag)) return out(0, { result: { terminal: { handle: "term-man-1", status: "closed", closed: true } } });
+    return out(0, { result: { terminal: { handle: "term-man-1", lastOutputAt: 1000, preview: "ready prompt" } } });
   }
   if (key === "orchestration dispatch") {
     if (args.includes("--dry-run")) return out(1, { error: "preamble unavailable" });
@@ -4031,7 +4031,7 @@ if (mode === "manual_then_cold") {
   if (key === "orchestration worker-stop") return out(0, { result: { dispatchId: "disp-man-1", state: "fenced" } });
   if (key === "terminal close") {
     fs.writeFileSync(${JSON.stringify(join(tmpV11, "term-man-1.closed"))}, "1");
-    return out(0, { result: { status: "closed" } });
+    return out(0, { result: { handle: "term-man-1", status: "closed", closed: true } });
   }
   if (key === "orchestration worker-release") return out(0, { result: { dispatchId: "disp-man-1", status: "retained" } });
   if (key === "orchestration task-update") return out(0, { result: {} });
@@ -4732,7 +4732,7 @@ if (mode === "strict_unknown_agent") {
 }
 if (mode === "create_fail_with_handle_closed") {
   if (key === "terminal create") return out(1, { result: { handle: "term-leak-1" }, error: "post-spawn init failed" });
-  if (key === "terminal close") return out(0, { result: { status: "closed" } });
+  if (key === "terminal close") return out(0, { result: { handle: "term-leak-1", status: "closed", closed: true } });
   if (key === "terminal show") return out(1, { error: "unknown terminal term-leak-1" });
   if (key === "orchestration worker-start") return out(0, { result: { dispatchId: "disp-after-close", state: "ready" } });
 }
@@ -4806,7 +4806,7 @@ out(0, { result: {} });
   let manualTermClosed = false;
   const rManOk = verifyManualStopAndReleaseReceipt((args) => {
     if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "dm-1", state: "fenced" } } };
-    if (args[0] === "terminal" && args[1] === "close") { manualTermClosed = true; return { ok: true, json: { result: { status: "closed" } } }; }
+    if (args[0] === "terminal" && args[1] === "close") { manualTermClosed = true; return { ok: true, json: { result: { handle: "tm-1", status: "closed", closed: true } } }; }
     if (args[0] === "terminal" && args[1] === "show") return manualTermClosed ? { ok: false, stderr: "unknown terminal tm-1" } : { ok: true, json: { result: { terminal: { preview: "alive" } } } };
     if (args[1] === "worker-release") return { ok: true, json: { result: { dispatchId: "dm-1", status: "retained" } } };
     return { ok: true, json: {} };
@@ -5215,6 +5215,626 @@ process.exit(Number(process.env.MOCK_CURL_RC || 0));
       MOCK_HTTP_CODE: "200",
       MOCK_CURL_RC: "0",
     }).status, 0);
+});
+
+// ---------------------------------------------------------------------------
+// V13 — Round-5 final closure regressions (P0-01, P0-02, P0-03, P1-02, P1-06, P1-07, P1-11, P2-01)
+// ---------------------------------------------------------------------------
+scenario("V13 Round-5 final closure: attributed terminal close, conflicting worker-start, nudge supervised handle, gate non-symlink atomic promote, root-shadowed Python CI, ledger parentRunKey lineage, shell comment/default/-- launch family, expired nudge/vitals budget, multiline shortcut ref, forge origin+basePath URL, and CD inspect precedence", async () => {
+  const { spawnSync, execFileSync } = await import("node:child_process");
+  const { symlinkSync } = await import("node:fs");
+  const {
+    createOrcaClient,
+    buildAgentCommand,
+    verifyStopAndReleaseReceipt,
+    verifyManualTerminalClosed,
+  } = await import("../.orca/lib/orca-cli.mjs");
+  const { createNudgeController } = await import("../.orca/lib/nudge.mjs");
+  const { verifyStepArtifact } = await import("../.orca/gate-verify.mjs");
+  const { syncOutputsFromIsolatedWorktree } = await import("../.orca/worktree-isolation.mjs");
+  const {
+    detectProjectStacks,
+    renderCiWorkflow,
+    renderSelfHostedCdWorkflow,
+  } = await import("../.orca/ci-generator.mjs");
+  const {
+    tokenizeShellCommand,
+    parseAgentCommandSpec,
+    resolveEffectiveLaunchSpec,
+    classifyModelFamily,
+  } = await import("../.orca/preflight.mjs");
+  const {
+    parseBacklogTasks,
+    extractExplicitLocalIssueNumber,
+    createIssueViaCli,
+    parseRemoteHost,
+    matchTeaLoginForHost,
+  } = await import("../.orca/issue-tracker.mjs");
+  const { createRunLedger, computeFileSha256 } = await import("../.orca/ledger.mjs");
+
+  const tmpV13 = mkdtempSync(join(tmpdir(), "orca-v13-"));
+  dirsOfCurrentScenario.push(tmpV13);
+
+  const extractStepScript13 = (yml, stepTitleSubstr) => {
+    const lines = yml.split(/\r?\n/);
+    const hdrIdx = lines.findIndex((l) => l.includes("- name:") && l.includes(stepTitleSubstr));
+    if (hdrIdx < 0) return null;
+    let runIdx = -1;
+    for (let i = hdrIdx + 1; i < Math.min(lines.length, hdrIdx + 20); i++) {
+      if (/^\s+-\s+name:/.test(lines[i])) break;
+      if (/^\s+run:\s*\|\s*$/.test(lines[i])) { runIdx = i; break; }
+    }
+    if (runIdx < 0) return null;
+    const baseIndent = lines[runIdx + 1]?.match(/^(\s*)/)?.[1]?.length || 10;
+    const body = [];
+    for (let i = runIdx + 1; i < lines.length; i++) {
+      const l = lines[i];
+      if (!l.trim()) { body.push(""); continue; }
+      const ind = l.match(/^(\s*)/)[1].length;
+      if (ind < baseIndent) break;
+      body.push(l.slice(baseIndent));
+    }
+    return body.join("\n");
+  };
+
+  // =========================================================================
+  // 1) P0-01: Empty/mismatched terminal close receipts, conflicting worker-start,
+  //    nudge supervised handle isolation, fenced-code & symlink gate hardening,
+  //    and in-place validation before atomic canonical promotion
+  // =========================================================================
+  const rEmptyClose = verifyManualTerminalClosed(() => ({ ok: true, json: { result: {} } }), "term-x");
+  eq("V13 P0-01 verifyManualTerminalClosed REJECTS empty {} close + empty {} show receipts", rEmptyClose.ok, false);
+
+  const rWrongHandleClose = verifyManualTerminalClosed((args) => {
+    if (args[1] === "close") return { ok: true, json: { result: { handle: "other-term", status: "closed", closed: true } } };
+    return { ok: false, stderr: "unknown terminal term-x" };
+  }, "term-x");
+  eq("V13 P0-01 verifyManualTerminalClosed REJECTS close receipt attributed to a different handle", rWrongHandleClose.ok, false);
+
+  const mockOrcaV13 = join(tmpV13, "mock-orca-v13.cjs");
+  const mockLogV13 = join(tmpV13, "mock-orca-v13.jsonl");
+  writeFileSync(mockOrcaV13, `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const mode = process.env.MOCK_V13_MODE || "";
+fs.appendFileSync(${JSON.stringify(mockLogV13)}, JSON.stringify({ mode, args }) + "\\n");
+const out = (code, obj) => { console.log(JSON.stringify(obj)); process.exit(code); };
+const key = args.slice(0, 2).join(" ");
+if (mode === "empty_close_receipts") {
+  if (key === "terminal create") return out(1, { result: { handle: "term-empty-1" }, error: "init failed" });
+  if (key === "terminal close") return out(0, { result: {} });
+  if (key === "terminal show") return out(0, { result: {} });
+  if (key === "orchestration worker-start") return out(0, { result: { dispatchId: "disp-never", state: "ready" } });
+}
+if (mode === "conflicting_code_and_stage") {
+  if (key === "terminal create") return out(1, { error: "no warm terminal" });
+  if (key === "orchestration worker-start") return out(1, { result: { code: "permission_denied", failedStage: "agent_readiness", lastError: "connect ECONNREFUSED 127.0.0.1:4100" } });
+  if (key === "orchestration dispatch-show") return out(0, { result: { dispatch: { id: null, status: "unknown" } } });
+}
+out(0, { result: {} });
+`, { mode: 0o755 });
+
+  const prevOrca13 = process.env.ORCA_CLI_COMMAND;
+  const prevMode13 = process.env.MOCK_V13_MODE;
+  try {
+    process.env.ORCA_CLI_COMMAND = mockOrcaV13;
+    const cli13 = createOrcaClient({
+      cfg: { defaults: { startRetries: 0, warmTerminal: true } },
+      opt: {},
+      objective: "v13",
+      autoRun: true,
+      agentOf: (s) => s.agent,
+      modelOf: (s) => s.model,
+      writeStatus: () => {},
+      log: () => {},
+      warn: () => {},
+      die: (m) => { throw new Error(m); },
+    });
+    cli13.setRunId("run-v13");
+
+    process.env.MOCK_V13_MODE = "empty_close_receipts";
+    rmSync(mockLogV13, { force: true });
+    const rEmp = cli13.startWorker({ id: "s1", title: "S1", agent: "claude", model: "claude-sonnet-4-5" }, "t1", "name:testlab");
+    const empCalls = readFileSync(mockLogV13, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    eq("V13 P0-01 failed terminal create + empty {} close/show blocks ambiguous=true with zero cold worker-start",
+      [rEmp.ok, rEmp.ambiguous, empCalls.filter((c) => c.args[1] === "worker-start").length], [false, true, 0]);
+
+    process.env.MOCK_V13_MODE = "conflicting_code_and_stage";
+    const rConflict = cli13.startWorker({ id: "s2", title: "S2", agent: "codex", model: "gpt-6.2-sol" }, "t2", "name:testlab");
+    eq("V13 P0-01 conflicting code=permission_denied + failedStage=agent_readiness stays ambiguous=true",
+      [rConflict.ok, rConflict.ambiguous], [false, true]);
+  } finally {
+    if (prevOrca13 === undefined) delete process.env.ORCA_CLI_COMMAND;
+    else process.env.ORCA_CLI_COMMAND = prevOrca13;
+    if (prevMode13 === undefined) delete process.env.MOCK_V13_MODE;
+    else process.env.MOCK_V13_MODE = prevMode13;
+  }
+
+  // Nudge controller on a supervised cold-start member MUST NOT mutate `m.terminal` or downgrade supervised stop/release!
+  const nudgeCalls = [];
+  const nudgeCtrl = createNudgeController({
+    orca: (args, opts) => {
+      nudgeCalls.push({ args, opts });
+      if (args[1] === "worker-show") return { ok: true, json: { result: { terminal: { handle: "sup-term-9" } } } };
+      if (args[0] === "terminal" && args[1] === "show") return { ok: true, json: { result: { terminal: { preview: "Working...", lastOutputAt: 100 } } } };
+      return { ok: true, json: { result: {} } };
+    },
+    res: (j) => j?.result ?? {},
+    pick: (o, ks) => ks.map((k) => o?.[k]).find((v) => v !== undefined),
+    sleepMs: () => {},
+    parkedPromptOf: () => null,
+    nudgeRetriesOf: () => 2,
+    nudgeTimeoutOf: () => 0,
+    outPath: (w) => `.orca/artifacts/${w}`,
+    artifactReady: () => false,
+    statusSet: () => {},
+    writeStatus: () => {},
+    warn: () => {},
+    settleMember: () => {},
+    syncOutputsFromIsolatedWorktree: () => {},
+    getWtDir: () => tmpV13,
+    artDir: ".orca/artifacts",
+  });
+  const supMember = {
+    step: { id: "s-sup", title: "Supervised", writes: "OUT.md" },
+    startMode: "cold",
+    terminal: null,
+    dispatchId: "disp-sup-9",
+    deadlineAt: Date.now() + 30000,
+    lastBusy: 0,
+    nudge: { left: 2, count: 0, sentAt: 0, phase: null },
+    health: { lastBusyMs: 0 },
+  };
+  nudgeCtrl.maybeNudgeMidRun(supMember, { preview: "Working...", heartbeatMs: 0 });
+  eq("V13 P0-01 nudge stores supervised handle on nudgeTerminal without mutating m.terminal or m.startMode",
+    [supMember.startMode, supMember.terminal, supMember.nudgeTerminal], ["cold", null, "sup-term-9"]);
+  const supAfterNudgeReceipt = verifyStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "disp-sup-9", state: "fenced" } } };
+    if (args[1] === "worker-release") return { ok: true, json: { result: { dispatchId: "disp-sup-9", status: "retained" } } };
+    return { ok: true, json: {} };
+  }, "disp-sup-9");
+  eq("V13 P0-01 supervised member after nudge lookup STILL rejects manual-only fenced/retained stop-release receipt",
+    supAfterNudgeReceipt.ok, false);
+
+  // Gate provenance: (a) marker inside fenced code block REJECTED, (b) symlink in .dispatch-<id> REJECTED,
+  // (c) wrong Dispatch-ID inside .dispatch-<id> REJECTED WITHOUT clobbering pre-existing canonical file!
+  const gateWt13 = join(tmpV13, "gate-wt");
+  const gateArt13 = join(gateWt13, ".orca", "artifacts");
+  mkdirSync(join(gateArt13, ".dispatch-disp-13"), { recursive: true });
+  writeFileSync(join(gateArt13, ".dispatch-gate-claims.json"), JSON.stringify({
+    "REVIEW.md": { cleared: true, activeDispatchId: "disp-13", stepId: "code-review", fsEpochMtimeMs: 0 },
+  }, null, 2));
+  const reviewStep13 = {
+    id: "code-review",
+    writes: "REVIEW.md",
+    verify: { requireVerdict: "PASS" },
+  };
+  const origCanonicalBody = "# Pre-existing Canonical Review\n\nDO NOT OVERWRITE ON FAILED PROMOTION!\n";
+  writeFileSync(join(gateArt13, "REVIEW.md"), origCanonicalBody);
+
+  // (a) Fenced code block containing fake `<!-- orca-dispatch: disp-13 -->` on canonical file -> MUST FAIL!
+  writeFileSync(join(gateArt13, "REVIEW.md"), [
+    "# Code Review",
+    "",
+    "```markdown",
+    "<!-- orca-dispatch: disp-13 -->",
+    "```",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\n"));
+  rmSync(join(gateArt13, ".dispatch-disp-13", "REVIEW.md"), { force: true });
+  const gFenced = verifyStepArtifact(reviewStep13, gateArt13, gateWt13, 30, {
+    mode: "settlement",
+    dispatchId: "disp-13",
+    clearedBeforeDispatch: true,
+  });
+  eq("V13 P0-01 gate REJECTS provenance marker embedded inside fenced Markdown code block",
+    gFenced.ok, false);
+
+  // Restore canonical file to test that failed `.dispatch-disp-13` candidates NEVER overwrite canonical!
+  writeFileSync(join(gateArt13, "REVIEW.md"), origCanonicalBody);
+
+  // (b) Wrong Dispatch-ID in `.dispatch-disp-13/REVIEW.md` -> MUST FAIL & keep canonical untouched!
+  writeFileSync(join(gateArt13, ".dispatch-disp-13", "REVIEW.md"), [
+    "# Code Review",
+    "Dispatch-ID: disp-wrong-999",
+    "",
+    "Reviewed thoroughly.",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\n"));
+  const gWrongId = verifyStepArtifact(reviewStep13, gateArt13, gateWt13, 30, {
+    mode: "settlement",
+    dispatchId: "disp-13",
+    clearedBeforeDispatch: true,
+  });
+  eq("V13 P0-01 gate REJECTS wrong Dispatch-ID in per-dispatch artifact BEFORE touching canonical file",
+    [gWrongId.ok, readFileSync(join(gateArt13, "REVIEW.md"), "utf8") === origCanonicalBody], [false, true]);
+
+  // (c) Symlink inside `.dispatch-disp-13/REVIEW.md` pointing to unmarked file -> MUST FAIL & keep canonical untouched!
+  const unmarkedTarget = join(tmpV13, "unmarked-review.md");
+  writeFileSync(unmarkedTarget, "# Unmarked External Review\n\nDetailed review lines here.\n\nVERDICT: PASS\n");
+  rmSync(join(gateArt13, ".dispatch-disp-13", "REVIEW.md"), { force: true });
+  symlinkSync(unmarkedTarget, join(gateArt13, ".dispatch-disp-13", "REVIEW.md"));
+  const gSymlink = verifyStepArtifact(reviewStep13, gateArt13, gateWt13, 30, {
+    mode: "settlement",
+    dispatchId: "disp-13",
+    clearedBeforeDispatch: true,
+  });
+  eq("V13 P0-01 gate REJECTS symlinked per-dispatch artifact pointing to unmarked file and preserves canonical file",
+    [gSymlink.ok, readFileSync(join(gateArt13, "REVIEW.md"), "utf8") === origCanonicalBody], [false, true]);
+
+  // (d) Valid non-symlink `.dispatch-disp-13/REVIEW.md` with real marker -> PASSES and atomically promotes!
+  rmSync(join(gateArt13, ".dispatch-disp-13", "REVIEW.md"), { force: true });
+  writeFileSync(join(gateArt13, ".dispatch-disp-13", "REVIEW.md"), [
+    "<!-- orca-dispatch: disp-13 -->",
+    "# Code Review",
+    "",
+    "All invariants verified.",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\n"));
+  const gValid13 = verifyStepArtifact(reviewStep13, gateArt13, gateWt13, 30, {
+    mode: "settlement",
+    dispatchId: "disp-13",
+    clearedBeforeDispatch: true,
+  });
+  eq("V13 P0-01 valid non-symlink per-dispatch artifact passes gate and promotes to canonical",
+    [gValid13.ok, readFileSync(join(gateArt13, "REVIEW.md"), "utf8").includes("orca-dispatch: disp-13")], [true, true]);
+
+  // (e) `syncOutputsFromIsolatedWorktree` refuses symlinked output artifacts!
+  const isoWt13 = join(tmpV13, "iso-wt");
+  const mainWt13 = join(tmpV13, "main-wt");
+  mkdirSync(join(isoWt13, ".orca", "artifacts"), { recursive: true });
+  mkdirSync(join(mainWt13, ".orca", "artifacts"), { recursive: true });
+  symlinkSync(unmarkedTarget, join(isoWt13, ".orca", "artifacts", "BACKEND_DONE.md"));
+  syncOutputsFromIsolatedWorktree({
+    step: { id: "backend-coding", writes: "BACKEND_DONE.md" },
+    stepWtDir: isoWt13,
+    wtDir: mainWt13,
+    artDirRel: ".orca/artifacts",
+  });
+  eq("V13 P0-01 syncOutputsFromIsolatedWorktree skips symlinked artifact in isolated worktree",
+    existsSync(join(mainWt13, ".orca", "artifacts", "BACKEND_DONE.md")), false);
+
+  // =========================================================================
+  // 2) P0-02: ALL FOUR Python CI scripts execute root `unit_test.py` (pass) +
+  //    `nested/unit_test.py` (fail) WITHOUT root shadowing nested failure!
+  // =========================================================================
+  const pyShadowDir = join(tmpV13, "py-root-shadow");
+  mkdirSync(join(pyShadowDir, "nested"), { recursive: true });
+  writeFileSync(join(pyShadowDir, "requirements.txt"), "# offline\n");
+  writeFileSync(join(pyShadowDir, "unit_test.py"), [
+    "import pathlib, unittest",
+    "class RootUnitTest(unittest.TestCase):",
+    "    def test_root_passes(self):",
+    "        pathlib.Path('ran-root.txt').write_text('ok')",
+    "        self.assertTrue(True)",
+  ].join("\n") + "\n");
+  writeFileSync(join(pyShadowDir, "nested", "unit_test.py"), [
+    "import pathlib, unittest",
+    "class NestedUnitTest(unittest.TestCase):",
+    "    def test_nested_fails(self):",
+    "        pathlib.Path('ran-nested.txt').write_text('fail')",
+    "        self.fail('nested unit_test failure MUST NOT be shadowed by root unit_test.py')",
+  ].join("\n") + "\n");
+
+  const blockPytest13 = join(tmpV13, "block-pytest-13");
+  mkdirSync(blockPytest13, { recursive: true });
+  writeFileSync(join(blockPytest13, "pytest.py"), "raise ImportError('stdlib unittest mode')\n");
+  const stripPip13 = (s) => String(s || "").replace(/^\s*python3 -m pip install .*$/gm, ":");
+
+  const fourPyScripts13 = [
+    { label: "GitHub bundled", script: stripPip13(extractStepScript13(readFileSync(join(REPO, ".github", "workflows", "ci-release.yml"), "utf8"), "Verify Python projects (root / backend)")) },
+    { label: "Gitea bundled", script: stripPip13(extractStepScript13(readFileSync(join(REPO, ".gitea", "workflows", "ci-release.yml"), "utf8"), "Verify Python projects (root / backend)")) },
+    { label: "Generated generic", script: stripPip13(extractStepScript13(renderCiWorkflow({ summary: "Empty", python: [], node: [], go: [], rust: [], dockerfiles: [], composeFile: null, composeFiles: [] }), "Verify Python projects (root / backend)")) },
+    { label: "Generated tailored", script: stripPip13(extractStepScript13(renderCiWorkflow(detectProjectStacks(pyShadowDir), { includeTokenHub: false }), "Run Python lint & tests")) },
+  ];
+  for (const item of fourPyScripts13) {
+    rmSync(join(pyShadowDir, "ran-root.txt"), { force: true });
+    rmSync(join(pyShadowDir, "nested", "ran-nested.txt"), { force: true });
+    rmSync(join(pyShadowDir, "ran-nested.txt"), { force: true });
+    const pyRes = spawnSync("bash", ["-c", item.script], {
+      cwd: pyShadowDir,
+      env: { ...process.env, PYTHONPATH: blockPytest13 },
+      encoding: "utf8",
+    });
+    const ranNested = existsSync(join(pyShadowDir, "ran-nested.txt")) || existsSync(join(pyShadowDir, "nested", "ran-nested.txt"));
+    eq(`V13 P0-02 [${item.label}] root unit_test.py does NOT shadow failing nested/unit_test.py (exit 1 + both ran)`,
+      [pyRes.status, existsSync(join(pyShadowDir, "ran-root.txt")), ranNested], [1, true, true]);
+  }
+
+  // =========================================================================
+  // 3) P0-03 + P2-01: Unlinked secondary ledger rejected on `--from`, AND
+  //    shell `#` comment / `--model default` / `--` option terminator accuracy
+  // =========================================================================
+  const v13ResCfg = join(REPO, ".orca", "_tmp-v13-resume.config.json");
+  writeFileSync(v13ResCfg, JSON.stringify({
+    defaults: { timeoutMs: 5000, hardTimeoutMs: 15000, preflight: { enabled: false } },
+    pipeline: [
+      { id: "coding", title: "Coding", agent: "opencode2", model: "deepseek-v4.1", spec: "Code {out}.", writes: "CHANGES.md" },
+      { id: "code-review", title: "Code Review", agent: "codex", model: "gpt-6.2-sol", crossFamilyWith: ["coding"], reads: ["coding"], verify: { requireVerdict: "PASS" }, spec: "Review {out}.", writes: "REVIEW.md" },
+      { id: "pr-submit", title: "PR Submit", agent: "opencode2", model: "deepseek-v4.1", reads: ["code-review"], spec: "Submit {out}.", writes: "PR.md" },
+    ],
+  }, null, 2));
+  try {
+    const dirBorrow = mkdtempSync(join(tmpdir(), "orca-v13-borrow-"));
+    dirsOfCurrentScenario.push(dirBorrow);
+    mkdirSync(join(dirBorrow, "wt", ".orca", "artifacts"), { recursive: true });
+    mkdirSync(join(dirBorrow, "home"), { recursive: true });
+    const ledHomeBorrow = join(dirBorrow, "ledger-home");
+    writeFileSync(join(dirBorrow, "wt", ".orca", "artifacts", "CHANGES.md"), "# Changes\n\n" + "Code line.\n".repeat(12));
+    writeFileSync(join(dirBorrow, "wt", ".orca", "artifacts", "REVIEW.md"), "# Review\n\n" + "Approved.\n".repeat(12) + "\nVERDICT: PASS\n");
+    // Unrelated valid ledger `run-other-valid` (same repo, same objective, same config!)
+    const ledOther = createRunLedger({
+      runKey: "run-other-valid",
+      repoDir: join(dirBorrow, "wt"),
+      ledgerHome: ledHomeBorrow,
+      objective: "test objective",
+      configFile: "_tmp-v13-resume.config.json",
+    });
+    ledOther.recordIntent({ requestId: "r1", stepId: "coding", title: "Coding", agent: "opencode2", model: "deepseek-v4.1", family: "deepseek", attempt: 1 });
+    ledOther.recordDispatchResult({ requestId: "r1", stepId: "coding", dispatchId: "d1", executedFamilies: ["deepseek"] });
+    ledOther.recordStepSettled({ stepId: "coding", outcome: "succeeded", verifyOk: true, artifactSha256: computeFileSha256(join(dirBorrow, "wt", ".orca", "artifacts", "CHANGES.md")) });
+    ledOther.recordIntent({ requestId: "r2", stepId: "code-review", title: "Code Review", agent: "codex", model: "gpt-6.2-sol", family: "openai", attempt: 1 });
+    ledOther.recordDispatchResult({ requestId: "r2", stepId: "code-review", dispatchId: "d2", executedFamilies: ["openai"] });
+    ledOther.recordStepSettled({ stepId: "code-review", outcome: "succeeded", verifyOk: true, artifactSha256: computeFileSha256(join(dirBorrow, "wt", ".orca", "artifacts", "REVIEW.md")) });
+    // Empty primary ledger `run-primary-empty` with NO `parentRunKey`!
+    createRunLedger({
+      runKey: "run-primary-empty",
+      parentRunKey: null,
+      repoDir: join(dirBorrow, "wt"),
+      ledgerHome: ledHomeBorrow,
+      objective: "test objective",
+      configFile: "_tmp-v13-resume.config.json",
+    });
+    // Tamper `status.js` to list `run-other-valid` in `lineageRunKeys` while primary is `run-primary-empty`
+    writeFileSync(join(dirBorrow, "wt", ".orca", "artifacts", "status.js"), `window.__STATUS=${JSON.stringify({
+      meta: {
+        objective: "test objective",
+        config: "_tmp-v13-resume.config.json",
+        ledgerRunKey: "run-primary-empty",
+        lineageRunKeys: ["run-other-valid", "run-primary-empty"],
+        steps: [{ id: "coding" }, { id: "code-review" }, { id: "pr-submit" }],
+      },
+      overall: "failed",
+      steps: [
+        { id: "coding", status: "succeeded", family: "deepseek", executedFamilies: ["deepseek"] },
+        { id: "code-review", status: "succeeded", family: "openai", executedFamilies: ["openai"] },
+        { id: "pr-submit", status: "pending" },
+      ],
+    })};window.__ON_STATUS&&window.__ON_STATUS();\n`);
+    const rBorrow = await runFlow({
+      name: "v13-unlinked-secondary",
+      reuseDir: dirBorrow,
+      config: "_tmp-v13-resume.config.json",
+      args: ["--from", "pr-submit", "--ledger-home", ledHomeBorrow],
+      stdinText: "n\n",
+      budgetMs: 25000,
+    });
+    eq("V13 P0-03 --from pr-submit REJECTS borrowing review from unlinked secondary ledger in status.lineageRunKeys (exit 1, 0 dispatches)",
+      [rBorrow.code, rBorrow.by("orchestration worker-start").length, /provenance|ledger|cross-family/i.test((rBorrow.err || "") + (rBorrow.out || ""))], [1, 0, true]);
+
+    // Contrast: legitimate 2-hop `--from` chain persists `parentRunKey` in ledger and SUCCEEDS!
+    const rHop1 = await runFlow({
+      name: "v13-hop1",
+      config: "_tmp-v13-resume.config.json",
+      args: ["--only", "coding"],
+      budgetMs: 30000,
+    });
+    const rHop2 = await runFlow({
+      name: "v13-hop2",
+      reuseDir: rHop1.dir,
+      config: "_tmp-v13-resume.config.json",
+      args: ["--from", "code-review", "--only", "code-review"],
+      stdinText: "n\n",
+      budgetMs: 30000,
+    });
+    const rHop3 = await runFlow({
+      name: "v13-hop3",
+      reuseDir: rHop1.dir,
+      config: "_tmp-v13-resume.config.json",
+      args: ["--from", "pr-submit"],
+      stdinText: "n\n",
+      budgetMs: 30000,
+    });
+    eq("V13 P0-03 legitimate 2-hop --from chain traverses ledger-persisted parentRunKey and succeeds",
+      [rHop1.code, rHop2.code, rHop3.code], [0, 0, 0]);
+  } finally {
+    try { rmSync(v13ResCfg, { force: true }); } catch {}
+  }
+
+  // Shell comment, `--model default`, and `--` option terminator accuracy (P0-03 & P2-01)
+  eq("V13 P0-03 unquoted # comment in 'claude # --model gpt-6.2-sol' classifies as anthropic (NOT openai)",
+    [tokenizeShellCommand("claude # --model gpt-6.2-sol").tokens, classifyModelFamily("claude # --model gpt-6.2-sol", null)],
+    [["claude"], "anthropic"]);
+  const builtCommentCmd = buildAgentCommand("claude # --model gpt-6.2-sol", "claude-sonnet-4-5", { isWin: false });
+  ok("V13 P0-03 buildAgentCommand strips trailing # comment so --model and --permission-mode are real argv options",
+    !builtCommentCmd.includes("#") && builtCommentCmd.includes("--model claude-sonnet-4-5") && builtCommentCmd.includes("--permission-mode bypassPermissions"));
+
+  const expDefaultSpec = resolveEffectiveLaunchSpec("agy --model default", "gpt-6.2-sol", "high");
+  eq("V13 P0-03/P2-01 'agy --model default' with step model gpt-6.2-sol classifies as unknown and records effectiveModel='default'",
+    [classifyModelFamily("agy --model default", "gpt-6.2-sol"), expDefaultSpec.passedModel, expDefaultSpec.effectiveModel],
+    ["unknown", null, "default"]);
+  const builtDefaultCmd = buildAgentCommand("agy --model default", "gpt-6.2-sol", { effort: "high", isWin: false });
+  ok("V13 P2-01 buildAgentCommand keeps '--model default' without injecting gpt-6.2-sol",
+    builtDefaultCmd.includes("--model default") && !builtDefaultCmd.includes("gpt-6.2-sol"));
+
+  const builtDashDash = buildAgentCommand("agy -- positional_arg", "gpt-6.2-sol", { effort: "high", worktreePath: "/tmp/wt", isWin: false });
+  const parsedBuiltDashDash = parseAgentCommandSpec(builtDashDash);
+  eq("V13 P2-01 buildAgentCommand inserts --model/--effort BEFORE '--' so real argv parses them as options",
+    [parsedBuiltDashDash.embeddedModel, parsedBuiltDashDash.embeddedEffort, builtDashDash.endsWith("-- positional_arg")],
+    ["gpt-6.2-sol", "high", true]);
+  eq("V13 P0-03/P2-01 tokens after '--' ('agy -- --model claude-sonnet-4-5') are NOT treated as model flags",
+    [parseAgentCommandSpec("agy -- --model claude-sonnet-4-5").embeddedModel, classifyModelFamily("agy -- --model claude-sonnet-4-5", null)],
+    [null, "unknown"]);
+
+  // =========================================================================
+  // 4) P1-02: Expired member passed to nudge fires ZERO RPCs
+  // =========================================================================
+  nudgeCalls.length = 0;
+  const expiredMember = {
+    step: { id: "s-exp", title: "Expired", writes: "EXP.md" },
+    startMode: "cold",
+    terminal: null,
+    dispatchId: "disp-exp-1",
+    deadlineAt: Date.now() - 50,
+    lastBusy: 0,
+    nudge: { left: 2, count: 0, sentAt: 0, phase: null },
+    health: { lastBusyMs: 0 },
+  };
+  nudgeCtrl.maybeNudgeMidRun(expiredMember, { preview: "Working...", heartbeatMs: 0 });
+  nudgeCtrl.holdForNudge(expiredMember, "succeeded", null);
+  nudgeCtrl.nudgePoll(expiredMember);
+  eq("V13 P1-02 expired member passed to nudge fires ZERO worker-show or terminal show RPCs",
+    nudgeCalls.length, 0);
+
+  // =========================================================================
+  // 5) P1-06: Multiline CommonMark shortcut reference link `[Issue #42]` -> `null`
+  // =========================================================================
+  const multilineShortcutMd = [
+    "- [ ] Verify upstream compatibility [Issue #42]",
+    "",
+    "[Issue #42]:",
+    "  https://github.com/other/repo/issues/42",
+  ].join("\n");
+  const mlTasks = parseBacklogTasks(multilineShortcutMd, { currentHost: "github.com", currentRepo: "shown1985/sxcj" });
+  eq("V13 P1-06 multiline CommonMark shortcut reference [Issue #42] to external repo returns null (NEVER 42)",
+    [mlTasks.length, mlTasks[0]?.number, extractExplicitLocalIssueNumber(multilineShortcutMd, { currentHost: "github.com", currentRepo: "shown1985/sxcj" })],
+    [1, null, null]);
+
+  // =========================================================================
+  // 6) P1-07: Self-hosted `tea` URL validation binds exact origin (scheme+host+port)
+  //    and confirmed basePath (rejecting arbitrary `/other/project/local/repo/issues/42`!)
+  // =========================================================================
+  const teaSubpathReject = createIssueViaCli({
+    provider: "tea",
+    bin: "tea",
+    repoDir: tmpV13,
+    host: "git.example.test",
+    origin: "https://git.example.test",
+    basePath: "",
+    repo: "local/repo",
+    teaLogin: "corp",
+    title: "Test",
+    body: "Body",
+    execFn: () => ({ ok: true, status: 0, stdout: "https://git.example.test/other/project/local/repo/issues/42\n", stderr: "", timedOut: false }),
+  });
+  eq("V13 P1-07 self-hosted tea REJECTS unconfirmed subpath prefix https://git.example.test/other/project/local/repo/issues/42",
+    [teaSubpathReject.ok, teaSubpathReject.number], [false, null]);
+
+  const teaWrongPortReject = createIssueViaCli({
+    provider: "tea",
+    bin: "tea",
+    repoDir: tmpV13,
+    host: "git.example.test",
+    origin: "https://git.example.test:8443",
+    basePath: "/forge",
+    repo: "local/repo",
+    teaLogin: "corp",
+    title: "Test",
+    body: "Body",
+    execFn: () => ({ ok: true, status: 0, stdout: "https://git.example.test:9443/forge/local/repo/issues/42\n", stderr: "", timedOut: false }),
+  });
+  eq("V13 P1-07 self-hosted tea REJECTS URL on mismatched port (:9443 vs :8443)",
+    [teaWrongPortReject.ok, teaWrongPortReject.number], [false, null]);
+
+  const teaExactAccept = createIssueViaCli({
+    provider: "tea",
+    bin: "tea",
+    repoDir: tmpV13,
+    host: "git.example.test",
+    origin: "https://git.example.test:8443",
+    basePath: "/forge",
+    repo: "local/repo",
+    teaLogin: "corp",
+    title: "Test",
+    body: "Body",
+    execFn: () => ({ ok: true, status: 0, stdout: "https://git.example.test:8443/forge/local/repo/issues/42\n", stderr: "", timedOut: false }),
+  });
+  eq("V13 P1-07 self-hosted tea ACCEPTS URL matching exact confirmed origin + basePath + repo",
+    [teaExactAccept.ok, teaExactAccept.number], [true, 42]);
+
+  const parsedSubpathRemote = parseRemoteHost("https://git.example.test:8443/forge/local/repo.git");
+  const matchedTeaSubpath = matchTeaLoginForHost(
+    "| corp | https://git.example.test:8443/forge | bot | true |\n",
+    "git.example.test",
+    "https://git.example.test:8443"
+  );
+  eq("V13 P1-07 parseRemoteHost & matchTeaLoginForHost extract exact origin + basePath",
+    [parsedSubpathRemote?.origin, parsedSubpathRemote?.basePath, parsedSubpathRemote?.repoSlug, matchedTeaSubpath?.basePath],
+    ["https://git.example.test:8443", "/forge", "local/repo", "/forge"]);
+
+  // =========================================================================
+  // 7) P1-11: CD Health Probe rejects non-zero `docker inspect` AND rejects
+  //    newer `inspect` reporting `unhealthy` even when `compose ps` said `healthy`!
+  // =========================================================================
+  const cdDir13 = join(tmpV13, "cd-13");
+  mkdirSync(cdDir13, { recursive: true });
+  writeFileSync(join(cdDir13, "docker-compose.prod.yml"), "services:\n  api:\n    image: alpine\n");
+  const cdYml13 = renderSelfHostedCdWorkflow(detectProjectStacks(cdDir13), { deployBranch: "main", serviceName: "api", healthUrl: "http://127.0.0.1:8000/health" });
+  const cdHealth13 = extractStepScript13(cdYml13, "Post-deploy automated health check (PII-safe)");
+  const bin13 = join(tmpV13, "bin-13");
+  mkdirSync(bin13, { recursive: true });
+  const rev13 = "e".repeat(40);
+  writeFileSync(join(bin13, "docker"), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a.includes("config") && a.includes("--services")) { console.log("api"); process.exit(0); }
+if (a.includes("ps") && a.includes("--format")) { process.stdout.write(process.env.MOCK_PS_JSON || "[]"); process.exit(0); }
+if (a.includes("inspect")) {
+  const rc = Number(process.env.MOCK_INSPECT_RC || 0);
+  if (rc !== 0) { process.stderr.write("inspect error\\n"); process.exit(rc); }
+  process.stdout.write(process.env.MOCK_INSPECT_JSON || "{}");
+  process.exit(0);
+}
+process.exit(0);
+`, { mode: 0o755 });
+  writeFileSync(join(bin13, "curl"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const a = process.argv.slice(2);
+const oi = a.indexOf("-o");
+if (oi >= 0 && a[oi + 1]) fs.writeFileSync(a[oi + 1], "ok");
+process.stdout.write("200");
+process.exit(0);
+`, { mode: 0o755 });
+
+  const runH13 = (extra) => spawnSync("bash", ["-c", cdHealth13], {
+    cwd: cdDir13,
+    env: {
+      ...process.env,
+      PATH: `${bin13}:${process.env.PATH}`,
+      COMPOSE_FILE: "docker-compose.prod.yml",
+      SERVICE_NAME: "api",
+      ORCA_DEPLOY_SHA: rev13,
+      DEFAULT_HEALTHCHECK_URL: "http://127.0.0.1:8000/health",
+      HEALTHCHECK_URL: "",
+      DEPLOY_ONESHOT_SERVICES: "",
+      HEALTHCHECK_RETRIES: "1",
+      HEALTHCHECK_INTERVAL: "0",
+      ...extra,
+    },
+    encoding: "utf8",
+  });
+
+  // (a) Compose returns valid revision & empty Health, HTTP 200, `docker inspect` exits 42 -> MUST FAIL (non-zero)!
+  ok("V13 P1-11 CD health FAILS when docker inspect exits 42 even if compose ps has valid revision and HTTP 200",
+    runH13({
+      MOCK_PS_JSON: JSON.stringify([{ ID: "c1", Service: "api", State: "running", Health: "", Labels: `io.orca-pod.deploy-sha=${rev13}` }]),
+      MOCK_INSPECT_RC: "42",
+    }).status !== 0);
+
+  // (b) Compose ps says `Health: "healthy"`, newer `docker inspect` says `State.Health.Status: "unhealthy"` -> MUST FAIL (exit 1)!
+  eq("V13 P1-11 CD health FAILS when newer docker inspect reports unhealthy despite stale compose ps healthy",
+    runH13({
+      MOCK_PS_JSON: JSON.stringify([{ ID: "c1", Service: "api", State: "running", Health: "healthy", Labels: `io.orca-pod.deploy-sha=${rev13}` }]),
+      MOCK_INSPECT_JSON: JSON.stringify({
+        Config: { Healthcheck: { Test: ["CMD-SHELL", "curl -f http://localhost/health"] }, Labels: { "io.orca-pod.deploy-sha": rev13 } },
+        State: { Status: "running", Health: { Status: "unhealthy" } },
+      }),
+    }).status, 1);
 });
 
 // ---------------------------------------------------------------------------

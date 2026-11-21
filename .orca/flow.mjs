@@ -450,7 +450,7 @@ LEDGER.setOrcaRunId(runId);
 statusMgr.initStatus();
 const resumedLedgerRunKey = statusMgr.getResumedLedgerRunKey();
 const resumedLineageId = statusMgr.getResumedLineageId();
-const resumedLineageRunKeys = statusMgr.getResumedLineageRunKeys();
+let verifiedLineageRunKeys = [];
 if ((opt.from || opt.only) && resumedLedgerRunKey) {
   try {
     const canonDir = (p) => { try { return realpathSync(p); } catch { return resolve(p); } };
@@ -463,15 +463,24 @@ if ((opt.from || opt.only) && resumedLedgerRunKey) {
       s.configFile && CONFIG_FILE && s.configFile === CONFIG_FILE &&
       (!s.worktreeDir || canonDir(s.worktreeDir) === resolvedWt)
     );
-    // P0-03: Primary `resumedLedgerRunKey` MUST exist and match objective + configFile + worktreeDir!
+    // P0-03: Primary `resumedLedgerRunKey` MUST exist and match objective + configFile + worktreeDir,
+    // and ancestor keys MUST ONLY be traversed via each ledger record's own `parentRunKey` link
+    // (NEVER trusting arbitrary secondary `lineageRunKeys` injected into `status.js`!).
     const primarySummary = byKey.get(resumedLedgerRunKey);
     if (isMatchingRunSummary(primarySummary)) {
+      const chainNewestFirst = [];
+      const visited = new Set();
+      let cur = primarySummary;
+      while (cur && !visited.has(cur.runKey) && isMatchingRunSummary(cur)) {
+        visited.add(cur.runKey);
+        chainNewestFirst.push(cur);
+        const pk = typeof cur.parentRunKey === "string" && cur.parentRunKey.trim() ? cur.parentRunKey.trim() : null;
+        cur = pk ? byKey.get(pk) : null;
+      }
+      const chainOldestFirst = chainNewestFirst.reverse();
       const mergedSteps = {};
-      const verifiedChainKeys = [];
-      for (const rk of resumedLineageRunKeys) {
-        const s = byKey.get(rk);
-        if (!isMatchingRunSummary(s)) continue;
-        verifiedChainKeys.push(rk);
+      verifiedLineageRunKeys = chainOldestFirst.map((s) => s.runKey);
+      for (const s of chainOldestFirst) {
         for (const [sid, stepRec] of Object.entries(s.steps || {})) {
           mergedSteps[sid] = stepRec;
           if (stepRec?.outcome === "succeeded") {
@@ -479,18 +488,19 @@ if ((opt.from || opt.only) && resumedLedgerRunKey) {
           }
         }
       }
+      LEDGER.setParentRunKey?.(resumedLedgerRunKey);
       BOUND_PREV_LEDGER = {
         runKey: resumedLedgerRunKey,
         configFile: CONFIG_FILE,
-        lineageId: resumedLineageId || verifiedChainKeys[0] || resumedLedgerRunKey,
-        lineageRunKeys: verifiedChainKeys,
+        lineageId: verifiedLineageRunKeys[0] || resumedLedgerRunKey,
+        lineageRunKeys: verifiedLineageRunKeys,
         steps: mergedSteps,
       };
     }
   } catch {}
 }
-const activeLineageId = resumedLineageId || LEDGER.runKey;
-const activeLineageRunKeys = [...new Set([...resumedLineageRunKeys, LEDGER.runKey])];
+const activeLineageId = (BOUND_PREV_LEDGER ? BOUND_PREV_LEDGER.lineageId : resumedLineageId) || LEDGER.runKey;
+const activeLineageRunKeys = [...new Set([...verifiedLineageRunKeys, LEDGER.runKey])];
 statusMgr.setLedgerRunKey(LEDGER.runKey, { lineageId: activeLineageId, lineageRunKeys: activeLineageRunKeys });
 statusMgr.writeStatus();
 
@@ -513,7 +523,7 @@ if (ISSUE_CFG.mode === false) {
     objective,
     epicIssue: ISSUE_CFG.epicIssue,
     runScopeId: opt.from ? resumedLedgerRunKey : LEDGER.runKey,
-    priorRunScopeIds: opt.from ? resumedLineageRunKeys : [],
+    priorRunScopeIds: opt.from ? verifiedLineageRunKeys : [],
     lineageId: opt.from ? resumedLineageId : activeLineageId,
     requireRunScope: Boolean(opt.from),
   });

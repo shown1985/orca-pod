@@ -211,6 +211,7 @@ export function createRunLedger({
   ledgerHome = null,
   objective = "",
   configFile = "",
+  parentRunKey = null,
   targetBranch = "dev",
   protectedBranches = ["main", "master"],
   dedupKey = null,
@@ -236,6 +237,7 @@ export function createRunLedger({
   const summary = {
     schemaVersion: 1,
     runKey: safeKey,
+    parentRunKey: parentRunKey || null,
     orcaRunId: null,
     repoRoot,
     worktreeDir: safeRealpath(repoDir),
@@ -317,6 +319,12 @@ export function createRunLedger({
     setOrcaRunId(orcaRunId) {
       summary.orcaRunId = orcaRunId;
       append("run_bound", { orcaRunId });
+    },
+
+    setParentRunKey(nextParentKey) {
+      summary.parentRunKey = nextParentKey || null;
+      append("lineage", { parentRunKey: summary.parentRunKey }, { critical: false });
+      persistSummary(false);
     },
 
     updateIntegrationHead(gitDir) {

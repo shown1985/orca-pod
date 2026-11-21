@@ -9,7 +9,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import readline from "node:readline";
 import { WATCHDOG_PARKED_PROMPTS, detectGatewayDisconnect, detectPromptBlocked } from "../watchdog.mjs";
-import { parseAgentCommandSpec } from "../preflight.mjs";
+import { parseAgentCommandSpec, stripUnquotedShellComment } from "../preflight.mjs";
 import { sanitizeText } from "./sanitize.mjs";
 
 export const IS_WIN = process.platform === "win32";
@@ -84,35 +84,77 @@ export function buildAgySettingsArg(trustedDirs, { isWin = IS_WIN, settingsDir =
   return `--settings '${json.replace(/'/g, "'\\''")}'`;
 }
 
+/**
+ * Insert synthesized CLI flags BEFORE any unquoted `--` end-of-options terminator
+ * (after stripping any unquoted `#` trailing comment), so injected flags NEVER land
+ * inside a comment or after `--` as positional arguments!
+ */
+function appendFlagsBeforeTerminator(cmdStr, extraFlags) {
+  if (!extraFlags.length) return cmdStr;
+  const flagBlock = extraFlags.join(" ");
+  let quote = null;
+  let tokenStart = -1;
+  for (let i = 0; i <= cmdStr.length; i++) {
+    const ch = i < cmdStr.length ? cmdStr[i] : " ";
+    if (quote === "'") { if (ch === "'") quote = null; continue; }
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      else if (ch === "\\" && i + 1 < cmdStr.length) i++;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (tokenStart >= 0) {
+        const tok = cmdStr.slice(tokenStart, i);
+        if (tok === "--") {
+          const prefix = cmdStr.slice(0, tokenStart).trimEnd();
+          const suffix = cmdStr.slice(tokenStart);
+          return `${prefix} ${flagBlock} ${suffix}`;
+        }
+        tokenStart = -1;
+      }
+      continue;
+    }
+    if (tokenStart < 0) tokenStart = i;
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "\\" && i + 1 < cmdStr.length) i++;
+  }
+  return `${cmdStr} ${flagBlock}`;
+}
+
 export function buildAgentCommand(agent, model = null, { autoRun = true, effort = null, worktreePath = null, extraTrustedDirs = [], settingsDir = null, warn = () => {}, isWin = IS_WIN } = {}) {
-  let cmd = String(agent || "").trim();
+  let cmd = stripUnquotedShellComment(String(agent || "").trim());
   const parsed = parseAgentCommandSpec(cmd);
   const baseLower = parsed.parseable ? parsed.lowerBase : "";
   const isKiro = parsed.parseable ? parsed.isKiro : isKiroCmd(cmd);
   const isAgy = parsed.parseable ? (baseLower === "agy" || baseLower === "antigravity") : isAgyCmd(cmd);
   const hasModel = parsed.parseable ? parsed.hasModelFlag : MODEL_FLAG_RE.test(cmd);
   const hasEffort = parsed.parseable ? parsed.hasEffortFlag : EFFORT_FLAG_RE.test(cmd);
+  const normModel = (model != null && String(model).trim() && String(model).trim().toLowerCase() !== "default")
+    ? String(model).trim()
+    : null;
 
-  if (model && !hasModel && !isKiro) cmd += ` --model ${model}`;
-  else if (model && isKiro && !hasModel) warn(`step model "${model}" ignored: kiro-cli has no model selection.`);
+  const extraFlags = [];
+  if (normModel && !hasModel && !isKiro) extraFlags.push(`--model ${normModel}`);
+  else if (normModel && isKiro && !hasModel) warn(`step model "${normModel}" ignored: kiro-cli has no model selection.`);
 
   if (isAgy) {
-    if (effort && !hasEffort) cmd += ` --effort ${effort}`;
+    if (effort && !hasEffort) extraFlags.push(`--effort ${effort}`);
     if (autoRun && !(parsed.parseable ? parsed.hasDangerouslySkipFlag : cmd.includes("--dangerously-skip-permissions")) && !(parsed.parseable ? parsed.hasModeFlag : /(^|\s)--mode(\s|=|$)/.test(cmd))) {
-      cmd += " --dangerously-skip-permissions";
+      extraFlags.push("--dangerously-skip-permissions");
     }
     const trustDirs = [worktreePath, ...(extraTrustedDirs || [])].filter(Boolean);
     if (trustDirs.length && !(parsed.parseable ? parsed.hasSettingsFlag : cmd.includes("--settings"))) {
       const settingsArg = buildAgySettingsArg(trustDirs, { isWin, settingsDir });
-      if (settingsArg) cmd += ` ${settingsArg}`;
+      if (settingsArg) extraFlags.push(settingsArg);
     }
-    return cmd;
+    return appendFlagsBeforeTerminator(cmd, extraFlags);
   }
 
   const isClaude = parsed.parseable ? baseLower === "claude" : (cmd === "claude" || cmd.startsWith("claude "));
-  if (!isClaude) return cmd;
+  if (!isClaude) return appendFlagsBeforeTerminator(cmd, extraFlags);
   if (autoRun && !(parsed.parseable ? parsed.hasPermissionModeFlag : cmd.includes("--permission-mode")) && !(parsed.parseable ? parsed.hasDangerouslySkipFlag : cmd.includes("--dangerously-skip-permissions")))
-    cmd += " --permission-mode bypassPermissions";
+    extraFlags.push("--permission-mode bypassPermissions");
+  cmd = appendFlagsBeforeTerminator(cmd, extraFlags);
   if (!autoRun) return cmd;
   return isWin ? `cmd /c "set CLAUDE_AFK_TIMEOUT_MS=60000&& ${cmd}"` : `env CLAUDE_AFK_TIMEOUT_MS=60000 ${cmd}`;
 }
@@ -180,54 +222,102 @@ export function outcomeOf(done) {
   return o || null;
 }
 
+const CLEANUP_RPC_TIMEOUT_MS = 3000;
+const CONFIRMED_TERMINAL_CLOSE_STATES = new Set(["closed", "already_closed", "exited", "terminated", "stopped", "gone", "not_found", "removed"]);
+
+function extractReceiptTerminalHandle(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  for (const k of ["handle", "terminalHandle", "terminal_handle", "id", "terminalId", "terminal_id"]) {
+    if (typeof obj[k] === "string" && obj[k].trim()) return obj[k].trim();
+  }
+  if (typeof obj.terminal === "string" && obj.terminal.trim()) return obj.terminal.trim();
+  if (obj.terminal && typeof obj.terminal === "object") {
+    for (const k of ["handle", "terminalHandle", "terminal_handle", "id", "terminalId", "terminal_id"]) {
+      if (typeof obj.terminal[k] === "string" && obj.terminal[k].trim()) return obj.terminal[k].trim();
+    }
+  }
+  return null;
+}
+
 /**
  * P0-01: Positively close a caller-created manual terminal AND confirm via `terminal show`
- * that the terminal session is actually gone/closed (never assuming bare exit-0 proves closure!).
+ * that the exact `termHandle` session is closed/gone.
+ *   - NEVER accepts empty `{}` receipts on `terminal close` or `terminal show`!
+ *   - NEVER accepts a receipt whose returned handle/id differs from `termHandle`!
  */
 export function verifyManualTerminalClosed(orcaFn, termHandle) {
   if (!termHandle || !String(termHandle).trim()) {
     return { ok: false, reason: "missing manual terminal handle for close verification" };
   }
-  const cl = orcaFn(["terminal", "close", "--terminal", termHandle], { allowPostDeadlineCleanup: true });
+  const target = String(termHandle).trim();
+  const cl = orcaFn(["terminal", "close", "--terminal", target], { allowPostDeadlineCleanup: true, timeoutMs: CLEANUP_RPC_TIMEOUT_MS });
   const clJson = res(cl.json);
+  const clHandle = extractReceiptTerminalHandle(clJson);
   const clAction = String(pick(clJson, ["status", "action", "state"]) || "").trim().toLowerCase();
-  if (!cl.ok || clAction === "kept_open" || clAction === "retained" || clAction === "failed") {
+  if (clHandle && clHandle !== target) {
     return {
       ok: false,
-      reason: `terminal close (${termHandle}) did not confirm: ${sanitizeText(cl.stderr || cl.raw || clAction || "unconfirmed", { maxLen: 200 })}`,
+      reason: `terminal close handle mismatch (got "${clHandle}", expected "${target}")`,
     };
   }
-  const checkRes = orcaFn(["terminal", "show", "--terminal", termHandle], { allowPostDeadlineCleanup: true });
+  const closeReceiptPositive = Boolean(
+    cl.ok &&
+    cl.json &&
+    (clJson?.closed === true || CONFIRMED_TERMINAL_CLOSE_STATES.has(clAction))
+  );
+  if (!closeReceiptPositive) {
+    return {
+      ok: false,
+      reason: `terminal close (${target}) lacked positive close confirmation (status=${clAction || "empty"}: ${sanitizeText(cl.stderr || cl.raw || "unconfirmed", { maxLen: 200 })})`,
+    };
+  }
+
+  const checkRes = orcaFn(["terminal", "show", "--terminal", target], { allowPostDeadlineCleanup: true, timeoutMs: CLEANUP_RPC_TIMEOUT_MS });
   if (checkRes.timedOut) {
-    return { ok: false, reason: `terminal show (${termHandle}) timed out while verifying manual terminal closure` };
+    return { ok: false, reason: `terminal show (${target}) timed out while verifying manual terminal closure` };
   }
   if (!checkRes.ok) {
+    const errJson = res(checkRes.json);
+    const errHandle = extractReceiptTerminalHandle(errJson);
+    if (errHandle && errHandle !== target) {
+      return { ok: false, reason: `terminal show error handle mismatch (got "${errHandle}", expected "${target}")` };
+    }
     const errTxt = `${checkRes.stderr || ""} ${checkRes.raw || ""}`;
     if (/not[\s_-]*found|unknown[\s_-]*terminal|no[\s_-]*such[\s_-]*terminal|closed|gone|does not exist|invalid terminal/i.test(errTxt)) {
       return { ok: true, reason: null };
     }
     return {
       ok: false,
-      reason: `terminal show (${termHandle}) failed without not-found confirmation: ${sanitizeText(errTxt || "unknown error", { maxLen: 180 })}`,
+      reason: `terminal show (${target}) failed without not-found confirmation: ${sanitizeText(errTxt || "unknown error", { maxLen: 180 })}`,
     };
   }
-  const termObj = pick(res(checkRes.json), ["terminal"]);
-  if (termObj == null) return { ok: true, reason: null };
-  if (typeof termObj === "object") {
-    const tState = String(pick(termObj, ["status", "state"]) || "").trim().toLowerCase();
-    if (termObj.closed === true || /^(closed|exited|terminated|stopped|gone|not_found)$/.test(tState)) {
-      return { ok: true, reason: null };
-    }
-    const keys = Object.keys(termObj);
-    if (keys.length === 0) {
-      return { ok: true, reason: null };
-    }
+
+  const checkJson = res(checkRes.json);
+  const termObj = pick(checkJson, ["terminal"]);
+  if (!termObj || typeof termObj !== "object" || Array.isArray(termObj)) {
+    return { ok: false, reason: `terminal show (${target}) returned empty/missing terminal record instead of explicit closed/not_found confirmation` };
+  }
+  const shownHandle = extractReceiptTerminalHandle(termObj) || extractReceiptTerminalHandle(checkJson);
+  if (shownHandle && shownHandle !== target) {
     return {
       ok: false,
-      reason: `terminal (${termHandle}) still appears live after terminal close (state=${tState || "active"})`,
+      reason: `terminal show handle mismatch (got "${shownHandle}", expected "${target}")`,
     };
   }
-  return { ok: false, reason: `could not confirm manual terminal (${termHandle}) closure` };
+  const tState = String(pick(termObj, ["status", "state"]) || "").trim().toLowerCase();
+  if ((termObj.closed === true || CONFIRMED_TERMINAL_CLOSE_STATES.has(tState)) && (shownHandle === target || clHandle === target)) {
+    return { ok: true, reason: null };
+  }
+  if (termObj.closed === true || CONFIRMED_TERMINAL_CLOSE_STATES.has(tState)) {
+    return {
+      ok: false,
+      reason: `terminal close/show for "${target}" lacked explicit handle attribution in receipt`,
+    };
+  }
+  return {
+    ok: false,
+    reason: `terminal (${target}) still appears live or unconfirmed after terminal close (state=${tState || "empty"})`,
+  };
 }
 
 /**
@@ -418,7 +508,7 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       };
     }
     const effTimeout = allowPostDeadlineCleanup
-      ? timeoutMs
+      ? Math.min(timeoutMs ?? CLEANUP_RPC_TIMEOUT_MS, CLEANUP_RPC_TIMEOUT_MS)
       : clampTimeoutToDeadline(deadlineAt, timeoutMs);
     if (!allowPostDeadlineCleanup && effTimeout === 0) {
       return {
@@ -637,10 +727,15 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     const effAgent = launchOpts.agentOverride ?? agentOf(step);
     const reqModel = launchOpts.modelOverride !== undefined ? launchOpts.modelOverride : modelOf(step);
     const reqEffort = launchOpts.effortOverride !== undefined ? launchOpts.effortOverride : (step.effort || null);
-    const parsedCmd = parseAgentCommandSpec(effAgent);
-    // P2-01 & P0-03: Actual warm argv preserves any embedded `--model`/`--effort` inside `effAgent`!
-    const effectivePassedModel = parsedCmd.isKiro ? null : (parsedCmd.embeddedModel || reqModel || null);
-    const effectivePassedEffort = parsedCmd.embeddedEffort || (isAgyCmd(effAgent) ? (reqEffort || null) : null);
+    const effWtPath = resolveEffectiveWtPath(wtSelector, launchOpts.worktreePath || null);
+    // P0-03 & P2-01: Build the EXACT final command string first and parse its real shell `argv`
+    // so comments, `--`, and `--model default` never diverge between launch and ledger!
+    const previewBuiltCmd = agentCommand(effAgent, reqModel, { effort: reqEffort, worktreePath: effWtPath });
+    const parsedFinal = parseAgentCommandSpec(previewBuiltCmd);
+    const effectivePassedModel = (!parsedFinal.parseable || parsedFinal.isKiro)
+      ? null
+      : (parsedFinal.embeddedModel || null);
+    const effectivePassedEffort = parsedFinal.parseable ? (parsedFinal.embeddedEffort || null) : null;
     const deadlineAt = launchOpts.deadlineAt ?? null;
     const manualReqId = `start-${process.pid}-${++startReqSeq}`;
 
@@ -719,6 +814,7 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     }
 
     const d = orca(["orchestration", "dispatch", "--task", taskId, "--to", term, "--run", runId], {
+      deadlineAt,
       timeoutMs: clampTimeoutToDeadline(deadlineAt),
     });
     const dr = res(d.json);
@@ -747,6 +843,7 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     }
 
     const p = orca(["orchestration", "dispatch", "--task", taskId, "--to", term, "--run", runId, "--dry-run", "--return-preamble"], {
+      deadlineAt,
       timeoutMs: clampTimeoutToDeadline(deadlineAt),
     });
     const preamble = pick(res(p.json), ["preamble"]);
@@ -759,6 +856,7 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     }
 
     const s = orca(["terminal", "send", "--terminal", term, "--text", preamble.split("ctx_dryrun").join(dispatchId), "--enter"], {
+      deadlineAt,
       timeoutMs: clampTimeoutToDeadline(deadlineAt),
     });
     if (!s.ok) {
@@ -785,10 +883,10 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
         error: "reached step deadline during manual prompt delivery",
       };
     }
-    orca(["terminal", "send", "--terminal", term, "--text", "", "--enter"], { timeoutMs: clampTimeoutToDeadline(deadlineAt) });
+    orca(["terminal", "send", "--terminal", term, "--text", "", "--enter"], { deadlineAt, timeoutMs: clampTimeoutToDeadline(deadlineAt) });
     const START_GRACE_MS = cfg.defaults?.startGraceMs ?? 90000;
     const SEND_ATTEMPTS = cfg.defaults?.sendAttempts ?? 3;
-    const previewOf = (h) => pick(pick(res(orca(["terminal", "show", "--terminal", h], { timeoutMs: clampTimeoutToDeadline(deadlineAt) }).json), ["terminal"]) || {}, ["preview"]) ?? null;
+    const previewOf = (h) => pick(pick(res(orca(["terminal", "show", "--terminal", h], { deadlineAt, timeoutMs: clampTimeoutToDeadline(deadlineAt) }).json), ["terminal"]) || {}, ["preview"]) ?? null;
     const before = previewOf(term);
     for (let attempt = 1; attempt <= SEND_ATTEMPTS; attempt++) {
       const graceCap = (deadlineAt != null && Number.isFinite(deadlineAt))
@@ -817,6 +915,7 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
         if (pv == null || before == null || pv !== before) {
           return {
             ok: true,
+            startMode: "manual",
             dispatchId,
             terminal: term,
             effectiveAgent: effAgent,
@@ -845,8 +944,8 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
         const nudge = attempt === 1;
         warn(`no sign the '${step.title}' prompt was consumed; ${nudge ? "nudging with Enter" : "re-sending"} (${attempt + 1}/${SEND_ATTEMPTS})`);
         const s2 = nudge
-          ? orca(["terminal", "send", "--terminal", term, "--text", "", "--enter"], { timeoutMs: clampTimeoutToDeadline(deadlineAt) })
-          : orca(["terminal", "send", "--terminal", term, "--text", preamble.split("ctx_dryrun").join(dispatchId), "--enter"], { timeoutMs: clampTimeoutToDeadline(deadlineAt) });
+          ? orca(["terminal", "send", "--terminal", term, "--text", "", "--enter"], { deadlineAt, timeoutMs: clampTimeoutToDeadline(deadlineAt) })
+          : orca(["terminal", "send", "--terminal", term, "--text", preamble.split("ctx_dryrun").join(dispatchId), "--enter"], { deadlineAt, timeoutMs: clampTimeoutToDeadline(deadlineAt) });
         if (!s2.ok) { warn(`re-send '${step.title}' failed: ${sanitizeText(s2.stderr || s2.raw, { maxLen: 240 })}`); break; }
       }
     }
@@ -866,9 +965,16 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     const orcaAgent = normalizeOrcaWorkerAgent(effAgent);
     const reqModel = launchOpts.modelOverride !== undefined ? launchOpts.modelOverride : modelOf(step);
     const reqEffort = launchOpts.effortOverride !== undefined ? launchOpts.effortOverride : (step.effort || null);
-    // P0-03 & P2-01: Honor embedded `--model`/`--effort` in `effAgent` consistently on coldStart too!
-    const model = parsedCmd.isKiro ? null : (parsedCmd.embeddedModel || reqModel || null);
-    const effort = parsedCmd.embeddedEffort || reqEffort || null;
+    const normReqModel = (reqModel != null && String(reqModel).trim() && String(reqModel).trim().toLowerCase() !== "default")
+      ? String(reqModel).trim()
+      : null;
+    // P0-03 & P2-01: Honor embedded `--model`/`--effort` in `effAgent` consistently on coldStart;
+    // if `effAgent` explicitly specified `--model default`, do NOT override with `reqModel`!
+    const model = (!parsedCmd.parseable || parsedCmd.isKiro || parsedCmd.explicitDefaultModel)
+      ? null
+      : (parsedCmd.embeddedModel || normReqModel || null);
+    const recordedColdModel = parsedCmd.explicitDefaultModel ? "default" : (model || null);
+    const effort = parsedCmd.parseable ? (parsedCmd.embeddedEffort || reqEffort || null) : (reqEffort || null);
     const effWtPath = resolveEffectiveWtPath(wtSelector, launchOpts.worktreePath || null);
     const deadlineAt = launchOpts.deadlineAt ?? null;
     const attempts = [...(launchOpts.priorAttempts || [])];
@@ -979,15 +1085,16 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
             failedStage: "missing_dispatch_id",
           };
         }
-        attempts.push({ attempt: attempts.length + 1, requestId: startReqId, mode: "cold", agent: orcaAgent, model: model || null, effort: passedEffort, dispatchId, state: state || "ready", ok: true });
+        attempts.push({ attempt: attempts.length + 1, requestId: startReqId, mode: "cold", agent: orcaAgent, model: recordedColdModel, effort: passedEffort, dispatchId, state: state || "ready", ok: true });
         return {
           ok: true,
+          startMode: "cold",
           dispatchId,
           terminal: null,
           dispatchState: state || null,
           receiptTurnStart,
           effectiveAgent: orcaAgent,
-          effectiveModel: model || null,
+          effectiveModel: recordedColdModel,
           effectiveEffort: passedEffort,
           lastClearedInfo,
           attempts,
@@ -1062,22 +1169,27 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
           retryOf = reconDispId;
         } else {
           // 2) No dispatchId in receipt or dispatch-show: ONLY classify as `ambiguous: false` when
-          //    structured Orca error code/stage is strictly a pre-launch validation rejection!
-          //    Any `agent_readiness`, network/gateway, transport, or unknown error stays `ambiguous: true`!
+          //    structured Orca error code/stage is strictly a pre-launch validation rejection AND
+          //    NO conflicting runtime/post-start signal (`failedStage`, returned handle, `gwErr`) is present!
           const structuredCode = String(
             pick(result, ["code", "errorCode", "error_code"]) ||
             pick(r.json || {}, ["code", "errorCode", "error_code"]) ||
             ""
           ).trim().toLowerCase();
+          const retTermHandle = extractReceiptTerminalHandle(result);
+          const hasConflictingStage = Boolean(normFailedStage && !STRICT_PRE_LAUNCH_REJECTION_CODES.has(normFailedStage));
           const provenPreSpawnFailure = Boolean(
             r.json &&
             !r.timedOut &&
             !r.ok &&
             state !== "outcome_unknown" &&
             !hasResiduals &&
+            !retTermHandle &&
+            !gwErr &&
+            !hasConflictingStage &&
             (
               STRICT_PRE_LAUNCH_REJECTION_CODES.has(structuredCode) ||
-              (STRICT_PRE_LAUNCH_REJECTION_CODES.has(normFailedStage) && !gwErr)
+              STRICT_PRE_LAUNCH_REJECTION_CODES.has(normFailedStage)
             )
           );
           if (!provenPreSpawnFailure) {
@@ -1118,6 +1230,7 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
         const effectivePrevDisp = dispatchId || retryOf;
         if (effectivePrevDisp) {
           const tu = orca(["orchestration", "task-update", "--id", taskId, "--status", "failed", "--result", `coldStart retry: ${lastError}`], {
+            deadlineAt,
             timeoutMs: clampTimeoutToDeadline(deadlineAt, 5000),
           });
           if (!tu.ok) {
@@ -1168,8 +1281,10 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     if (manual) {
       if (manual.ok || manual.ambiguous || manual.deadlineExceeded) return manual;
       if (manual.manualAbortedAfterDispatch && manual.supersededDispatchId) {
+        const effDeadline = launchOpts.deadlineAt ?? null;
         const tu = orca(["orchestration", "task-update", "--id", taskId, "--status", "failed", "--result", manual.error || "manual dispatch aborted"], {
-          timeoutMs: clampTimeoutToDeadline(launchOpts.deadlineAt ?? null, 5000),
+          deadlineAt: effDeadline,
+          timeoutMs: clampTimeoutToDeadline(effDeadline, 5000),
         });
         if (!tu.ok) {
           return {

@@ -229,10 +229,11 @@ const SHELL_VALUE_FLAGS = new Set([
 
 /**
  * Real POSIX-like shell tokenizer for single-command agent launch strings.
- * Handles single quotes, double quotes, and backslash escapes cleanly.
+ * Handles single quotes, double quotes, backslash escapes, and unquoted `#` comments cleanly.
  * Fails closed (`ok: false, parseable: false`) on unclosed quotes, trailing escapes,
- * newlines, command substitutions (`$(` / backticks), or shell control operators
- * (`;`, `|`, `&`, `<`, `>`, `(`, `)`) so ambiguous strings never pass cross-family checks!
+ * newlines, shell variable/command expansions (`$VAR`, `${...}`, `$(...)`, backticks),
+ * or shell control operators (`;`, `|`, `&`, `<`, `>`, `(`, `)`) so ambiguous strings
+ * never pass cross-family checks!
  */
 export function tokenizeShellCommand(cmdStr) {
   const src = String(cmdStr ?? "");
@@ -256,8 +257,8 @@ export function tokenizeShellCommand(cmdStr) {
         quote = null;
         continue;
       }
-      if (ch === "`" || (ch === "$" && src[i + 1] === "(")) {
-        return { ok: false, parseable: false, tokens: [], reason: "command_substitution" };
+      if (ch === "`" || ch === "$") {
+        return { ok: false, parseable: false, tokens: [], reason: "shell_expansion" };
       }
       if (ch === "\\") {
         if (i + 1 >= src.length) {
@@ -281,11 +282,15 @@ export function tokenizeShellCommand(cmdStr) {
       }
       continue;
     }
+    // POSIX shell comment: unquoted `#` at the start of a token discards the rest of the line!
+    if (!inToken && ch === "#") {
+      break;
+    }
     if (ch === ";" || ch === "|" || ch === "&" || ch === "`" || ch === "<" || ch === ">" || ch === "(" || ch === ")") {
       return { ok: false, parseable: false, tokens: [], reason: "shell_control_operator" };
     }
-    if (ch === "$" && src[i + 1] === "(") {
-      return { ok: false, parseable: false, tokens: [], reason: "command_substitution" };
+    if (ch === "$") {
+      return { ok: false, parseable: false, tokens: [], reason: "shell_expansion" };
     }
     if (ch === "'" || ch === '"') {
       quote = ch;
@@ -312,9 +317,34 @@ export function tokenizeShellCommand(cmdStr) {
 }
 
 /**
+ * Strip any unquoted POSIX `# ...` trailing comment from a single-line command string
+ * so appending CLI flags never places them inside a shell comment!
+ */
+export function stripUnquotedShellComment(cmdStr) {
+  const src = String(cmdStr ?? "");
+  let inToken = false;
+  let quote = null;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (quote === "'") { if (ch === "'") quote = null; continue; }
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      else if (ch === "\\" && i + 1 < src.length) i++;
+      continue;
+    }
+    if (/\s/.test(ch)) { inToken = false; continue; }
+    if (!inToken && ch === "#") return src.slice(0, i).trimEnd();
+    if (ch === "'" || ch === '"') { quote = ch; inToken = true; continue; }
+    if (ch === "\\" && i + 1 < src.length) { i++; inToken = true; continue; }
+    inToken = true;
+  }
+  return src.trimEnd();
+}
+
+/**
  * Parse an agent CLI command string into structured `argv[]` via `tokenizeShellCommand`
- * and walk top-level flags ONLY (skipping option values like `--settings '{...}'`)
- * to extract `baseAgent`, `embeddedModel`, and `embeddedEffort`.
+ * and walk top-level flags ONLY (stopping at `--` end-of-options and skipping option values
+ * like `--settings '{...}'`) to extract `baseAgent`, `embeddedModel`, and `embeddedEffort`.
  */
 export function parseAgentCommandSpec(agentCmd) {
   const raw = String(agentCmd || "").trim();
@@ -329,6 +359,7 @@ export function parseAgentCommandSpec(agentCmd) {
       lowerBase: "",
       isKiro: false,
       embeddedModel: null,
+      explicitDefaultModel: false,
       embeddedEffort: null,
       hasModelFlag: false,
       hasEffortFlag: false,
@@ -336,6 +367,7 @@ export function parseAgentCommandSpec(agentCmd) {
       hasModeFlag: false,
       hasPermissionModeFlag: false,
       hasDangerouslySkipFlag: false,
+      hasOptionTerminator: false,
     };
   }
 
@@ -363,6 +395,7 @@ export function parseAgentCommandSpec(agentCmd) {
       lowerBase: "",
       isKiro: false,
       embeddedModel: null,
+      explicitDefaultModel: false,
       embeddedEffort: null,
       hasModelFlag: false,
       hasEffortFlag: false,
@@ -370,6 +403,7 @@ export function parseAgentCommandSpec(agentCmd) {
       hasModeFlag: false,
       hasPermissionModeFlag: false,
       hasDangerouslySkipFlag: false,
+      hasOptionTerminator: false,
     };
   }
 
@@ -379,6 +413,7 @@ export function parseAgentCommandSpec(agentCmd) {
   const isKiro = lowerBase === "kiro-cli" || lowerBase === "kiro";
 
   let embeddedModel = null;
+  let explicitDefaultModel = false;
   let embeddedEffort = null;
   let hasModelFlag = false;
   let hasEffortFlag = false;
@@ -386,31 +421,53 @@ export function parseAgentCommandSpec(agentCmd) {
   let hasModeFlag = false;
   let hasPermissionModeFlag = false;
   let hasDangerouslySkipFlag = false;
+  let hasOptionTerminator = false;
 
   for (let i = 1; i < argv.length; i++) {
     const t = argv[i];
-    if (t === "--") break;
+    if (t === "--") {
+      hasOptionTerminator = true;
+      break;
+    }
 
     if (t === "--model" || t === "-m") {
       hasModelFlag = true;
       if (i + 1 >= argv.length) {
-        return { raw, parseable: false, parseReason: "dangling_model_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel: null, embeddedEffort: null, hasModelFlag: true, hasEffortFlag, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag };
+        return { raw, parseable: false, parseReason: "dangling_model_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel: null, explicitDefaultModel: false, embeddedEffort: null, hasModelFlag: true, hasEffortFlag, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator };
       }
       const mv = String(argv[++i] || "").trim();
-      if (mv && mv.toLowerCase() !== "default") embeddedModel = mv;
+      if (!mv) {
+        return { raw, parseable: false, parseReason: "empty_model_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel: null, explicitDefaultModel: false, embeddedEffort: null, hasModelFlag: true, hasEffortFlag, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator };
+      }
+      if (mv.toLowerCase() === "default") {
+        explicitDefaultModel = true;
+        embeddedModel = "default";
+      } else {
+        explicitDefaultModel = false;
+        embeddedModel = mv;
+      }
       continue;
     }
     if (t.startsWith("--model=") || t.startsWith("-m=")) {
       hasModelFlag = true;
       const mv = t.slice(t.indexOf("=") + 1).trim();
-      if (mv && mv.toLowerCase() !== "default") embeddedModel = mv;
+      if (!mv) {
+        return { raw, parseable: false, parseReason: "empty_model_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel: null, explicitDefaultModel: false, embeddedEffort: null, hasModelFlag: true, hasEffortFlag, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator };
+      }
+      if (mv.toLowerCase() === "default") {
+        explicitDefaultModel = true;
+        embeddedModel = "default";
+      } else {
+        explicitDefaultModel = false;
+        embeddedModel = mv;
+      }
       continue;
     }
 
     if (t === "--effort" || t === "--reasoning-effort") {
       hasEffortFlag = true;
       if (i + 1 >= argv.length) {
-        return { raw, parseable: false, parseReason: "dangling_effort_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel, embeddedEffort: null, hasModelFlag, hasEffortFlag: true, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag };
+        return { raw, parseable: false, parseReason: "dangling_effort_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel, explicitDefaultModel, embeddedEffort: null, hasModelFlag, hasEffortFlag: true, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag, hasOptionTerminator };
       }
       const ev = String(argv[++i] || "").trim();
       if (ev) embeddedEffort = ev;
@@ -458,6 +515,7 @@ export function parseAgentCommandSpec(agentCmd) {
     lowerBase,
     isKiro,
     embeddedModel,
+    explicitDefaultModel,
     embeddedEffort,
     hasModelFlag,
     hasEffortFlag,
@@ -465,6 +523,7 @@ export function parseAgentCommandSpec(agentCmd) {
     hasModeFlag,
     hasPermissionModeFlag,
     hasDangerouslySkipFlag,
+    hasOptionTerminator,
   };
 }
 
@@ -482,6 +541,7 @@ export function resolveEffectiveLaunchSpec(agent, model = null, effort = null, {
       parseReason: parsed.parseReason,
       baseAgent: "",
       embeddedModel: null,
+      explicitDefaultModel: false,
       embeddedEffort: null,
       passedModel: null,
       effectiveModel: null,
@@ -489,16 +549,26 @@ export function resolveEffectiveLaunchSpec(agent, model = null, effort = null, {
     };
   }
 
+  // P0-03 & P2-01: If the command explicitly passed `--model default` (or `-m default`),
+  // step `reqModel` will NOT override it in the launched command! Keep `passedModel: null`
+  // and `effectiveModel: "default"` (unless OpenCode config resolves a default model),
+  // NEVER claiming `reqModel`!
   let passedModel = null;
   if (!parsed.isKiro) {
-    passedModel = parsed.embeddedModel || reqModel || null;
+    if (parsed.explicitDefaultModel) {
+      passedModel = null;
+    } else {
+      passedModel = parsed.embeddedModel || reqModel || null;
+    }
   }
   let configModel = null;
   if (!passedModel && (parsed.lowerBase === "opencode" || parsed.lowerBase === "opencode2") && (projectDir || configPaths)) {
     const oc = resolveOpencodeConfig({ projectDir: projectDir || process.cwd(), configPaths });
     if (oc.configuredModel) configModel = oc.configuredModel;
   }
-  const effectiveModel = passedModel || configModel || null;
+  const effectiveModel = parsed.explicitDefaultModel
+    ? (configModel || "default")
+    : (passedModel || configModel || null);
   const effectiveEffort = parsed.embeddedEffort || reqEffort || null;
   return {
     agent: parsed.raw,
@@ -506,6 +576,7 @@ export function resolveEffectiveLaunchSpec(agent, model = null, effort = null, {
     parseReason: null,
     baseAgent: parsed.baseAgent,
     embeddedModel: parsed.embeddedModel,
+    explicitDefaultModel: parsed.explicitDefaultModel,
     embeddedEffort: parsed.embeddedEffort,
     passedModel,
     effectiveModel,

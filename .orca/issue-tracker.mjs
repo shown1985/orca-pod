@@ -102,9 +102,11 @@ export function parseRemoteHost(remoteUrl) {
   const u = remoteUrl.trim();
   if (!u) return null;
   if (u.startsWith("/") || u.startsWith("./") || u.startsWith("../") || u.startsWith("file://") || /^[A-Za-z]:[\\/]/.test(u)) {
-    return { isRemote: false, host: null, repoSlug: null, raw: sanitizeText(u, { maxLen: 160 }) };
+    return { isRemote: false, host: null, origin: null, basePath: "", repoSlug: null, raw: sanitizeText(u, { maxLen: 160 }) };
   }
   let host = null;
+  let origin = null;
+  let basePath = "";
   let repoPath = null;
   const scp = u.match(/^[^@]+@([^:]+):(.+?)(?:\.git)?$/);
   if (scp) {
@@ -114,14 +116,26 @@ export function parseRemoteHost(remoteUrl) {
     try {
       const parsed = new URL(u);
       host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-      repoPath = parsed.pathname.replace(/^\/+/, "").replace(/\.git$/, "");
+      if (/^https?:$/i.test(parsed.protocol)) {
+        origin = parsed.origin.toLowerCase();
+      }
+      const cleanPath = parsed.pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+      const segs = cleanPath.split("/").filter(Boolean);
+      if (segs.length > 2 && host !== "github.com" && !host.endsWith(".github.com")) {
+        basePath = "/" + segs.slice(0, -2).join("/");
+        repoPath = segs.slice(-2).join("/");
+      } else {
+        repoPath = cleanPath;
+      }
     } catch {
-      return { isRemote: false, host: null, repoSlug: null, raw: sanitizeText(u, { maxLen: 160 }) };
+      return { isRemote: false, host: null, origin: null, basePath: "", repoSlug: null, raw: sanitizeText(u, { maxLen: 160 }) };
     }
   }
   return {
     isRemote: Boolean(host),
     host,
+    origin,
+    basePath,
     isGitHub: Boolean(host && (host === "github.com" || host.endsWith(".github.com"))),
     repoSlug: repoPath || null,
     raw: sanitizeText(u, { maxLen: 160 }),
@@ -136,20 +150,23 @@ export function buildGhRepoSelector(host, repo) {
 
 /**
  * Parse `tea logins list` table/plain output to find a login entry whose server URL
- * matches `targetHost` by exact hostname (never substring match!).
+ * matches `targetHost` (and preserves exact `origin` including `:port` + `basePath`!).
  */
-export function matchTeaLoginForHost(stdoutText, targetHost = null) {
+export function matchTeaLoginForHost(stdoutText, targetHost = null, targetOrigin = null) {
   const lines = String(stdoutText || "").split(/\r?\n/);
   const entries = [];
   for (const rawLine of lines) {
     const urlMatch = rawLine.match(/https?:\/\/[^\s|│]+/i);
     if (!urlMatch) continue;
-    let hostname = null;
+    let parsed = null;
     try {
-      hostname = new URL(urlMatch[0]).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+      parsed = new URL(urlMatch[0]);
     } catch {
       continue;
     }
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const entryOrigin = parsed.origin.toLowerCase();
+    const entryBasePath = parsed.pathname.replace(/\/+$/, "") || "";
     const cols = rawLine
       .split(/[|│]/)
       .map((c) => c.trim())
@@ -164,11 +181,20 @@ export function matchTeaLoginForHost(stdoutText, targetHost = null) {
       }
     }
     if (loginName && hostname) {
-      entries.push({ login: loginName, host: hostname, url: urlMatch[0] });
+      entries.push({ login: loginName, host: hostname, origin: entryOrigin, basePath: entryBasePath, url: urlMatch[0] });
     }
+  }
+  if (targetOrigin) {
+    const wantOrigin = String(targetOrigin).trim().replace(/\/+$/, "").toLowerCase();
+    const exactOrigin = entries.find((e) => e.origin === wantOrigin);
+    if (exactOrigin) return exactOrigin;
+    return null;
   }
   if (!targetHost) return entries[0] || null;
   const want = String(targetHost).trim().replace(/^\[|\]$/g, "").toLowerCase();
+  if (want.includes(":")) {
+    return entries.find((e) => { try { return new URL(e.url).host.toLowerCase() === want; } catch { return false; } }) || null;
+  }
   return entries.find((e) => e.host === want) || null;
 }
 
@@ -254,6 +280,8 @@ export function detectIssueProvider({
         bin,
         repo: remote?.repoSlug || null,
         host: remote?.host || null,
+        origin: remote?.origin || null,
+        basePath: remote?.basePath || "",
         teaLogin: null,
         defaultBranch,
         reason: "gh CLI authenticated",
@@ -264,7 +292,7 @@ export function detectIssueProvider({
       if (!ver.ok) continue;
       const logins = execFn(bin, ["logins", "list"], { cwd: repoDir, timeoutMs: 5000 });
       if (!logins.ok || !logins.stdout) continue;
-      const matchedLogin = matchTeaLoginForHost(logins.stdout, remote?.host || null);
+      const matchedLogin = matchTeaLoginForHost(logins.stdout, remote?.host || null, remote?.origin || null);
       if (remote?.host && !allowLocalRemote && !matchedLogin) {
         continue;
       }
@@ -280,6 +308,8 @@ export function detectIssueProvider({
         bin,
         repo: remote?.repoSlug || null,
         host: remote?.host || null,
+        origin: matchedLogin?.origin || remote?.origin || null,
+        basePath: matchedLogin?.basePath ?? remote?.basePath ?? "",
         teaLogin: matchedLogin?.login || null,
         defaultBranch,
         reason: "tea CLI authenticated",
@@ -307,10 +337,12 @@ function normalizeMarkdownRefKey(k) {
 export function parseMarkdownRefDefinitions(markdown) {
   const defs = new Map();
   if (typeof markdown !== "string" || !markdown) return defs;
+  const lines = markdown.split(/\r?\n/);
   let inFence = false;
   let fenceChar = "";
   let fenceLen = 0;
-  for (const rawLine of markdown.split(/\r?\n/)) {
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
     const tf = rawLine.trimStart();
     const fm = tf.match(/^(`{3,}|~{3,})/);
     if (fm) {
@@ -320,10 +352,23 @@ export function parseMarkdownRefDefinitions(markdown) {
       if (ch === fenceChar && len >= fenceLen && tf.slice(len).trim() === "") { inFence = false; fenceChar = ""; fenceLen = 0; continue; }
     }
     if (inFence) continue;
-    const m = rawLine.match(/^\s{0,3}\[([^\]]+)\]:\s*<?([^\s>]+)>?(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*$/);
-    if (m) {
-      const key = normalizeMarkdownRefKey(m[1]);
-      if (key && !defs.has(key)) defs.set(key, m[2].trim());
+    // 1) Single-line reference definition: `[label]: https://...`
+    const m1 = rawLine.match(/^\s{0,3}\[([^\]]+)\]:\s*<?([^\s>]+)>?(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*$/);
+    if (m1) {
+      const key = normalizeMarkdownRefKey(m1[1]);
+      if (key && !defs.has(key)) defs.set(key, m1[2].trim());
+      continue;
+    }
+    // 2) CommonMark multiline reference definition: `[label]:\n  https://...`
+    const mHead = rawLine.match(/^\s{0,3}\[([^\]]+)\]:\s*$/);
+    if (mHead && i + 1 < lines.length) {
+      const nextLine = lines[i + 1];
+      const mUrl = nextLine.match(/^\s*<?([^\s>\[]+)>?(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*$/);
+      if (mUrl && mUrl[1]) {
+        const key = normalizeMarkdownRefKey(mHead[1]);
+        if (key && !defs.has(key)) defs.set(key, mUrl[1].trim());
+        i++;
+      }
     }
   }
   return defs;
@@ -358,8 +403,10 @@ export function extractExplicitLocalIssueNumber(text, { currentHost = null, curr
     return String(label || "").replace(/#\d+\b/g, "");
   };
 
-  // Remove reference definition lines themselves before scanning
-  let sanitizedForScan = srcText.replace(/^\s{0,3}\[([^\]]+)\]:\s*<?([^\s>]+)>?.*$/gm, "");
+  // Remove both single-line and two-line reference definition lines before scanning
+  let sanitizedForScan = srcText
+    .replace(/^\s{0,3}\[([^\]]+)\]:\s*\r?\n\s*<?[^\s>\[]+>?.*$/gm, "")
+    .replace(/^\s{0,3}\[([^\]]+)\]:\s*<?([^\s>]+)>?.*$/gm, "");
   // 1) Inline Markdown links `[label](url)`
   sanitizedForScan = sanitizedForScan.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_full, label, rawUrl) => inspectResolvedLink(label, rawUrl));
   // 2) Full & collapsed reference-style Markdown links `[label][ref]` / `[label][]`
@@ -403,6 +450,9 @@ export function parseBacklogTasks(markdown, { maxTasks = 20, currentHost = null,
     const cleanTitle = String(title || "")
       .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
       .replace(/\[([^\]]+)\]\[[^\]]*\]/g, "$1")
+      .replace(/\[([^\]]+)\](?![(\[])/g, (full, label) => (
+        docRefDefs.has(normalizeMarkdownRefKey(label)) ? label : full
+      ))
       .replace(/[*_`~]/g, "")
       .replace(/\s+/g, " ")
       .trim();
@@ -554,7 +604,7 @@ export function parseIssueNumberFromOutput(text) {
  * Extract an already-created issue URL ONLY from trusted `stdout` (NEVER `stderr` diagnostics!),
  * requiring exact `host` and `owner/repo` match when known.
  */
-export function parseTrustedCreatedIssueUrl(stdout = "", { host = null, repo = null, requireRepo = false } = {}) {
+export function parseTrustedCreatedIssueUrl(stdout = "", { host = null, origin = null, basePath = "", repo = null, requireRepo = false } = {}) {
   if (!stdout) return { number: null, url: null };
   if (requireRepo && !repo) return { number: null, url: null };
   for (const rawLine of String(stdout).split(/\r?\n/)) {
@@ -566,18 +616,29 @@ export function parseTrustedCreatedIssueUrl(stdout = "", { host = null, repo = n
     if (!Number.isInteger(num) || num <= 0) continue;
     let parsedUrl = null;
     try { parsedUrl = new URL(urlStr); } catch { continue; }
-    if (host) {
-      const wantHost = String(host).replace(/^\[|\]$/g, "").toLowerCase();
-      const gotHost = parsedUrl.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-      if (gotHost !== wantHost) continue;
+    if (origin) {
+      const wantOrigin = String(origin).trim().replace(/\/+$/, "").toLowerCase();
+      if (parsedUrl.origin.toLowerCase() !== wantOrigin) continue;
+    } else if (host) {
+      const rawWantHost = String(host).trim().toLowerCase();
+      if (rawWantHost.includes(":") && !rawWantHost.startsWith("[")) {
+        if (parsedUrl.host.toLowerCase() !== rawWantHost) continue;
+      } else {
+        const wantHostname = rawWantHost.replace(/^\[|\]$/g, "");
+        const gotHostname = parsedUrl.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+        if (gotHostname !== wantHostname) continue;
+        // Reject unverified custom port when target host had no port and no explicit origin authorized it!
+        if (parsedUrl.port !== "") continue;
+      }
     }
     if (repo) {
-      const wantPath = `/${String(repo).replace(/^\/+|\/+$/g, "").toLowerCase()}/issues/${num}`;
+      const normBase = String(basePath || "").trim().replace(/\/+$/, "").toLowerCase();
+      const basePrefix = normBase ? (normBase.startsWith("/") ? normBase : `/${normBase}`) : "";
+      const normRepo = String(repo).replace(/^\/+|\/+$/g, "").toLowerCase();
+      const wantExactPath = `${basePrefix}/${normRepo}/issues/${num}`;
       const gotPath = parsedUrl.pathname.replace(/\/+$/, "").toLowerCase();
-      if (gotPath !== wantPath && !gotPath.endsWith(wantPath)) continue;
-      // Reject extra leading path segments on standard github.com
-      const gotHost = parsedUrl.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-      if (gotHost === "github.com" && gotPath !== wantPath) continue;
+      // P1-07: Require EXACT `<basePath>/<owner>/<repo>/issues/<id>` match (reject arbitrary extra path prefixes!)
+      if (gotPath !== wantExactPath) continue;
     }
     return { number: num, url: urlStr };
   }
@@ -606,6 +667,8 @@ export function createIssueViaCli({
   repoDir,
   repo = null,
   host = null,
+  origin = null,
+  basePath = "",
   teaLogin = null,
   title,
   body,
@@ -638,7 +701,7 @@ export function createIssueViaCli({
   // P1-07: Reconcile ALREADY-CREATED issue URL ONLY from trusted `stdout` matching exact host + owner/repo!
   // Never trust an external issue URL mentioned inside `stderr` error diagnostics!
   const mustHaveRepo = Boolean(repo) || (provider === "gh" && process.env.ORCA_ISSUE_ALLOW_LOCAL !== "1");
-  const firstCreated = parseTrustedCreatedIssueUrl(res.stdout, { host, repo, requireRepo: mustHaveRepo });
+  const firstCreated = parseTrustedCreatedIssueUrl(res.stdout, { host, origin, basePath, repo, requireRepo: mustHaveRepo });
   if (firstCreated.url && firstCreated.number != null) {
     return {
       ok: true,
@@ -658,11 +721,11 @@ export function createIssueViaCli({
     const rawErr = res.stderr || res.stdout || res.error || "issue create failed";
     return { ok: false, number: null, url: null, error: sanitizeText(rawErr, { maxLen: 240 }) };
   }
-  // P1-07: If stdout contains ANY HTTP(S) URL, it MUST pass strict host + owner/repo + /issues/<id>
+  // P1-07: If stdout contains ANY HTTP(S) URL, it MUST pass strict origin + basePath + owner/repo + /issues/<id>
   // verification (NEVER fall back to a loose regex that accepts external repo URLs!).
   const stdoutStr = String(res.stdout || "");
   if (/https?:\/\/[^\s"'<>]+/i.test(stdoutStr)) {
-    const trustedUrl = parseTrustedCreatedIssueUrl(stdoutStr, { host, repo, requireRepo: mustHaveRepo });
+    const trustedUrl = parseTrustedCreatedIssueUrl(stdoutStr, { host, origin, basePath, repo, requireRepo: mustHaveRepo });
     if (!trustedUrl.url || trustedUrl.number == null) {
       return {
         ok: false,
@@ -895,6 +958,8 @@ export function syncPlanIssues({
     lineageId: lineageId || runScopeId || null,
     provider: providerInfo.provider,
     host: providerInfo.host || null,
+    origin: providerInfo.origin || null,
+    basePath: providerInfo.basePath || "",
     repo: providerInfo.repo || null,
     teaLogin: providerInfo.teaLogin || null,
     defaultBranch: providerInfo.defaultBranch || config.defaultBranch || null,
@@ -912,6 +977,8 @@ export function syncPlanIssues({
   }
   existing.provider = providerInfo.provider;
   existing.host = providerInfo.host || existing.host || null;
+  existing.origin = providerInfo.origin || existing.origin || null;
+  existing.basePath = providerInfo.basePath ?? existing.basePath ?? "";
   existing.repo = providerInfo.repo || existing.repo || null;
   existing.teaLogin = providerInfo.teaLogin || existing.teaLogin || null;
   existing.defaultBranch = providerInfo.defaultBranch || config.defaultBranch || existing.defaultBranch || null;
@@ -953,6 +1020,8 @@ export function syncPlanIssues({
       repoDir,
       repo: providerInfo.repo,
       host: providerInfo.host,
+      origin: existing.origin,
+      basePath: existing.basePath,
       teaLogin: providerInfo.teaLogin || null,
       title: epicTitle,
       body: epicBody,
@@ -1011,6 +1080,8 @@ export function syncPlanIssues({
         repoDir,
         repo: providerInfo.repo,
         host: providerInfo.host,
+        origin: existing.origin,
+        basePath: existing.basePath,
         teaLogin: providerInfo.teaLogin || null,
         title: childTitle,
         body: childBody,

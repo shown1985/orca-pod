@@ -6,15 +6,6 @@ export function createNudgeController({
   statusSet, writeStatus, warn, settleMember,
   syncOutputsFromIsolatedWorktree, getWtDir, artDir,
 }) {
-  function terminalOf(m) {
-    if (m.terminal) return m.terminal;
-    if (!m.dispatchId) return null;
-    const t = pick(res(orca(["orchestration", "worker-show", "--dispatch", m.dispatchId]).json), ["terminal"]) || {};
-    const id = pick(t, ["id", "terminalId", "terminal_id"]);
-    if (id) m.terminal = id;
-    return id || null;
-  }
-
   function deadlineCapOf(m) {
     const capAt = Math.min(
       Number.isFinite(m.deadlineAt) ? m.deadlineAt : Infinity,
@@ -28,12 +19,33 @@ export function createNudgeController({
     return capAt != null ? (capAt - Date.now()) : Infinity;
   }
 
+  // P0-01 & P1-02: Never mutate `m.terminal` (which belongs to `m.startMode === "manual"`),
+  // and check remaining deadline BEFORE issuing `worker-show`!
+  function terminalOf(m) {
+    if (m.terminal) return m.terminal;
+    if (m.nudgeTerminal) return m.nudgeTerminal;
+    if (!m.dispatchId) return null;
+    const rem = remainingBudgetMs(m);
+    if (rem <= 0) return null;
+    const ws = orca(["orchestration", "worker-show", "--dispatch", m.dispatchId], {
+      timeoutMs: Number.isFinite(rem) ? Math.max(1, Math.floor(rem)) : undefined,
+      deadlineAt: deadlineCapOf(m),
+    });
+    if (ws.deadlineExceeded || !ws.ok) return null;
+    const t = pick(res(ws.json), ["terminal"]) || {};
+    const id = pick(t, ["id", "terminalId", "terminal_id", "handle", "terminalHandle"]);
+    if (id) m.nudgeTerminal = id;
+    return id || null;
+  }
+
   function send(m, text) {
+    const term = terminalOf(m);
+    if (!term) return false;
     const capAt = deadlineCapOf(m);
     const remBefore = remainingBudgetMs(m);
     if (remBefore <= 0) return false;
     const rpcTimeout = Number.isFinite(remBefore) ? Math.max(1, Math.floor(remBefore)) : undefined;
-    const s = orca(["terminal", "send", "--terminal", m.terminal, "--text", text, "--enter"], { timeoutMs: rpcTimeout, deadlineAt: capAt });
+    const s = orca(["terminal", "send", "--terminal", term, "--text", text, "--enter"], { timeoutMs: rpcTimeout, deadlineAt: capAt });
     if (!s.ok) { warn(`nudge send '${m.step.title}' failed: ${s.stderr || s.raw}`); return false; }
     const remSleep = remainingBudgetMs(m);
     if (remSleep > 0) {
@@ -41,7 +53,7 @@ export function createNudgeController({
     }
     const remAfter = remainingBudgetMs(m);
     if (remAfter > 0) {
-      orca(["terminal", "send", "--terminal", m.terminal, "--text", "", "--enter"], {
+      orca(["terminal", "send", "--terminal", term, "--text", "", "--enter"], {
         timeoutMs: Number.isFinite(remAfter) ? Math.max(1, Math.floor(remAfter)) : undefined,
         deadlineAt: capAt,
       });
@@ -56,6 +68,7 @@ export function createNudgeController({
 
   function maybeNudgeMidRun(m, v) {
     if (m.nudge.phase || m.nudge.left <= 0) return false;
+    if (remainingBudgetMs(m) <= 0) return false;
     if (!m.step.writes || artifactReady(m.step.id)) return false;
     if (v.preview == null || parkedPromptOf(v.preview)) return false;
     if (Date.now() - m.lastBusy < nudgeTimeoutOf(m.step)) return false;
@@ -69,13 +82,25 @@ export function createNudgeController({
   function holdForNudge(m, outcome, done) {
     if (!m.step.writes || artifactReady(m.step.id)) return false;
     if (nudgeRetriesOf(m.step) <= 0) { m.note = "artifact missing (nudge disabled)"; return false; }
+    if (remainingBudgetMs(m) <= 0) {
+      m.note = "artifact missing (deadline reached before nudge)";
+      return false;
+    }
     if (m.nudge.left <= 0) {
       if (m.nudge.count > 0) { m.note = `artifact missing after ${m.nudge.count} nudge(s)`; m.outcome = "failed"; }
       else m.note = "artifact missing (nudge undeliverable)";
       return false;
     }
-    if (!terminalOf(m)) { m.note = "artifact missing (no terminal to nudge)"; return false; }
-    const tinfo = pick(res(orca(["terminal", "show", "--terminal", m.terminal]).json), ["terminal"]) || {};
+    const term = terminalOf(m);
+    if (!term) { m.note = "artifact missing (no terminal to nudge)"; return false; }
+    const remShow = remainingBudgetMs(m);
+    if (remShow <= 0) { m.note = "artifact missing (deadline reached before nudge)"; return false; }
+    const ts = orca(["terminal", "show", "--terminal", term], {
+      timeoutMs: Number.isFinite(remShow) ? Math.max(1, Math.floor(remShow)) : undefined,
+      deadlineAt: deadlineCapOf(m),
+    });
+    if (ts.deadlineExceeded) { m.note = "artifact missing (deadline reached during nudge check)"; return false; }
+    const tinfo = pick(res(ts.json), ["terminal"]) || {};
     const parked = parkedPromptOf(pick(tinfo, ["preview"]) ?? null);
     if (parked) { m.note = `artifact missing (terminal parked on ${parked.label})`; return false; }
     const ok = send(m, `[orca-flow] Your session completed but the output file was not written — write your complete output to ${outPath(m.step.writes)} now (Markdown). Automated nudge; do not ask questions.`);
@@ -101,7 +126,23 @@ export function createNudgeController({
     }
     if (Date.now() - m.nudge.sentAt >= nudgeTimeoutOf(m.step)) {
       if (m.nudge.left > 0) {
-        const tinfo = pick(res(orca(["terminal", "show", "--terminal", m.terminal]).json), ["terminal"]) || {};
+        const term = terminalOf(m);
+        const remShow = remainingBudgetMs(m);
+        if (!term || remShow <= 0) {
+          m.note = "artifact still missing after hard cap";
+          settleMember(m, "failed", m.nudge.done);
+          return;
+        }
+        const ts = orca(["terminal", "show", "--terminal", term], {
+          timeoutMs: Number.isFinite(remShow) ? Math.max(1, Math.floor(remShow)) : undefined,
+          deadlineAt: deadlineCapOf(m),
+        });
+        if (ts.deadlineExceeded) {
+          m.note = "artifact still missing after hard cap";
+          settleMember(m, "failed", m.nudge.done);
+          return;
+        }
+        const tinfo = pick(res(ts.json), ["terminal"]) || {};
         const parked = parkedPromptOf(pick(tinfo, ["preview"]) ?? null);
         if (parked) {
           m.note = `artifact missing (terminal parked on ${parked.label})`;

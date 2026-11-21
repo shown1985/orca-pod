@@ -194,13 +194,22 @@ function main(argv) {
     "orchestration gate-resolve": () => c.ok({}),
 
     "terminal create": () => c.fail("terminal create unavailable (default forces the cold-start path)"),
-    "terminal show": () => c.ok({ terminal: ((state.terminals[flags.terminal] || {}).info) || {} }),
+    "terminal show": () => {
+      if (flags.terminal && state.closedTerminals && state.closedTerminals[flags.terminal]) {
+        return c.ok({ terminal: { handle: flags.terminal, status: "closed", closed: true } });
+      }
+      return c.ok({ terminal: ((state.terminals[flags.terminal] || {}).info) || {} });
+    },
     "terminal send": () => c.ok({}),
     "terminal close": () => {
-      if (flags.terminal && state.terminals && state.terminals[flags.terminal]) {
-        delete state.terminals[flags.terminal];
+      if (flags.terminal) {
+        state.closedTerminals = state.closedTerminals || {};
+        state.closedTerminals[flags.terminal] = true;
+        if (state.terminals && state.terminals[flags.terminal]) {
+          delete state.terminals[flags.terminal];
+        }
       }
-      c.ok({ status: "closed" });
+      c.ok({ handle: flags.terminal || null, status: "closed", closed: true });
     },
   };
 

@@ -2,7 +2,7 @@
 //
 // Zero external dependencies (Node builtins only).
 
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
@@ -332,18 +332,27 @@ export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDir
   }
   for (const fname of relCandidates) {
     const src = join(srcArt, fname);
-    if (!existsSync(src)) continue;
     try {
-      const st = statSync(src);
+      const parentLst = fname.includes("/") ? lstatSync(join(src, "..")) : null;
+      if (parentLst && parentLst.isSymbolicLink()) continue;
+      const st = lstatSync(src);
+      // P0-01: NEVER follow or copy symbolic links out of an isolated worktree!
+      if (st.isSymbolicLink() || !st.isFile()) continue;
       const isMainWrite = fname === step.writes || fname.endsWith(`/${step.writes}`);
       if (isMainWrite && minSourceMtimeMs != null && Number.isFinite(minSourceMtimeMs) && st.mtimeMs < minSourceMtimeMs) {
         continue;
       }
       const dst = join(dstArt, fname);
+      try {
+        const dstLst = lstatSync(dst);
+        if (dstLst.isSymbolicLink()) continue;
+      } catch {}
       mkdirSync(join(dst, ".."), { recursive: true });
-      copyFileSync(src, dst);
-      try { utimesSync(dst, st.atime, st.mtime); } catch {}
-    } catch { /* best-effort */ }
+      const tmpDst = `${dst}.sync.${process.pid}.${Date.now()}.tmp`;
+      copyFileSync(src, tmpDst);
+      try { utimesSync(tmpDst, st.atime, st.mtime); } catch {}
+      renameSync(tmpDst, dst);
+    } catch { /* best-effort / ENOENT */ }
   }
 }
 

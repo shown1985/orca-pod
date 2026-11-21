@@ -483,14 +483,19 @@ export function createRunner({
     statusEnd(m.step.id, outcome, m.note);
     notifier.notifyStep(m);
     if (!m.done) return;
-    if (m.terminal) {
+    // P0-01: Select manual vs supervised cleanup STRICTLY by launcher-assigned `m.startMode`,
+    // NEVER by whether `m.terminal` / `m.nudgeTerminal` was populated later!
+    if (m.startMode === "manual") {
       const mr = verifyManualStopAndReleaseReceipt(orca, m.dispatchId || null, m.terminal);
       if (!mr.ok) warn(`manual terminal close/release '${m.step.title}' did not confirm: ${mr.reason}`);
     } else if (m.dispatchId) {
-      const rel = orca(["orchestration", "worker-release", "--dispatch", m.dispatchId], { allowPostDeadlineCleanup: true });
+      const rel = orca(["orchestration", "worker-release", "--dispatch", m.dispatchId], { allowPostDeadlineCleanup: true, timeoutMs: 3000 });
       const relAction = pick(res(rel.json), ["action", "status", "releaseStatus"]);
       if (!rel.ok || relAction === "release_unknown" || relAction === "release_pending") {
         warn(`worker-release '${m.step.title}' (${m.dispatchId}) returned ${relAction || sanitizeText(rel.stderr || rel.raw, { maxLen: 200 })}`);
+      }
+      if (m.nudgeTerminal) {
+        orca(["terminal", "close", "--terminal", m.nudgeTerminal], { allowPostDeadlineCleanup: true, timeoutMs: 3000 });
       }
     }
   }
@@ -504,11 +509,11 @@ export function createRunner({
 
   /**
    * P0-01: Require POSITIVE stop & release confirmation before reusing any Task or Worktree.
-   * Splits manual (`m.terminal`) vs supervised (`cold`) dispatch stop/release verification cleanly!
+   * Splits manual (`m.startMode === "manual"`) vs supervised (`cold`) dispatch stop/release verification cleanly!
    */
   function stopAndIsolateWorker(m, reason = "watchdog") {
     const LEDGER = getLedger();
-    if (m.terminal) {
+    if (m.startMode === "manual") {
       const mr = verifyManualStopAndReleaseReceipt(orca, m.dispatchId || null, m.terminal);
       if (!mr.ok) {
         return { ok: false, reason: mr.reason };
@@ -537,7 +542,7 @@ export function createRunner({
       });
       return { ok: true };
     }
-    return { ok: false, reason: "missing dispatchId and terminal handle — cannot prove worker stopped" };
+    return { ok: false, reason: "missing dispatchId and manual startMode — cannot prove worker stopped" };
   }
 
   /**
@@ -790,7 +795,7 @@ export function createRunner({
           stepId: step.id,
           title: step.title,
           agent: activeCand.agent,
-          model: launchSpec.effectiveModel || requestedModel,
+          model: launchSpec.effectiveModel,
           requestedModel: requestedModel || "default",
           requestedEffort: requestedEffort || null,
           effort: launchSpec.effectiveEffort,
@@ -814,7 +819,7 @@ export function createRunner({
         },
         allowError: true,
         onBeforeManualDispatch: currentRetryOf ? () => {
-          const u = orca(["orchestration", "task-update", "--id", taskId, "--status", "ready"]);
+          const u = orca(["orchestration", "task-update", "--id", taskId, "--status", "ready"], { deadlineAt });
           if (!u.ok) warn(`task-update to ready before manual dispatch failed: ${sanitizeText(u.stderr || u.raw, { maxLen: 200 })}`);
           return u.ok;
         } : null,
@@ -828,7 +833,7 @@ export function createRunner({
       }
 
       if (started?.dispatchId) {
-        recordExecutedStep(step.id, activeCand.agent, started.effectiveModel || launchSpec.effectiveModel || requestedModel, worktreeDir);
+        recordExecutedStep(step.id, activeCand.agent, started.effectiveModel ?? launchSpec.effectiveModel ?? null, worktreeDir);
       }
 
       if (started?.deadlineExceeded) {
@@ -867,14 +872,23 @@ export function createRunner({
         reason: errReason,
         phase: "worker_start",
       });
+      if (Date.now() >= deadlineAt) {
+        return buildDeadlineSettledMember({ taskIdVal: taskId, dispatchIdVal: started?.dispatchId || null, terminalVal: started?.terminal || null, reqIdVal: requestId, candIdxVal: candIndex, activeCandVal: activeCand, clearedVal: clearedInfo, supersededVal: superseded, crossRejVal: crossRejected, fullChainVal: fullChain });
+      }
       if (started?.dispatchId) {
-        const tu = orca(["orchestration", "task-update", "--id", taskId, "--status", "failed", "--result", `worker-start failed: ${errReason}`]);
+        const tu = orca(["orchestration", "task-update", "--id", taskId, "--status", "failed", "--result", `worker-start failed: ${errReason}`], { deadlineAt });
+        if (tu.deadlineExceeded) {
+          return buildDeadlineSettledMember({ taskIdVal: taskId, dispatchIdVal: started.dispatchId, reqIdVal: requestId, candIdxVal: candIndex, activeCandVal: activeCand, clearedVal: clearedInfo, supersededVal: superseded, crossRejVal: crossRejected, fullChainVal: fullChain });
+        }
         if (!tu.ok) {
           throw new FlowFatalError(`task-update '${step.title}' (${taskId}) failed before fallback: ${sanitizeText(tu.stderr || tu.raw, { maxLen: 200 })}`);
         }
         currentRetryOf = started.dispatchId;
       } else {
-        const tu = orca(["orchestration", "task-update", "--id", taskId, "--status", "ready"]);
+        const tu = orca(["orchestration", "task-update", "--id", taskId, "--status", "ready"], { deadlineAt });
+        if (tu.deadlineExceeded) {
+          return buildDeadlineSettledMember({ taskIdVal: taskId, reqIdVal: requestId, candIdxVal: candIndex, activeCandVal: activeCand, clearedVal: clearedInfo, supersededVal: superseded, crossRejVal: crossRejected, fullChainVal: fullChain });
+        }
         if (!tu.ok) {
           throw new FlowFatalError(`task-update '${step.title}' (${taskId}) failed before fallback: ${sanitizeText(tu.stderr || tu.raw, { maxLen: 200 })}`);
         }
@@ -883,12 +897,18 @@ export function createRunner({
       candIndex = nextIdx;
     }
 
-    const finalRequestedModel = activeCand.isPrimary ? (modelOf(step) || null) : (activeCand.requestedModel || activeCand.model || null);
-    const finalModel = started.effectiveModel || activeCand.resolvedModel || finalRequestedModel || null;
+    const finalLaunchSpec = resolveEffectiveLaunchSpec(
+      activeCand.agent,
+      activeCand.isPrimary ? (activeCand.requestedModel ?? modelOf(step)) : (activeCand.requestedModel ?? activeCand.model),
+      activeCand.isPrimary ? (activeCand.requestedEffort ?? step.effort ?? null) : (activeCand.requestedEffort ?? activeCand.effort),
+      { projectDir: worktreeDir }
+    );
+    const finalModel = started.effectiveModel ?? finalLaunchSpec.effectiveModel ?? null;
     const execRec = recordExecutedStep(step.id, activeCand.agent, finalModel, worktreeDir);
 
     const dispatchedAt = Date.now();
     const { dispatchId, terminal } = started;
+    const startMode = started.startMode || (terminal ? "manual" : "cold");
     if (dispatchId) {
       bindStepArtifactDispatchClaim(wtRootDir, artDir, step, {
         dispatchId,
@@ -941,7 +961,7 @@ export function createRunner({
     if (maxRtMs > 0) sliceCandidates.push(maxRtMs);
 
     return {
-      step, ctx: stepCtx, taskId, dispatchId, terminal, requestId,
+      step, ctx: stepCtx, taskId, dispatchId, terminal, startMode, requestId,
       clearedAtMs: clearedInfo.clearedAtMs,
       fsEpochMtimeMs: clearedInfo.fsEpochMtimeMs,
       clearedBeforeDispatch: Boolean(clearedInfo.cleared),
@@ -1090,9 +1110,9 @@ export function createRunner({
             if (!nudgeCtrl.holdForNudge(m, out, wd)) settleMember(m, m.outcome || out, wd);
             continue;
           }
-          // P1-02: Do NOT issue work vitals RPCs once `m.deadlineAt` is reached unless watchdog can still extend below `m.maxDeadlineAt`!
-          const canPossiblyExtend = Boolean(m.watchdog && m.deadlineAt < m.maxDeadlineAt && Date.now() < m.maxDeadlineAt);
-          const vitalsBudgetCap = canPossiblyExtend ? m.maxDeadlineAt : m.deadlineAt;
+          // P1-02: Enforce CURRENT approved `m.deadlineAt` on `workerVitals` and `drain`
+          // (NEVER pass an unapproved `m.maxDeadlineAt` before extension is confirmed!).
+          const vitalsBudgetCap = m.deadlineAt;
           const v = (Date.now() < vitalsBudgetCap)
             ? workerVitals(m.taskId, m.terminal, m.dispatchId, { deadlineAt: vitalsBudgetCap })
             : { status: null, settled: false, outcome: null, lastBusyMs: 0, heartbeatMs: 0, preview: null, agentWait: null, dispatchMismatch: false, deadlineExceeded: true };
@@ -1154,7 +1174,7 @@ export function createRunner({
                 continue;
               }
               if (m.dispatchId) {
-                const tu = orca(["orchestration", "task-update", "--id", m.taskId, "--status", "failed", "--result", `stopped for fallback: ${wres.kind}`]);
+                const tu = orca(["orchestration", "task-update", "--id", m.taskId, "--status", "failed", "--result", `stopped for fallback: ${wres.kind}`], { deadlineAt: m.deadlineAt });
                 if (!tu.ok) {
                   const tuNote = `[watchdog:${wres.kind}] task-update failed (${sanitizeText(tu.stderr || tu.raw, { maxLen: 180 })}) — pausing cleanly`;
                   warn(`"${m.step.title}" ${tuNote}`);
@@ -1164,7 +1184,7 @@ export function createRunner({
                   continue;
                 }
               } else {
-                const tu = orca(["orchestration", "task-update", "--id", m.taskId, "--status", "ready"]);
+                const tu = orca(["orchestration", "task-update", "--id", m.taskId, "--status", "ready"], { deadlineAt: m.deadlineAt });
                 if (!tu.ok) {
                   const tuNote = `[watchdog:${wres.kind}] task-update failed (${sanitizeText(tu.stderr || tu.raw, { maxLen: 180 })}) — pausing cleanly`;
                   warn(`"${m.step.title}" ${tuNote}`);

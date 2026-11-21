@@ -15,7 +15,7 @@
 //
 // Zero external dependencies (Node builtins only).
 
-import { existsSync, readFileSync, statSync, copyFileSync, utimesSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, statSync, lstatSync, copyFileSync, renameSync, rmSync, utimesSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -306,21 +306,45 @@ export function verifyArtifactContent(text, verify, { gitDir = null, artDir = nu
   return { ok: true, reason: null, verdict: foundVerdict, contractCommit: foundCommit, expectedCommit, mergeDanger, mergeDangerResult, pendingHumanMerge };
 }
 
+function stripMarkdownCodeFences(text) {
+  const out = [];
+  let inFence = false;
+  let fenceChar = "";
+  let fenceLen = 0;
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    const tf = raw.trimStart();
+    const fm = tf.match(/^(`{3,}|~{3,})/);
+    if (fm) {
+      const ch = fm[1][0];
+      const len = fm[1].length;
+      if (!inFence) {
+        inFence = true;
+        fenceChar = ch;
+        fenceLen = len;
+        continue;
+      }
+      if (ch === fenceChar && len >= fenceLen && tf.slice(len).trim() === "") {
+        inFence = false;
+        fenceChar = "";
+        fenceLen = 0;
+        continue;
+      }
+    }
+    if (!inFence) out.push(raw);
+  }
+  return out;
+}
+
 function extractWriterAttestedDispatchIds(text) {
   const ids = new Set();
+  const unfencedLines = stripMarkdownCodeFences(text);
+  const unfencedText = unfencedLines.join("\n");
   const commentRe = /<!--\s*orca-dispatch:\s*([^\s>]+)\s*-->/gi;
   let cm = null;
-  while ((cm = commentRe.exec(text)) !== null) {
+  while ((cm = commentRe.exec(unfencedText)) !== null) {
     if (cm[1]) ids.add(cm[1].trim());
   }
-  let inFence = false;
-  for (const raw of text.split(/\r?\n/)) {
-    const trimmed = raw.trim();
-    if (/^(`{3,}|~{3,})/.test(trimmed)) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence) continue;
+  for (const raw of unfencedLines) {
     const cleaned = normalizeMarkerLine(raw);
     const dm = /^(?:\*\*|__)?Dispatch-ID(?:\*\*|__)?\s*:\s*`?([^`\s*]+)`?$/i.exec(cleaned);
     if (dm && dm[1]) ids.add(dm[1].trim());
@@ -328,39 +352,131 @@ function extractWriterAttestedDispatchIds(text) {
   return [...ids];
 }
 
+function lstatSafe(p) {
+  try { return lstatSync(p); } catch { return null; }
+}
+
 /**
- * Full artifact check for a pipeline step: existence, minBytes, writer-attested
- * per-dispatch provenance, and verify rules.
+ * Full artifact check for a pipeline step: symlink rejection, existence, minBytes,
+ * writer-attested per-dispatch provenance, verify rules, and atomic promotion.
  */
 export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = {}) {
   if (!step || !step.writes) return { ok: true, reason: null };
   const isSettlement = (opts.mode || "settlement") === "settlement";
   const safeDisp = opts.dispatchId ? String(opts.dispatchId).replace(/[^A-Za-z0-9._-]+/g, "_") : null;
-  const dispatchScopedPath = safeDisp ? join(artDir, `.dispatch-${safeDisp}`, step.writes) : null;
+  const dispatchScopedDir = safeDisp ? join(artDir, `.dispatch-${safeDisp}`) : null;
+  const dispatchScopedPath = dispatchScopedDir ? join(dispatchScopedDir, step.writes) : null;
   const canonicalPath = join(artDir, step.writes);
 
   const thresholdMs = (opts.fsEpochMtimeMs != null && Number.isFinite(opts.fsEpochMtimeMs))
     ? opts.fsEpochMtimeMs
     : ((opts.minMtimeMs != null && Number.isFinite(opts.minMtimeMs)) ? opts.minMtimeMs : null);
 
-  let usedDispatchScopedTarget = false;
-  if (isSettlement && dispatchScopedPath && existsSync(dispatchScopedPath)) {
-    let dst = null;
-    try { dst = statSync(dispatchScopedPath); } catch { dst = null; }
-    if (dst && dst.size >= minBytes && (thresholdMs == null || dst.mtimeMs >= thresholdMs)) {
+  const verifyDispatchClaimRecord = (stMtimeMs) => {
+    if (!opts.dispatchId) return { ok: true };
+    const claimFile = join(artDir, ".dispatch-gate-claims.json");
+    const clStat = lstatSafe(claimFile);
+    if (!clStat || clStat.isSymbolicLink() || !clStat.isFile()) {
+      return {
+        ok: false,
+        reason: `unattributed gate artifact: missing dispatch provenance claim for ${step.writes} (expected dispatch ${opts.dispatchId})`,
+      };
+    }
+    let claim = null;
+    try {
+      const claims = JSON.parse(readFileSync(claimFile, "utf8"));
+      claim = claims?.[step.writes] || null;
+    } catch {
+      claim = null;
+    }
+    if (!claim || claim.cleared !== true || claim.activeDispatchId !== opts.dispatchId) {
+      return {
+        ok: false,
+        reason: `unattributed gate artifact: ${step.writes} provenance (${claim?.activeDispatchId || "none"}) does not match active dispatch ${opts.dispatchId}`,
+      };
+    }
+    if (claim.fsEpochMtimeMs != null && Number.isFinite(claim.fsEpochMtimeMs) && stMtimeMs < claim.fsEpochMtimeMs) {
+      return {
+        ok: false,
+        reason: `stale gate artifact: ${step.writes} mtime (${stMtimeMs.toFixed(3)}) predates dispatch ${opts.dispatchId} epoch (${claim.fsEpochMtimeMs.toFixed(3)})`,
+      };
+    }
+    return { ok: true };
+  };
+
+  // P0-01: Inspect dispatch-scoped candidate IN-PLACE FIRST (rejecting symlinks and wrong-ID/invalid
+  // content BEFORE touching canonical `<writes>`!), then atomically promote via temp + rename!
+  if (isSettlement && dispatchScopedPath) {
+    const dirLst = lstatSafe(dispatchScopedDir);
+    if (dirLst && dirLst.isSymbolicLink()) {
+      return { ok: false, reason: `symlink rejected: dispatch directory .dispatch-${safeDisp} is a symbolic link` };
+    }
+    const scopedLst = lstatSafe(dispatchScopedPath);
+    if (scopedLst) {
+      if (scopedLst.isSymbolicLink() || !scopedLst.isFile()) {
+        return { ok: false, reason: `symlink or non-regular gate artifact rejected at .dispatch-${safeDisp}/${step.writes}` };
+      }
+      if (opts.clearedBeforeDispatch === false) {
+        return { ok: false, reason: `stale artifact guard: ${step.writes} was not cleared prior to dispatch` };
+      }
+      if (scopedLst.size < minBytes) {
+        return { ok: false, reason: `too small (${scopedLst.size} bytes < ${minBytes} min)` };
+      }
+      if (thresholdMs != null && scopedLst.mtimeMs < thresholdMs) {
+        return { ok: false, reason: `stale artifact: ${step.writes} mtime (${scopedLst.mtimeMs.toFixed(3)}) predates current dispatch (${thresholdMs.toFixed(3)})` };
+      }
+      const claimRes = verifyDispatchClaimRecord(scopedLst.mtimeMs);
+      if (!claimRes.ok) return claimRes;
+
+      let scopedText = "";
+      try { scopedText = readFileSync(dispatchScopedPath, "utf8"); } catch (e) { return { ok: false, reason: `read failed: ${e.message}` }; }
+      const writerIds = extractWriterAttestedDispatchIds(scopedText);
+      if (writerIds.some((id) => id !== opts.dispatchId)) {
+        const bad = writerIds.find((id) => id !== opts.dispatchId);
+        return {
+          ok: false,
+          reason: `mismatched Dispatch-ID in .dispatch-${safeDisp}/${step.writes}: found "${bad}", expected "${opts.dispatchId}"`,
+        };
+      }
+      let contentRes = { ok: true, reason: null };
+      if (step.verify) {
+        contentRes = verifyArtifactContent(scopedText, step.verify, {
+          gitDir, artDir, mode: opts.mode || "settlement", targetBranch: opts.targetBranch || "dev",
+          allowOneWayMerge: Boolean(opts.allowOneWayMerge), preStepTargetSha: opts.preStepTargetSha || null,
+          preStepOriginTargetSha: opts.preStepOriginTargetSha || null, preStepRemoteTargetSha: opts.preStepRemoteTargetSha || null,
+          preStepRemoteError: opts.preStepRemoteError || null, preStepHasOrigin: Boolean(opts.preStepHasOrigin),
+          preStepHeadSha: opts.preStepHeadSha || null, mergeDangerThresholds: opts.mergeDangerThresholds || null,
+        });
+        if (!contentRes.ok) return contentRes;
+      }
+
+      // All checks passed in-place: refuse to overwrite a symlink at canonicalPath, then atomically promote!
+      const canonExistingLst = lstatSafe(canonicalPath);
+      if (canonExistingLst && canonExistingLst.isSymbolicLink()) {
+        return { ok: false, reason: `symlink rejected at canonical gate path ${step.writes}` };
+      }
       mkdirSync(dirname(canonicalPath), { recursive: true });
-      copyFileSync(dispatchScopedPath, canonicalPath);
-      try { utimesSync(canonicalPath, dst.atime, dst.mtime); } catch {}
-      usedDispatchScopedTarget = true;
+      const promoteTmp = join(dirname(canonicalPath), `.${step.writes}.promote.${process.pid}.${Date.now()}.tmp`);
+      try {
+        copyFileSync(dispatchScopedPath, promoteTmp);
+        try { utimesSync(promoteTmp, scopedLst.atime, scopedLst.mtime); } catch {}
+        renameSync(promoteTmp, canonicalPath);
+      } catch (e) {
+        try { rmSync(promoteTmp, { force: true }); } catch {}
+        return { ok: false, reason: `atomic promotion of ${step.writes} failed: ${e.message}` };
+      }
+      return contentRes;
     }
   }
 
   const filePath = canonicalPath;
-  if (!existsSync(filePath)) {
+  const st = lstatSafe(filePath);
+  if (!st) {
     return { ok: false, reason: "missing" };
   }
-  let st = null;
-  try { st = statSync(filePath); } catch { return { ok: false, reason: "unreadable" }; }
+  if (st.isSymbolicLink() || !st.isFile()) {
+    return { ok: false, reason: `symlink or non-regular gate artifact rejected: ${step.writes}` };
+  }
   if (st.size < minBytes) {
     return { ok: false, reason: `too small (${st.size} bytes < ${minBytes} min)` };
   }
@@ -374,34 +490,8 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
         reason: `stale artifact: ${step.writes} mtime (${st.mtimeMs.toFixed(3)}) predates current dispatch (${thresholdMs.toFixed(3)})`,
       };
     }
-    if (opts.dispatchId) {
-      const claimFile = join(artDir, ".dispatch-gate-claims.json");
-      if (!existsSync(claimFile)) {
-        return {
-          ok: false,
-          reason: `unattributed gate artifact: missing dispatch provenance claim for ${step.writes} (expected dispatch ${opts.dispatchId})`,
-        };
-      }
-      let claim = null;
-      try {
-        const claims = JSON.parse(readFileSync(claimFile, "utf8"));
-        claim = claims?.[step.writes] || null;
-      } catch {
-        claim = null;
-      }
-      if (!claim || claim.cleared !== true || claim.activeDispatchId !== opts.dispatchId) {
-        return {
-          ok: false,
-          reason: `unattributed gate artifact: ${step.writes} provenance (${claim?.activeDispatchId || "none"}) does not match active dispatch ${opts.dispatchId}`,
-        };
-      }
-      if (claim.fsEpochMtimeMs != null && Number.isFinite(claim.fsEpochMtimeMs) && st.mtimeMs < claim.fsEpochMtimeMs) {
-        return {
-          ok: false,
-          reason: `stale gate artifact: ${step.writes} mtime (${st.mtimeMs.toFixed(3)}) predates dispatch ${opts.dispatchId} epoch (${claim.fsEpochMtimeMs.toFixed(3)})`,
-        };
-      }
-    }
+    const claimRes = verifyDispatchClaimRecord(st.mtimeMs);
+    if (!claimRes.ok) return claimRes;
   }
   if (!step.verify) {
     return { ok: true, reason: null };
@@ -417,10 +507,7 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
         reason: `mismatched Dispatch-ID in ${step.writes}: found "${bad}", expected "${opts.dispatchId}"`,
       };
     }
-    // P0-01: Require POSITIVE writer-attested provenance on every gate artifact at settlement:
-    // either written into the dispatch-isolated target `.dispatch-<dispatchId>/<writes>` OR
-    // explicitly carrying the matching `Dispatch-ID: <dispatchId>` / `<!-- orca-dispatch: <dispatchId> -->`!
-    if (!usedDispatchScopedTarget && !writerIds.includes(opts.dispatchId)) {
+    if (!writerIds.includes(opts.dispatchId)) {
       return {
         ok: false,
         reason: `unattested gate artifact: ${step.writes} lacks writer-attested provenance for active dispatch ${opts.dispatchId} (missing Dispatch-ID marker and not written via .dispatch-${safeDisp}/${step.writes})`,

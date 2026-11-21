@@ -6,7 +6,7 @@ import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, r
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, join, resolve } from "node:path";
-import { extractWriterAttestedDispatchIds, hasSymlinkInPath } from "./gate-verify.mjs";
+import { extractWriterAttestedDispatchIds, hasSymlinkInPath, isStrictlyInsideDir } from "./gate-verify.mjs";
 
 export const WORKTREES_MANIFEST = "WORKTREES.json";
 export const DISPATCH_GATE_CLAIMS_FILE = ".dispatch-gate-claims.json";
@@ -218,8 +218,15 @@ export function dispatchIsolatedArtifactRel(dispatchId, writes) {
 export function bindStepArtifactDispatchClaim(wtDir, artDirRel, step, { dispatchId, taskId = null, fsEpochMtimeMs = null, clearedAtMs = null } = {}) {
   if (!step || !step.writes) return;
   const artDir = join(wtDir, artDirRel);
+  if (!isStrictlyInsideDir(artDir, join(artDir, step.writes))) {
+    throw new Error(`[worktree-isolation] step "${step.id}" writes path "${step.writes}" escapes artifact directory`);
+  }
   if (dispatchId) {
-    mkdirSync(join(artDir, `.dispatch-${String(dispatchId).replace(/[^A-Za-z0-9._-]+/g, "_")}`), { recursive: true });
+    const scopeDir = join(artDir, `.dispatch-${String(dispatchId).replace(/[^A-Za-z0-9._-]+/g, "_")}`);
+    if (!isStrictlyInsideDir(scopeDir, join(scopeDir, step.writes))) {
+      throw new Error(`[worktree-isolation] step "${step.id}" writes path "${step.writes}" escapes dispatch scope directory`);
+    }
+    mkdirSync(scopeDir, { recursive: true });
   }
   const claims = readGateClaims(artDir);
   claims[step.writes] = {
@@ -245,9 +252,18 @@ export function bindStepArtifactDispatchClaim(wtDir, artDirRel, step, { dispatch
 export function clearStaleStepArtifact(step, wtDir, stepWtDir, artDirRel) {
   if (!step || !step.writes) return { cleared: true, clearedAtMs: Date.now(), fsEpochMtimeMs: Date.now(), targets: [] };
   const artDir = join(wtDir, artDirRel);
-  const targets = [join(wtDir, artDirRel, step.writes)];
+  const mainTarget = join(wtDir, artDirRel, step.writes);
+  if (!isStrictlyInsideDir(artDir, mainTarget)) {
+    throw new Error(`[worktree-isolation] step "${step.id}" writes path "${step.writes}" escapes artifact directory`);
+  }
+  const targets = [mainTarget];
   if (stepWtDir && !samePath(stepWtDir, wtDir)) {
-    targets.push(join(stepWtDir, artDirRel, step.writes));
+    const isoArtDir = join(stepWtDir, artDirRel);
+    const isoTarget = join(isoArtDir, step.writes);
+    if (!isStrictlyInsideDir(isoArtDir, isoTarget)) {
+      throw new Error(`[worktree-isolation] step "${step.id}" writes path "${step.writes}" escapes isolated artifact directory`);
+    }
+    targets.push(isoTarget);
   }
   for (const p of targets) {
     if (!existsSync(p)) continue;
@@ -328,7 +344,8 @@ export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDir
   const dstArt = join(wtDir, artDirRel);
   if (hasSymlinkInPath(wtDir, dstArt).bad) return;
   mkdirSync(dstArt, { recursive: true });
-  const scopedWriteRel = (dispatchId && step.writes) ? dispatchIsolatedArtifactRel(dispatchId, step.writes) : null;
+  const safeDisp = dispatchId ? String(dispatchId).replace(/[^A-Za-z0-9._-]+/g, "_") : null;
+  const scopedWriteRel = (safeDisp && step.writes) ? dispatchIsolatedArtifactRel(dispatchId, step.writes) : null;
   const relCandidates = [
     ...(scopedWriteRel ? [scopedWriteRel] : []),
     ...(step.writes ? [step.writes] : []),
@@ -338,11 +355,14 @@ export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDir
   for (const fname of relCandidates) {
     const src = join(srcArt, fname);
     try {
-      // P0-01: Walk the ENTIRE source path from `stepWtDir` down to `src` to reject parent or leaf symlinks!
+      const isScopedWrite = Boolean(scopedWriteRel && fname === scopedWriteRel);
+      // P0-01: Enforce strict containment inside `srcArt` (and `.dispatch-<id>` when scoped) BEFORE touching filesystem!
+      if (!isStrictlyInsideDir(srcArt, src)) continue;
+      if (isScopedWrite && !isStrictlyInsideDir(join(srcArt, `.dispatch-${safeDisp}`), src)) continue;
+      // Walk the ENTIRE source path from `stepWtDir` down to `src` to reject parent or leaf symlinks!
       if (hasSymlinkInPath(stepWtDir, src).bad) continue;
       const st = lstatSync(src);
       if (st.isSymbolicLink() || !st.isFile()) continue;
-      const isScopedWrite = Boolean(scopedWriteRel && fname === scopedWriteRel);
       const isCanonicalWrite = Boolean(step.writes && fname === step.writes);
       const isMainWrite = isScopedWrite || isCanonicalWrite;
       if (isMainWrite && minSourceMtimeMs != null && Number.isFinite(minSourceMtimeMs) && st.mtimeMs < minSourceMtimeMs) {
@@ -373,6 +393,8 @@ export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDir
       }
 
       const dst = join(dstArt, dstRel);
+      if (!isStrictlyInsideDir(dstArt, dst)) continue;
+      if (dstRel === scopedWriteRel && safeDisp && !isStrictlyInsideDir(join(dstArt, `.dispatch-${safeDisp}`), dst)) continue;
       if (hasSymlinkInPath(wtDir, dst).bad) continue;
       mkdirSync(dirname(dst), { recursive: true });
       const tmpDst = join(dirname(dst), `.tmp-${basename(dst)}-sync-${process.pid}-${Date.now()}`);

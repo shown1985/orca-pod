@@ -493,16 +493,45 @@ export function hasSymlinkInPath(baseDir, targetPath) {
 }
 
 /**
- * Full artifact check for a pipeline step: symlink rejection, existence, minBytes,
- * writer-attested per-dispatch provenance, verify rules, and atomic promotion.
+ * P0-01: Verify that `targetPath` resolves strictly INSIDE `rootDir` (never equal to `rootDir`,
+ * never escaping via `..`, and never absolute outside `rootDir`).
+ */
+export function isStrictlyInsideDir(rootDir, targetPath) {
+  if (!rootDir || !targetPath) return false;
+  const rootAbs = resolve(rootDir);
+  const targetAbs = resolve(targetPath);
+  const rel = relative(rootAbs, targetAbs);
+  if (!rel || rel === "." || rel === ".." || rel.startsWith(`..${sep}`) || rel.startsWith("../") || rel.startsWith("..\\") || isAbsolute(rel)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Full artifact check for a pipeline step: strict directory containment (`artDir` & `.dispatch-<id>`),
+ * symlink rejection from trusted worktree root, existence, minBytes, writer-attested per-dispatch
+ * provenance, verify rules, and atomic promotion.
  */
 export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = {}) {
   if (!step || !step.writes) return { ok: true, reason: null };
+  const rawWrites = String(step.writes).trim();
+  if (!rawWrites || isAbsolute(rawWrites) || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(rawWrites)) {
+    return { ok: false, reason: `artifact path "${step.writes}" escapes artifact directory` };
+  }
   const isSettlement = (opts.mode || "settlement") === "settlement";
   const safeDisp = opts.dispatchId ? String(opts.dispatchId).replace(/[^A-Za-z0-9._-]+/g, "_") : null;
   const dispatchScopedDir = safeDisp ? join(artDir, `.dispatch-${safeDisp}`) : null;
   const dispatchScopedPath = dispatchScopedDir ? join(dispatchScopedDir, step.writes) : null;
   const canonicalPath = join(artDir, step.writes);
+
+  // P0-01: Enforce independent strict containment bounds on BOTH `canonicalPath` (inside `artDir`)
+  // AND `dispatchScopedPath` (inside `dispatchScopedDir`), BEFORE touching the filesystem!
+  if (!isStrictlyInsideDir(artDir, canonicalPath)) {
+    return { ok: false, reason: `artifact path "${step.writes}" escapes artifact directory` };
+  }
+  if (dispatchScopedDir && (!isStrictlyInsideDir(artDir, dispatchScopedDir) || !isStrictlyInsideDir(dispatchScopedDir, dispatchScopedPath))) {
+    return { ok: false, reason: `scoped artifact path "${step.writes}" escapes dispatch scope directory` };
+  }
 
   const walkRoot = resolveTrustedWalkRoot(artDir, gitDir, opts.wtRootDir || null);
   const artRootCheck = hasSymlinkInPath(walkRoot, artDir);

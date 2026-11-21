@@ -356,14 +356,74 @@ export function verifyManualTerminalClosed(orcaFn, termHandle) {
   };
 }
 
+export function collectReceiptDispatchIds(rawJson, resJson = null) {
+  const rj = resJson || res(rawJson);
+  const raw = [
+    rj?.dispatchId, rj?.dispatch_id, rj?.id,
+    rj?.dispatch?.id, rj?.dispatch?.dispatchId, rj?.dispatch?.dispatch_id,
+    rawJson?.dispatchId, rawJson?.dispatch_id,
+    rawJson?.dispatch?.id, rawJson?.dispatch?.dispatchId, rawJson?.dispatch?.dispatch_id,
+  ]
+    .filter((v) => typeof v === "string" && v.trim())
+    .map((v) => v.trim());
+  return [...new Set(raw)];
+}
+
+export function collectAllStopStates(rawJson, resJson = null) {
+  const rj = resJson || res(rawJson);
+  const rawStates = [
+    rj?.state, rj?.status, rj?.stopStatus, rj?.stop_status, rj?.workerState, rj?.worker_state,
+    rj?.dispatch?.state, rj?.dispatch?.status,
+    rawJson?.state, rawJson?.status, rawJson?.stopStatus, rawJson?.stop_status, rawJson?.workerState, rawJson?.worker_state,
+    rawJson?.dispatch?.state, rawJson?.dispatch?.status,
+  ]
+    .filter((v) => typeof v === "string" && v.trim())
+    .map((v) => v.trim().toLowerCase());
+  const rawProcActions = [
+    rj?.processAction, rj?.process_action,
+    rawJson?.processAction, rawJson?.process_action,
+  ]
+    .filter((v) => typeof v === "string" && v.trim())
+    .map((v) => v.trim().toLowerCase());
+  const hasBooleanRetained = Boolean(
+    rj?.keptOpen === true || rj?.kept_open === true || rj?.retained === true ||
+    rawJson?.keptOpen === true || rawJson?.kept_open === true || rawJson?.retained === true
+  );
+  return {
+    states: [...new Set(rawStates)],
+    procActions: [...new Set(rawProcActions)],
+    hasBooleanRetained,
+  };
+}
+
+export function collectAllReleaseStatuses(rawJson, resJson = null) {
+  const rj = resJson || res(rawJson);
+  const rawStatuses = [
+    rj?.action, rj?.status, rj?.releaseStatus, rj?.release_status, rj?.state, rj?.processAction, rj?.process_action,
+    rj?.dispatch?.status, rj?.dispatch?.state,
+    rawJson?.action, rawJson?.status, rawJson?.releaseStatus, rawJson?.release_status, rawJson?.state, rawJson?.processAction, rawJson?.process_action,
+    rawJson?.dispatch?.status, rawJson?.dispatch?.state,
+  ]
+    .filter((v) => typeof v === "string" && v.trim())
+    .map((v) => v.trim().toLowerCase());
+  const hasBooleanRetained = Boolean(
+    rj?.keptOpen === true || rj?.kept_open === true || rj?.retained === true ||
+    rawJson?.keptOpen === true || rawJson?.kept_open === true || rawJson?.retained === true
+  );
+  return {
+    statuses: [...new Set(rawStatuses)],
+    hasBooleanRetained,
+  };
+}
+
 /**
  * P0-01: Stop & release verification for caller-created MANUAL terminal dispatches:
  *   Per `orca orchestration worker-stop --help` & `worker-release --help`, a dispatch created by
  *   `orchestration dispatch` reports `fenced` on `worker-stop` and `retained` on `worker-release`.
  *   Therefore:
- *     1) Fence via `worker-stop` (accepting `fenced` or confirmed stop states, zero live helpers);
+ *     1) Fence via `worker-stop` (unanimous `fenced` or confirmed stop states across ALL fields, zero live helpers);
  *     2) Explicitly close the manual terminal via `verifyManualTerminalClosed` (requiring positive close confirmation!);
- *     3) Release via `worker-release` (accepting `retained` / `released` / `already_released` ONLY AFTER step 2 proved terminal closure!).
+ *     3) Release via `worker-release` (unanimous `retained` / `released` / `already_released` across ALL fields ONLY AFTER step 2 proved terminal closure!).
  */
 export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle) {
   if (!termHandle || !String(termHandle).trim()) {
@@ -372,32 +432,34 @@ export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle
   if (dispatchId && String(dispatchId).trim()) {
     const stopRes = orcaFn(["orchestration", "worker-stop", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
     const stopJson = res(stopRes.json);
-    const stopDispId = pick(stopJson, ["dispatchId", "dispatch_id", "id"]) || pick(stopJson.dispatch || {}, ["id", "dispatchId"]) || null;
-    const stopState = String(pick(stopJson, ["state", "status", "stopStatus"]) || "").trim().toLowerCase();
-    const procAction = String(pick(stopJson, ["processAction"]) || "").trim().toLowerCase();
+    const stopDispIds = collectReceiptDispatchIds(stopRes.json, stopJson);
+    const { states: stopStates, procActions } = collectAllStopStates(stopRes.json, stopJson);
     const helpers = Array.isArray(stopJson.helpers) ? stopJson.helpers : [];
     const liveHelper = helpers.some((h) => h && (
       h.keptOpen === true ||
       h.running === true ||
       /^(running|starting|pending|stop_unknown|unknown)$/i.test(String(h.status || h.state || ""))
     ));
-    const idMatchedStop = !stopDispId || stopDispId === dispatchId;
+    const idMatchedStop = stopDispIds.length > 0 && stopDispIds.every((id) => id === dispatchId);
+    const unanimousFence = (stopStates.length > 0 || stopJson.fenced === true) &&
+      stopStates.every((s) => CONFIRMED_MANUAL_FENCE_STATES.has(s)) &&
+      procActions.every((a) => a !== "stop_unknown" && a !== "failed" && a !== "kept_open");
     const fencedOk = Boolean(
       stopRes.ok &&
       stopRes.json &&
       idMatchedStop &&
       !liveHelper &&
-      (CONFIRMED_MANUAL_FENCE_STATES.has(stopState) || stopJson.fenced === true) &&
-      procAction !== "stop_unknown" &&
-      procAction !== "failed" &&
-      procAction !== "kept_open"
+      unanimousFence &&
+      stopJson.keptOpen !== true &&
+      stopJson.kept_open !== true &&
+      stopRes.json?.keptOpen !== true
     );
     if (!fencedOk) {
       return {
         ok: false,
         reason: liveHelper
           ? `worker-stop (${dispatchId}) left kept-open/running helper(s)`
-          : `manual worker-stop (${dispatchId}) failed to fence cleanly (state=${stopState || "empty"}, action=${procAction || "none"}: ${sanitizeText(stopRes.stderr || stopRes.raw || "unconfirmed", { maxLen: 180 })})`,
+          : `manual worker-stop (${dispatchId}) failed to fence cleanly (states=[${stopStates.join(",") || "empty"}], actions=[${procActions.join(",") || "none"}]: ${sanitizeText(stopRes.stderr || stopRes.raw || "unconfirmed", { maxLen: 180 })})`,
       };
     }
   }
@@ -410,20 +472,23 @@ export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle
   if (dispatchId && String(dispatchId).trim()) {
     const relRes = orcaFn(["orchestration", "worker-release", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
     const relJson = res(relRes.json);
-    const relDispId = pick(relJson, ["dispatchId", "dispatch_id", "id"]) || pick(relJson.dispatch || {}, ["id", "dispatchId"]) || null;
-    const relState = String(pick(relJson, ["action", "status", "releaseStatus"]) || "").trim().toLowerCase();
-    const idMatchedRel = !relDispId || relDispId === dispatchId;
+    const relDispIds = collectReceiptDispatchIds(relRes.json, relJson);
+    const { statuses: relStatuses } = collectAllReleaseStatuses(relRes.json, relJson);
+    const idMatchedRel = relDispIds.length > 0 && relDispIds.every((id) => id === dispatchId);
+    const unanimousManualRel = relStatuses.length > 0 && relStatuses.every((s) => CONFIRMED_MANUAL_RELEASE_STATES.has(s));
     const relOk = Boolean(
       relRes.ok &&
       relRes.json &&
       idMatchedRel &&
-      CONFIRMED_MANUAL_RELEASE_STATES.has(relState) &&
-      relJson.keptOpen !== true
+      unanimousManualRel &&
+      relJson.keptOpen !== true &&
+      relJson.kept_open !== true &&
+      relRes.json?.keptOpen !== true
     );
     if (!relOk) {
       return {
         ok: false,
-        reason: `manual worker-release (${dispatchId}) lacked confirmation after terminal close (status=${relState || "empty"}: ${sanitizeText(relRes.stderr || relRes.raw || "unconfirmed", { maxLen: 180 })})`,
+        reason: `manual worker-release (${dispatchId}) lacked confirmation after terminal close (statuses=[${relStatuses.join(",") || "empty"}]: ${sanitizeText(relRes.stderr || relRes.raw || "unconfirmed", { maxLen: 180 })})`,
       };
     }
   }
@@ -431,11 +496,11 @@ export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle
 }
 
 /**
- * P0-01: Require explicit POSITIVE stop AND release confirmation for SUPERVISED (`cold`) `dispatchId`:
- *   - `worker-stop` MUST confirm an actual stopped state (`stopped|terminated|exited|already_stopped|completed|not_found`);
+ * P0-01: Require explicit UNANIMOUS stop AND release confirmation across ALL fields for SUPERVISED (`cold`) `dispatchId`:
+ *   - `worker-stop` MUST confirm an actual stopped state across ALL state/status fields (`state=stopped, status=running` is REJECTED!);
  *     `"fenced"` or bare `processAction` without a confirmed stop state is REJECTED!
- *   - `worker-release` MUST return a non-empty confirmed release state (`released|already_released|closed|not_found`);
- *     empty `""`, `null`, `release_pending`, `release_unknown`, or `retained` is REJECTED!
+ *   - `worker-release` MUST return a non-empty confirmed release state across ALL action/status/releaseStatus fields
+ *     (`action=released, releaseStatus=retained` is REJECTED!).
  */
 export function verifyStopAndReleaseReceipt(orcaFn, dispatchId) {
   if (!dispatchId || !String(dispatchId).trim()) {
@@ -443,24 +508,25 @@ export function verifyStopAndReleaseReceipt(orcaFn, dispatchId) {
   }
   const stopRes = orcaFn(["orchestration", "worker-stop", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
   const stopJson = res(stopRes.json);
-  const stopDispId = pick(stopJson, ["dispatchId", "dispatch_id", "id"]) || pick(stopJson.dispatch || {}, ["id", "dispatchId"]) || null;
-  const stopStateRaw = pick(stopJson, ["state", "status", "stopStatus"]);
-  const stopState = String(stopStateRaw || "").trim().toLowerCase();
-  const procAction = String(pick(stopJson, ["processAction"]) || "").trim().toLowerCase();
+  const stopDispIds = collectReceiptDispatchIds(stopRes.json, stopJson);
+  const { states: stopStates, procActions, hasBooleanRetained: stopRetained } = collectAllStopStates(stopRes.json, stopJson);
   const helpers = Array.isArray(stopJson.helpers) ? stopJson.helpers : [];
   const liveHelper = helpers.some((h) => h && (
     h.keptOpen === true ||
     h.running === true ||
     /^(running|starting|pending|stop_unknown|unknown)$/i.test(String(h.status || h.state || ""))
   ));
-  const idMatchedStop = !stopDispId || stopDispId === dispatchId;
+  const idMatchedStop = stopDispIds.length > 0 && stopDispIds.every((id) => id === dispatchId);
+  const unanimousStopped = stopStates.length > 0 &&
+    stopStates.every((s) => CONFIRMED_STOP_STATES.has(s)) &&
+    procActions.every((a) => !REJECTED_PROC_ACTIONS.has(a));
   const provenStopped = Boolean(
     stopRes.ok &&
     stopRes.json &&
     idMatchedStop &&
     !liveHelper &&
-    CONFIRMED_STOP_STATES.has(stopState) &&
-    !REJECTED_PROC_ACTIONS.has(procAction)
+    !stopRetained &&
+    unanimousStopped
   );
   if (!provenStopped) {
     return {
@@ -468,29 +534,29 @@ export function verifyStopAndReleaseReceipt(orcaFn, dispatchId) {
       reason: liveHelper
         ? `worker-stop (${dispatchId}) left kept-open/running helper(s)`
         : !idMatchedStop
-          ? `worker-stop receipt dispatchId mismatch (got "${stopDispId}", expected "${dispatchId}")`
-          : `worker-stop (${dispatchId}) lacked positive terminal stop confirmation (state=${stopState || "empty"}, action=${procAction || "none"}: ${sanitizeText(stopRes.stderr || stopRes.raw || "unconfirmed", { maxLen: 180 })})`,
+          ? `worker-stop receipt dispatchId mismatch (got [${stopDispIds.join(",") || "missing"}], expected "${dispatchId}")`
+          : `worker-stop (${dispatchId}) lacked unanimous terminal stop confirmation (states=[${stopStates.join(",") || "empty"}], actions=[${procActions.join(",") || "none"}]: ${sanitizeText(stopRes.stderr || stopRes.raw || "unconfirmed", { maxLen: 180 })})`,
     };
   }
 
   const relRes = orcaFn(["orchestration", "worker-release", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
   const relJson = res(relRes.json);
-  const relDispId = pick(relJson, ["dispatchId", "dispatch_id", "id"]) || pick(relJson.dispatch || {}, ["id", "dispatchId"]) || null;
-  const relActionRaw = pick(relJson, ["action", "status", "releaseStatus"]);
-  const relState = String(relActionRaw || "").trim().toLowerCase();
-  const idMatchedRel = !relDispId || relDispId === dispatchId;
+  const relDispIds = collectReceiptDispatchIds(relRes.json, relJson);
+  const { statuses: relStatuses, hasBooleanRetained: relRetained } = collectAllReleaseStatuses(relRes.json, relJson);
+  const idMatchedRel = relDispIds.length > 0 && relDispIds.every((id) => id === dispatchId);
+  const unanimousReleased = relStatuses.length > 0 &&
+    relStatuses.every((s) => CONFIRMED_RELEASE_STATES.has(s) || s === "closed_agent_terminal");
   const provenReleased = Boolean(
     relRes.ok &&
     relRes.json &&
     idMatchedRel &&
-    CONFIRMED_RELEASE_STATES.has(relState) &&
-    relJson.retained !== true &&
-    relJson.keptOpen !== true
+    !relRetained &&
+    unanimousReleased
   );
   if (!provenReleased) {
     return {
       ok: false,
-      reason: `worker-release (${dispatchId}) lacked positive release confirmation (status=${relState || "empty"}: ${sanitizeText(relRes.stderr || relRes.raw || "unconfirmed", { maxLen: 180 })}) — terminal ownership not released`,
+      reason: `worker-release (${dispatchId}) lacked unanimous release confirmation (statuses=[${relStatuses.join(",") || "empty"}]: ${sanitizeText(relRes.stderr || relRes.raw || "unconfirmed", { maxLen: 180 })}) — terminal ownership not released`,
     };
   }
   return { ok: true, reason: null };
@@ -531,8 +597,12 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     for (const c of cands) {
       const rem = clampTimeoutToDeadline(deadlineAt, 3000);
       if (rem === 0) return null;
-      const p = spawnSync(c, ["--version"], { encoding: "utf8", timeout: rem });
-      if (deadlineAt != null && Number.isFinite(deadlineAt) && (Date.now() >= deadlineAt || p.error?.code === "ETIMEDOUT" || p.signal === "SIGTERM")) {
+      const p = spawnSync(c, ["--version"], {
+        encoding: "utf8",
+        timeout: rem,
+        ...(deadlineAt != null && Number.isFinite(deadlineAt) ? { killSignal: "SIGKILL" } : {}),
+      });
+      if (deadlineAt != null && Number.isFinite(deadlineAt) && (Date.now() >= deadlineAt || p.error?.code === "ETIMEDOUT" || p.signal === "SIGTERM" || p.signal === "SIGKILL")) {
         return null;
       }
       if (!p.error) { orcaBin = c; return c; }
@@ -579,8 +649,13 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       };
     }
     const full = args.includes("--json") ? args : [...args, "--json"];
-    const r = spawnSync(orcaBin, full, { encoding: "utf8", timeout: effTimeout, maxBuffer: 64 * 1024 * 1024 });
-    const timedOut = Boolean(r.error?.code === "ETIMEDOUT" || r.signal === "SIGTERM");
+    const r = spawnSync(orcaBin, full, {
+      encoding: "utf8",
+      timeout: effTimeout,
+      maxBuffer: 64 * 1024 * 1024,
+      ...(allowPostDeadlineCleanup || (deadlineAt != null && Number.isFinite(deadlineAt)) ? { killSignal: "SIGKILL" } : {}),
+    });
+    const timedOut = Boolean(r.error?.code === "ETIMEDOUT" || r.signal === "SIGTERM" || r.signal === "SIGKILL");
     const hitDeadline = Boolean(
       !allowPostDeadlineCleanup &&
       deadlineAt != null &&

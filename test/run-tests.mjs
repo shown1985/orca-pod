@@ -6920,6 +6920,256 @@ process.exit(0);
 });
 
 // ---------------------------------------------------------------------------
+// V16 — Round-8 final closure regressions (P0-01a, P0-01b, P0-03, P1-02)
+// ---------------------------------------------------------------------------
+scenario("V16 Round-8 final closure: conflict-free stop/release receipts before re-dispatch, strict artDir & .dispatch-<id> containment against '../' escape, full model+effort launch-spec preflight & fail-closed dispatch, and SIGKILL hard-deadline escalation", async () => {
+  const {
+    createOrcaClient,
+    verifyStopAndReleaseReceipt,
+    verifyManualStopAndReleaseReceipt,
+  } = await import("../.orca/lib/orca-cli.mjs");
+  const { verifyStepArtifact, isStrictlyInsideDir } = await import("../.orca/gate-verify.mjs");
+  const { clearStaleStepArtifact, bindStepArtifactDispatchClaim } = await import("../.orca/worktree-isolation.mjs");
+  const { classifyModelFamily, filterCrossFamilyCandidates } = await import("../.orca/preflight.mjs");
+
+  const tmpV16 = mkdtempSync(join(tmpdir(), "orca-v16-"));
+  dirsOfCurrentScenario.push(tmpV16);
+
+  // =========================================================================
+  // 1) P0-01a: Conflicting `worker-stop` (`state=stopped, status=running`) and
+  //    conflicting `worker-release` (`action=released, releaseStatus=retained`)
+  //    MUST block re-dispatch (exit 1, ONLY 1 `worker-start`, 0 fallback)!
+  // =========================================================================
+  const rUnitConflictStop = verifyStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "d1", state: "stopped", status: "running" } } };
+    return { ok: true, json: { result: { dispatchId: "d1", status: "released" } } };
+  }, "d1");
+  const rUnitConflictRel = verifyStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "d1", state: "stopped" } } };
+    return { ok: true, json: { result: { dispatchId: "d1", action: "released", releaseStatus: "retained" } } };
+  }, "d1");
+  const rUnitManConflict = verifyManualStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "dm1", state: "fenced", status: "running" } } };
+    if (args[0] === "terminal" && args[1] === "close") return { ok: true, json: { result: { handle: "tm1", status: "closed", closed: true } } };
+    if (args[0] === "terminal" && args[1] === "show") return { ok: false, stderr: "Terminal tm1 not found" };
+    return { ok: true, json: { result: { dispatchId: "dm1", status: "retained" } } };
+  }, "dm1", "tm1");
+  eq("V16 P0-01a unit stop/release validators reject contradictory stop (stopped+running) and release (released+retained) receipts",
+    [rUnitConflictStop.ok, rUnitConflictRel.ok, rUnitManConflict.ok], [false, false, false]);
+
+  const v16RedispCfg = join(REPO, ".orca", "_tmp-v16-redisp.config.json");
+  const v16RedispScen = join(REPO, "test", "scenarios", "_tmp-v16-redisp-conflict.cjs");
+  writeFileSync(v16RedispCfg, JSON.stringify({
+    defaults: { timeoutMs: 5000, hardTimeoutMs: 15000, startRetries: 0, preflight: { enabled: false } },
+    pipeline: [
+      {
+        id: "coding",
+        title: "Coding",
+        agent: "opencode2",
+        model: "deepseek-v4.1",
+        fallbacks: [{ agent: "claude", model: "claude-sonnet-4-5" }],
+        spec: "Code {out}.",
+        writes: "CHANGES.md",
+      },
+    ],
+  }));
+  writeFileSync(v16RedispScen, `module.exports = {
+  handlers: {
+    "orchestration worker-start": (c) => {
+      const id = "disp-" + c.id();
+      c.state.dispatches[id] = { id, task: c.flags.task, status: "dispatching", created: Date.now() };
+      if ((c.state.extra.starts = (c.state.extra.starts || 0) + 1) === 1) {
+        return c.ok({ dispatchId: id, state: "failed", failedStage: "agent_readiness", lastError: "boot error" });
+      }
+      c.materialize(c.state.tasks[c.flags.task] || {}, "succeeded");
+      c.pushDone(c.flags.task, "succeeded", id);
+      return c.ok({ dispatchId: id, state: "ready" });
+    },
+    "orchestration worker-stop": (c) => {
+      if (process.env.V16_CONFLICT_MODE === "stop_running") {
+        return c.ok({ dispatchId: c.flags.dispatch, state: "stopped", status: "running" });
+      }
+      return c.ok({ dispatchId: c.flags.dispatch, state: "stopped" });
+    },
+    "orchestration worker-release": (c) => {
+      if (process.env.V16_CONFLICT_MODE === "release_retained") {
+        return c.ok({ dispatchId: c.flags.dispatch, action: "released", releaseStatus: "retained" });
+      }
+      return c.ok({ dispatchId: c.flags.dispatch, status: "released" });
+    },
+  },
+};\n`);
+  try {
+    const rStopRunningE2E = await runFlow({
+      name: "v16-stop-running",
+      config: "_tmp-v16-redisp.config.json",
+      scenario: "_tmp-v16-redisp-conflict.cjs",
+      env: { V16_CONFLICT_MODE: "stop_running" },
+      budgetMs: 25000,
+    });
+    eq("V16 P0-01a E2E conflicting state=stopped + status=running exits 1 with ONLY 1 worker-start (0 fallback re-dispatch)",
+      [rStopRunningE2E.code, rStopRunningE2E.by("orchestration worker-start").length], [1, 1]);
+
+    const rRelRetainedE2E = await runFlow({
+      name: "v16-rel-retained",
+      config: "_tmp-v16-redisp.config.json",
+      scenario: "_tmp-v16-redisp-conflict.cjs",
+      env: { V16_CONFLICT_MODE: "release_retained" },
+      budgetMs: 25000,
+    });
+    eq("V16 P0-01a E2E conflicting action=released + releaseStatus=retained exits 1 with ONLY 1 worker-start (0 fallback re-dispatch)",
+      [rRelRetainedE2E.code, rRelRetainedE2E.by("orchestration worker-start").length], [1, 1]);
+  } finally {
+    try { rmSync(v16RedispCfg, { force: true }); } catch {}
+    try { rmSync(v16RedispScen, { force: true }); } catch {}
+  }
+
+  // =========================================================================
+  // 2) P0-01b: Strict directory containment on `artDir` and `.dispatch-<id>`:
+  //    `writes: "../wrong-location.md"` MUST be rejected without touching `.orca/wrong-location.md`!
+  // =========================================================================
+  const escWt16 = join(tmpV16, "esc-wt");
+  const escArt16 = join(escWt16, ".orca", "artifacts");
+  mkdirSync(join(escArt16, ".dispatch-disp-16"), { recursive: true });
+  const sentinelNeighbor = "# Protected Neighbor File Outside artDir\nDO NOT OVERWRITE!\n";
+  writeFileSync(join(escWt16, ".orca", "wrong-location.md"), sentinelNeighbor);
+  // Attacker places an unmarked PASS file at `.orca/artifacts/wrong-location.md`
+  // (which `join(escArt16, ".dispatch-disp-16", "../wrong-location.md")` resolves to!)
+  writeFileSync(join(escArt16, "wrong-location.md"), "# Unmarked Escape\n\nDetailed text.\n\nVERDICT: PASS\n");
+  writeFileSync(join(escArt16, ".dispatch-gate-claims.json"), JSON.stringify({
+    "../wrong-location.md": { cleared: true, activeDispatchId: "disp-16", stepId: "code-review", fsEpochMtimeMs: 0 },
+  }, null, 2));
+
+  const gEscape = verifyStepArtifact(
+    { id: "code-review", writes: "../wrong-location.md", verify: { requireVerdict: "PASS" } },
+    escArt16, escWt16, 20,
+    { mode: "settlement", dispatchId: "disp-16", clearedBeforeDispatch: true }
+  );
+  let clearThrew = false;
+  let bindThrew = false;
+  try { clearStaleStepArtifact({ id: "s", writes: "../wrong-location.md" }, escWt16, null, ".orca/artifacts"); } catch { clearThrew = true; }
+  try { bindStepArtifactDispatchClaim(escWt16, ".orca/artifacts", { id: "s", writes: "../wrong-location.md" }, { dispatchId: "disp-16" }); } catch { bindThrew = true; }
+  eq("V16 P0-01b writes='../wrong-location.md' is REJECTED by gate/clear/bind and NEVER overwrites .orca/wrong-location.md",
+    [
+      isStrictlyInsideDir(escArt16, join(escArt16, "../wrong-location.md")),
+      gEscape.ok,
+      clearThrew,
+      bindThrew,
+      readFileSync(join(escWt16, ".orca", "wrong-location.md"), "utf8") === sentinelNeighbor,
+    ],
+    [false, false, true, true, true]);
+
+  // =========================================================================
+  // 3) P0-03: Invalid `effort: "high low"` on OpenCode reviewer with OpenAI
+  //    project default model MUST NOT pass preflight or dispatch self-review!
+  // =========================================================================
+  const ocWtProj16 = join(tmpV16, "oc-wt-proj");
+  mkdirSync(ocWtProj16, { recursive: true });
+  writeFileSync(join(ocWtProj16, "opencode.json"), JSON.stringify({ model: "openai/gpt-6.2-sol" }));
+  eq("V16 P0-03 classifyModelFamily & filterCrossFamilyCandidates reject invalid multi-token effort='high low'",
+    [
+      classifyModelFamily("opencode", "claude-sonnet-4-5", { effort: "high low", projectDir: ocWtProj16 }),
+      filterCrossFamilyCandidates(
+        [{ agent: "opencode", model: "claude-sonnet-4-5", effort: "high low", isPrimary: true }],
+        new Map([["openai", [{ stepId: "coding", agent: "codex", model: "gpt-6.2-sol" }]]]),
+        { projectDir: ocWtProj16 }
+      ).allowed.length,
+    ],
+    ["unknown", 0]);
+
+  const v16EffortGoodCfg = join(REPO, ".orca", "_tmp-v16-effort-good.config.json");
+  const v16EffortBadCfg = join(REPO, ".orca", "_tmp-v16-effort-bad.config.json");
+  const makeV16ReviewCfg = (effortVal) => JSON.stringify({
+    defaults: { timeoutMs: 5000, hardTimeoutMs: 15000, preflight: { enabled: false } },
+    pipeline: [
+      { id: "coding", title: "Coding", agent: "codex", model: "gpt-6.2-sol", spec: "Code {out}.", writes: "CHANGES.md" },
+      {
+        id: "code-review",
+        title: "Code Review",
+        agent: "opencode",
+        model: "claude-sonnet-4-5",
+        effort: effortVal,
+        crossFamilyWith: ["coding"],
+        reads: ["coding"],
+        verify: { requireVerdict: "PASS" },
+        spec: "Review {out}.",
+        writes: "REVIEW.md",
+      },
+    ],
+  });
+  writeFileSync(v16EffortGoodCfg, makeV16ReviewCfg("high"));
+  writeFileSync(v16EffortBadCfg, makeV16ReviewCfg("high low"));
+  try {
+    const rEffGood = await runFlow({
+      name: "v16-eff-good",
+      config: "_tmp-v16-effort-good.config.json",
+      seedWorktree: [{ file: "opencode.json", text: JSON.stringify({ model: "openai/gpt-6.2-sol" }) }],
+      budgetMs: 25000,
+    });
+    const goodRevStart = rEffGood.by("orchestration worker-start")[1];
+    eq("V16 P0-03 positive control: valid effort='high' dispatches OpenCode reviewer with --model claude-sonnet-4-5 (anthropic)",
+      [rEffGood.code, goodRevStart?.flags?.model, rEffGood.status?.steps?.find((s) => s.id === "code-review")?.family],
+      [0, "claude-sonnet-4-5", "anthropic"]);
+
+    const rEffBad = await runFlow({
+      name: "v16-eff-bad",
+      config: "_tmp-v16-effort-bad.config.json",
+      seedWorktree: [{ file: "opencode.json", text: JSON.stringify({ model: "openai/gpt-6.2-sol" }) }],
+      budgetMs: 25000,
+    });
+    eq("V16 P0-03 invalid effort='high low' blocks reviewer before dispatch (non-zero exit, ONLY 1 worker-start for author, 0 for reviewer)",
+      [rEffBad.code !== 0, rEffBad.by("orchestration worker-start").length],
+      [true, 1]);
+  } finally {
+    try { rmSync(v16EffortGoodCfg, { force: true }); } catch {}
+    try { rmSync(v16EffortBadCfg, { force: true }); } catch {}
+  }
+
+  // =========================================================================
+  // 4) P1-02: Child CLI trapping SIGTERM and sleeping 1150ms under a 500ms
+  //    hard `deadlineAt` MUST be killed immediately via SIGKILL (<< 750ms, NEVER ~1535ms)!
+  // =========================================================================
+  const sigtermTrapCli = join(tmpV16, "mock-sigterm-trap.cjs");
+  writeFileSync(sigtermTrapCli, `#!/usr/bin/env node
+process.on("SIGTERM", () => { /* ignore SIGTERM! */ });
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+  console.log("orca 1.0.0");
+  process.exit(0);
+}
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1150);
+console.log(JSON.stringify({ result: { worktree: { path: "/tmp" } } }));
+process.exit(0);
+`, { mode: 0o755 });
+
+  const prevOrca16 = process.env.ORCA_CLI_COMMAND;
+  try {
+    process.env.ORCA_CLI_COMMAND = sigtermTrapCli;
+    const trapCli = createOrcaClient({
+      cfg: { defaults: {} },
+      opt: {},
+      objective: "v16-sigkill",
+      autoRun: true,
+      agentOf: (s) => s.agent,
+      modelOf: (s) => s.model,
+      writeStatus: () => {},
+      log: () => {},
+      warn: () => {},
+      die: (m) => { throw new Error(m); },
+    });
+    const t0Trap = Date.now();
+    const rTrap = trapCli.orca(["worktree", "current"], { deadlineAt: t0Trap + 500 });
+    const dtTrap = Date.now() - t0Trap;
+    ok(`V16 P1-02 SIGTERM-trapping child CLI under 500ms deadlineAt is terminated via SIGKILL at ~500ms (got ${dtTrap}ms, deadlineExceeded=${rTrap.deadlineExceeded})`,
+      rTrap.deadlineExceeded === true && dtTrap <= 750);
+  } finally {
+    if (prevOrca16 === undefined) delete process.env.ORCA_CLI_COMMAND;
+    else process.env.ORCA_CLI_COMMAND = prevOrca16;
+  }
+});
+
+// ---------------------------------------------------------------------------
 (async () => {
   const t0 = Date.now();
   for (const s of scenarios) {

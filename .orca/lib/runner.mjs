@@ -39,6 +39,7 @@ import {
 import { formatIssuePrBlock } from "../issue-tracker.mjs";
 import {
   pick, res, sleepMs, parkedPromptOf, outcomeOf, promptChoice,
+  collectReceiptDispatchIds, collectAllReleaseStatuses,
   verifyStopAndReleaseReceipt, verifyManualStopAndReleaseReceipt, verifyManualTerminalClosed,
 } from "./orca-cli.mjs";
 import { createNudgeController } from "./nudge.mjs";
@@ -491,29 +492,12 @@ export function createRunner({
     } else if (m.dispatchId) {
       const rel = orca(["orchestration", "worker-release", "--dispatch", m.dispatchId], { allowPostDeadlineCleanup: true, timeoutMs: 3000 });
       const relJson = res(rel.json);
-      const relDispIds = [
-        relJson?.dispatchId, relJson?.dispatch_id, relJson?.id,
-        relJson?.dispatch?.id, relJson?.dispatch?.dispatchId, relJson?.dispatch?.dispatch_id,
-        rel.json?.dispatchId, rel.json?.dispatch_id,
-        rel.json?.dispatch?.id, rel.json?.dispatch?.dispatchId,
-      ]
-        .filter((v) => typeof v === "string" && v.trim())
-        .map((v) => v.trim());
+      const relDispIds = collectReceiptDispatchIds(rel.json, relJson);
       const unanimousRelDisp = relDispIds.length > 0 && relDispIds.every((id) => id === m.dispatchId);
-      const rawStatuses = [
-        relJson?.action, relJson?.status, relJson?.releaseStatus, relJson?.release_status, relJson?.state, relJson?.processAction, relJson?.process_action,
-        rel.json?.action, rel.json?.status, rel.json?.releaseStatus, rel.json?.release_status, rel.json?.state,
-      ]
-        .filter((v) => typeof v === "string" && v.trim())
-        .map((v) => v.trim().toLowerCase());
+      const { statuses: rawStatuses, hasBooleanRetained } = collectAllReleaseStatuses(rel.json, relJson);
       const relAction = rawStatuses[0] || "";
       const keptOpenOrConflicting = Boolean(
-        relJson?.keptOpen === true ||
-        relJson?.kept_open === true ||
-        relJson?.retained === true ||
-        rel.json?.keptOpen === true ||
-        rel.json?.kept_open === true ||
-        rel.json?.retained === true ||
+        hasBooleanRetained ||
         rawStatuses.some((s) => /^(?:retained|kept_open|keep_open|release_unknown|release_pending|pending|unknown|failed|none|fenced)$/.test(s))
       );
       const unanimousReleased = rawStatuses.length > 0 && rawStatuses.every((s) =>
@@ -812,20 +796,47 @@ export function createRunner({
         rematerializeForCandidate(step, activeCand.agent, worktreeDir, sharedPrepared, materializedDirs);
       }
 
+      const rawLaunchModel = activeCand.isPrimary ? (activeCand.requestedModel ?? modelOf(step)) : (activeCand.requestedModel ?? activeCand.model);
+      const rawLaunchEffort = activeCand.isPrimary ? (activeCand.requestedEffort ?? step.effort ?? cfg?.defaults?.effort ?? null) : (activeCand.requestedEffort ?? activeCand.effort ?? null);
       const launchSpec = resolveEffectiveLaunchSpec(
         activeCand.agent,
-        activeCand.isPrimary ? (activeCand.requestedModel ?? modelOf(step)) : (activeCand.requestedModel ?? activeCand.model),
-        activeCand.isPrimary ? (activeCand.requestedEffort ?? step.effort ?? null) : (activeCand.requestedEffort ?? activeCand.effort),
+        rawLaunchModel,
+        rawLaunchEffort,
         { projectDir: worktreeDir }
       );
+      if (!launchSpec.parseable) {
+        const invReason = `invalid launch specification for "${activeCand.agent}" (${launchSpec.parseReason || "unparseable"}: model=${sanitizeText(String(rawLaunchModel || "default"), { maxLen: 80 })}, effort=${sanitizeText(String(rawLaunchEffort || "none"), { maxLen: 80 })}) — refusing to strip options and dispatch with unverified defaults`;
+        const nextIdx = candIndex + 1;
+        if (nextIdx >= fullChain.length) {
+          statusSet(step.id, { status: "failed", health: "blocked", note: invReason });
+          writeStatus();
+          LEDGER?.recordStepSettled({ stepId: step.id, outcome: "blocked", note: invReason, verifyOk: false, verifyReason: invReason });
+          throw new FlowFatalError(invReason);
+        }
+        const nextCand = fullChain[nextIdx];
+        warn(`[preflight] "${step.title}" rejected invalid candidate "${activeCand.agent}" (${invReason}); advancing to "${nextCand.agent}".`);
+        LEDGER?.recordFallback({
+          stepId: step.id,
+          fromAgent: activeCand.agent,
+          fromModel: rawLaunchModel,
+          toAgent: nextCand.agent,
+          toModel: nextCand.model,
+          toEffort: nextCand.effort,
+          toFamily: nextCand.family,
+          reason: invReason,
+          phase: "preflight",
+        });
+        candIndex = nextIdx;
+        continue;
+      }
       const wtTag = stepCtx?.isolated ? `, worktree=${stepCtx.wtName}, branch=${stepCtx.branch}` : "";
       const modelTag = launchSpec.passedModel ? `, model=${launchSpec.passedModel}` : "";
       const effortTag = launchSpec.effectiveEffort ? `, effort=${launchSpec.effectiveEffort}` : "";
       log(`> ${step.title}  (agent=${activeCand.agent}${modelTag}${effortTag}, task=${taskId}${wtTag})`);
       requestId = `req-${++attemptSeq}-${step.id}`;
-      const requestedModel = activeCand.isPrimary ? (modelOf(step) || null) : (activeCand.requestedModel || activeCand.model || null);
-      const requestedEffort = activeCand.isPrimary ? (step.effort || cfg?.defaults?.effort || null) : (activeCand.requestedEffort || activeCand.effort || null);
-      const recordedFamily = classifyModelFamily(activeCand.agent, requestedModel, { projectDir: worktreeDir });
+      const requestedModel = rawLaunchModel || null;
+      const requestedEffort = rawLaunchEffort || null;
+      const recordedFamily = classifyModelFamily(activeCand.agent, requestedModel, { effort: requestedEffort, projectDir: worktreeDir });
       if (LEDGER) {
         LEDGER.recordIntent({
           requestId,

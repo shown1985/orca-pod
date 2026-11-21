@@ -734,8 +734,8 @@ function matchModelIdFamily(modelStr) {
  *     `omp`, `pi`) without a resolved model return `"unknown"` so cross-family gates fail closed.
  *   - Synthetic test harness `"stub"` returns `"stub"`.
  */
-export function classifyModelFamily(agent, model = null, { projectDir = null, configPaths = null } = {}) {
-  const launch = resolveEffectiveLaunchSpec(agent, model, null, { projectDir, configPaths });
+export function classifyModelFamily(agent, model = null, { effort = null, projectDir = null, configPaths = null } = {}) {
+  const launch = resolveEffectiveLaunchSpec(agent, model, effort, { projectDir, configPaths });
   if (!launch.parseable) return "unknown";
   const baseAgent = launch.baseAgent.toLowerCase();
 
@@ -1052,6 +1052,8 @@ export function normalizeCandidate(raw, isPrimary = false, { projectDir = null }
       requestedEffort: null,
       preflight: null,
       isPrimary,
+      parseable: launch.parseable,
+      parseReason: launch.parseReason,
       family: classifyModelFamily(trimmed, null, { projectDir }),
     };
   }
@@ -1061,7 +1063,7 @@ export function normalizeCandidate(raw, isPrimary = false, { projectDir = null }
   const reqModel = raw.model != null && String(raw.model).trim() && String(raw.model).trim() !== "default"
     ? String(raw.model).trim()
     : null;
-  const reqEffort = raw.effort ? String(raw.effort).trim() : null;
+  const reqEffort = raw.effort != null && String(raw.effort).trim() ? String(raw.effort).trim() : null;
   const launch = resolveEffectiveLaunchSpec(agent, reqModel, reqEffort, { projectDir });
   return {
     agent,
@@ -1072,7 +1074,9 @@ export function normalizeCandidate(raw, isPrimary = false, { projectDir = null }
     requestedEffort: reqEffort,
     preflight: raw.preflight && typeof raw.preflight === "object" ? raw.preflight : null,
     isPrimary,
-    family: classifyModelFamily(agent, reqModel, { projectDir }),
+    parseable: launch.parseable,
+    parseReason: launch.parseReason,
+    family: classifyModelFamily(agent, reqModel, { effort: reqEffort, projectDir }),
   };
 }
 
@@ -1167,10 +1171,16 @@ export function filterCrossFamilyCandidates(
 
   for (const cand of chain || []) {
     const rawCandModel = cand.requestedModel !== undefined ? cand.requestedModel : cand.model;
-    const computedFam = classifyModelFamily(cand.agent, rawCandModel, { projectDir });
-    const fam = (computedFam === "unknown" && cand.family === "stub" && allowSyntheticStub)
-      ? "stub"
-      : (cand.agent ? computedFam : (cand.family ?? "unknown"));
+    const rawCandEffort = cand.requestedEffort !== undefined ? cand.requestedEffort : cand.effort;
+    const fullSpec = resolveEffectiveLaunchSpec(cand.agent, rawCandModel, rawCandEffort, { projectDir });
+    const computedFam = fullSpec.parseable
+      ? classifyModelFamily(cand.agent, rawCandModel, { effort: rawCandEffort, projectDir })
+      : "unknown";
+    const fam = (!fullSpec.parseable)
+      ? "unknown"
+      : ((computedFam === "unknown" && cand.family === "stub" && allowSyntheticStub)
+        ? "stub"
+        : (cand.agent ? computedFam : (cand.family ?? "unknown")));
     if (fam === "stub" && allowSyntheticStub) {
       allowed.push(cand);
       continue;

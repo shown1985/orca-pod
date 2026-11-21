@@ -20,6 +20,7 @@ export const WORKTREES_MANIFEST = "WORKTREES.json";
 export const DISPATCH_GATE_CLAIMS_FILE = ".dispatch-gate-claims.json";
 const CASE_INSENSITIVE_FS = process.platform === "win32" || process.platform === "darwin";
 const O_NOFOLLOW_FLAG = constants.O_NOFOLLOW ?? 0;
+const O_NONBLOCK_FLAG = typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0;
 
 function samePath(a, b) {
   if (!a || !b) return false;
@@ -101,9 +102,11 @@ function ensureLocalGitExclude(stepWtDir, artDirRel) {
     const exLst = lstatSafe(excludePath);
     if (exLst && (exLst.isSymbolicLink() || exLst.isDirectory())) return;
     let existing = "";
-    if (exLst && exLst.isFile()) {
-      const rfd = openSync(excludePath, constants.O_RDONLY | O_NOFOLLOW_FLAG);
+    if (exLst) {
+      if (!exLst.isFile()) return;
+      const rfd = openSync(excludePath, constants.O_RDONLY | O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG);
       try {
+        if (!fstatSync(rfd).isFile()) return;
         existing = readFileSync(rfd, "utf8");
       } finally {
         try { closeSync(rfd); } catch {}
@@ -115,8 +118,9 @@ function ensureLocalGitExclude(stepWtDir, artDirRel) {
     if (toAdd.length) {
       const base = existing ? existing.replace(/\r?\n?$/, "\n") : "";
       const outBuf = Buffer.from(base + "# orca-pod engine-managed paths\n" + toAdd.join("\n") + "\n", "utf8");
-      const wfd = openSync(excludePath, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | O_NOFOLLOW_FLAG, 0o644);
+      const wfd = openSync(excludePath, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG, 0o644);
       try {
+        if (!fstatSync(wfd).isFile()) return;
         let off = 0;
         while (off < outBuf.length) {
           off += writeSync(wfd, outBuf, off, outBuf.length - off);

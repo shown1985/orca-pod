@@ -610,10 +610,12 @@ export function assertSafePathFromRoot(trustedRootDir, containerDir, targetPath,
 }
 
 const O_NOFOLLOW_FLAG = constants.O_NOFOLLOW ?? 0;
+const O_NONBLOCK_FLAG = typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0;
 
 /**
  * P0-01b: Read a regular file inside `containerDir` (anchored at `walkRoot`) from a
- * SINGLE `O_RDONLY | O_NOFOLLOW` descriptor (no separate pre-open `lstatSync` race window!),
+ * SINGLE `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` descriptor (no separate pre-open `lstatSync`
+ * race window, and `O_NONBLOCK` prevents blocking on writerless POSIX FIFOs before `fstatSync`!),
  * verifying `fstatSync(fd).isFile()` before AND after `readFileSync(fd)` with matching
  * `(dev, ino)` and `buf.length === stAfter.size`.
  */
@@ -622,7 +624,7 @@ export function readFileNoFollow(walkRoot, containerDir, srcPath, { encoding = n
   let fd = null;
   try {
     try {
-      fd = openSync(srcPath, constants.O_RDONLY | O_NOFOLLOW_FLAG);
+      fd = openSync(srcPath, constants.O_RDONLY | O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG);
     } catch (e) {
       if (e && (e.code === "ELOOP" || e.code === "EMLINK" || e.code === "EFTYPE")) {
         const err = new Error(`${label} symlink rejected: "${srcPath}"`);
@@ -785,7 +787,7 @@ export function writeFileAtomicNoFollow(
     let verifyFd = null;
     try {
       assertSafePathFromRoot(walkRoot, containerDir, targetPath, label);
-      verifyFd = openSync(targetPath, constants.O_RDONLY | O_NOFOLLOW_FLAG);
+      verifyFd = openSync(targetPath, constants.O_RDONLY | O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG);
       const pubStat = fstatSync(verifyFd);
       if (
         !pubStat.isFile() ||
@@ -1100,19 +1102,35 @@ function runCli(argv) {
     process.exit(2);
   }
   const abs = resolve(opts.artifact);
-  if (!existsSync(abs)) {
-    console.error(`[gate-verify] FAIL: artifact not found: ${abs}`);
+  let cliText = "";
+  let cliStat = null;
+  let cliFd = null;
+  try {
+    cliFd = openSync(abs, constants.O_RDONLY | O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG);
+    cliStat = fstatSync(cliFd);
+    if (!cliStat.isFile()) {
+      console.error(`[gate-verify] FAIL: non-regular artifact rejected: ${abs}`);
+      process.exit(1);
+    }
+    cliText = readFileSync(cliFd, "utf8");
+  } catch (e) {
+    const msg = e && e.code === "ENOENT" ? `artifact not found: ${abs}` : `${e?.message || e}`;
+    console.error(`[gate-verify] FAIL: ${msg}`);
     process.exit(1);
+  } finally {
+    if (cliFd !== null) {
+      try { closeSync(cliFd); } catch {}
+    }
   }
-  const size = statSync(abs).size;
-  if (size < opts.minBytes) {
+  const size = Buffer.byteLength(cliText, "utf8");
+  if (size < opts.minBytes || cliStat.size < opts.minBytes) {
     console.error(`[gate-verify] FAIL: artifact too small (${size} < ${opts.minBytes} bytes): ${abs}`);
     process.exit(1);
   }
   const verify = {};
   if (opts.requireVerdict) verify.requireVerdict = opts.requireVerdict;
   if (opts.requireContractCommit) verify.requireContractCommit = opts.requireContractCommit;
-  const res = verifyArtifactContent(readFileSync(abs, "utf8"), verify, { gitDir: opts.gitDir, artDir: opts.artDir, mode: "settlement" });
+  const res = verifyArtifactContent(cliText, verify, { gitDir: opts.gitDir, artDir: opts.artDir, mode: "settlement" });
   if (!res.ok) {
     console.error(`[gate-verify] FAIL: ${res.reason}`);
     process.exit(1);

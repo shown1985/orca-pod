@@ -8,7 +8,7 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { sanitizeText } from "./lib/sanitize.mjs";
 
@@ -247,17 +247,25 @@ function hashFileStreaming(filePath, maxBytes = MAX_STREAM_FILE_BYTES) {
       return { exists: true, partial: true, size: s.size, digest: null };
     }
     const h = createHash("sha256");
-    h.update(`${s.size}:`);
-    fd = openSync(filePath, "r");
+    fd = openSync(
+      filePath,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0)
+    );
+    const fst = fstatSync(fd);
+    if (!fst.isFile()) return { exists: false, partial: false, size: 0, digest: null };
+    if (fst.size > maxBytes) {
+      return { exists: true, partial: true, size: fst.size, digest: null };
+    }
+    h.update(`${fst.size}:`);
     const buf = Buffer.allocUnsafe(65536);
     let offset = 0;
-    while (offset < s.size) {
-      const n = readSync(fd, buf, 0, Math.min(buf.length, s.size - offset), offset);
+    while (offset < fst.size) {
+      const n = readSync(fd, buf, 0, Math.min(buf.length, fst.size - offset), offset);
       if (n <= 0) break;
       h.update(buf.subarray(0, n));
       offset += n;
     }
-    return { exists: true, partial: false, size: s.size, digest: h.digest("hex").slice(0, 24) };
+    return { exists: true, partial: false, size: fst.size, digest: h.digest("hex").slice(0, 24) };
   } catch (e) {
     if (e && e.code === "ENOENT") return { exists: false, partial: false, size: 0, digest: null };
     return { exists: false, partial: true, size: 0, digest: null };

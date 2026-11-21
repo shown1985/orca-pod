@@ -8210,6 +8210,226 @@ console.log(JSON.stringify(out));
 });
 
 // ---------------------------------------------------------------------------
+// V20 — Round 12 Final Hardening Regression Suite (Non-blocking O_NONBLOCK
+//       rejection of writerless POSIX FIFOs on canonical, scoped, claim, and post-rename paths)
+// ---------------------------------------------------------------------------
+scenario("V20: Round 12 non-blocking O_RDONLY|O_NOFOLLOW|O_NONBLOCK bounded rejection of writerless FIFOs across gate & post-rename paths", async () => {
+  if (process.platform === "win32") {
+    ok("V20 POSIX mkfifo test skipped on win32", true);
+    return;
+  }
+  const { spawnSync } = await import("node:child_process");
+  const { pathToFileURL } = await import("node:url");
+  const tmpV20 = mkdtempSync(join(tmpdir(), "orca-v20-"));
+  dirsOfCurrentScenario.push(tmpV20);
+
+  const mkfifoProbe = join(tmpV20, "probe.fifo");
+  const mkRes = spawnSync("mkfifo", [mkfifoProbe], { encoding: "utf8" });
+  if (mkRes.error || mkRes.status !== 0) {
+    ok("V20 mkfifo unavailable in environment — skipped", true);
+    return;
+  }
+  rmSync(mkfifoProbe, { force: true });
+
+  const gateVerifyUrl = pathToFileURL(join(REPO, ".orca", "gate-verify.mjs")).href;
+  const wtIsoUrl = pathToFileURL(join(REPO, ".orca", "worktree-isolation.mjs")).href;
+  const fifoRunnerScript = join(tmpV20, "v20-fifo-runner.mjs");
+
+  writeFileSync(fifoRunnerScript, `
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { join, resolve } from "node:path";
+
+const req = createRequire(import.meta.url);
+const fs = req("node:fs");
+const mod = req("node:module");
+
+const origOpenSync = fs.openSync.bind(fs);
+const origRenameSync = fs.renameSync.bind(fs);
+
+const swapState = {
+  active: false,
+  capturedTmpPath: null,
+  fifoSourcePath: null,
+  swappedToFifo: false,
+};
+
+fs.openSync = function patchedOpenSync(p, flags, mode) {
+  const abs = typeof p === "string" ? resolve(p) : null;
+  const fd = origOpenSync(p, flags, mode);
+  if (
+    swapState.active &&
+    abs &&
+    typeof flags === "number" &&
+    (flags & fs.constants.O_CREAT) !== 0 &&
+    (flags & fs.constants.O_EXCL) !== 0 &&
+    abs.includes(".tmp-")
+  ) {
+    swapState.capturedTmpPath = abs;
+  }
+  return fd;
+};
+
+fs.renameSync = function patchedRenameSync(oldP, newP) {
+  const oldAbs = typeof oldP === "string" ? resolve(oldP) : null;
+  if (
+    swapState.active &&
+    oldAbs &&
+    swapState.capturedTmpPath &&
+    oldAbs === swapState.capturedTmpPath &&
+    !swapState.swappedToFifo &&
+    swapState.fifoSourcePath
+  ) {
+    swapState.swappedToFifo = true;
+    origRenameSync(swapState.fifoSourcePath, swapState.capturedTmpPath);
+  }
+  return origRenameSync(oldP, newP);
+};
+
+mod.syncBuiltinESMExports();
+
+const { verifyStepArtifact, writeFileAtomicNoFollow } = await import(${JSON.stringify(gateVerifyUrl)});
+const { bindStepArtifactDispatchClaim } = await import(${JSON.stringify(wtIsoUrl)});
+
+const mkFifo = (p) => {
+  const r = spawnSync("mkfifo", [p], { encoding: "utf8" });
+  if (r.error || r.status !== 0) throw new Error("mkfifo failed: " + (r.stderr || r.error));
+};
+
+const root = process.argv[2];
+const mode = process.argv[3];
+const step = { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } };
+
+if (mode === "canonical_fifo") {
+  const wt = join(root, "wt-canon-fifo");
+  const art = join(wt, ".orca", "artifacts");
+  fs.mkdirSync(art, { recursive: true });
+  mkFifo(join(art, "REVIEW.md"));
+  const r = verifyStepArtifact(step, art, wt, 20, { mode: "readiness" });
+  console.log(JSON.stringify({ ok: r.ok, reason: r.reason }));
+} else if (mode === "scoped_fifo") {
+  const wt = join(root, "wt-scoped-fifo");
+  const art = join(wt, ".orca", "artifacts");
+  fs.mkdirSync(join(art, ".dispatch-disp-active"), { recursive: true });
+  bindStepArtifactDispatchClaim(wt, ".orca/artifacts", step, { dispatchId: "disp-active", fsEpochMtimeMs: 0, clearedAtMs: 0 });
+  mkFifo(join(art, ".dispatch-disp-active", "REVIEW.md"));
+  const r = verifyStepArtifact(step, art, wt, 20, { mode: "settlement", dispatchId: "disp-active", clearedBeforeDispatch: true });
+  console.log(JSON.stringify({ ok: r.ok, reason: r.reason }));
+} else if (mode === "claim_fifo") {
+  const wt = join(root, "wt-claim-fifo");
+  const art = join(wt, ".orca", "artifacts");
+  fs.mkdirSync(join(art, ".dispatch-disp-active"), { recursive: true });
+  fs.writeFileSync(join(art, ".dispatch-disp-active", "REVIEW.md"), [
+    "<!-- orca-dispatch: disp-active -->",
+    "# Scoped Valid Report With FIFO Claim",
+    "",
+    "Body clearing minBytes check cleanly.",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\\n"));
+  mkFifo(join(art, ".dispatch-gate-claims.json"));
+  const r = verifyStepArtifact(step, art, wt, 20, { mode: "settlement", dispatchId: "disp-active", clearedBeforeDispatch: true });
+  console.log(JSON.stringify({ ok: r.ok, reason: r.reason }));
+} else if (mode === "post_rename_fifo") {
+  const wt = join(root, "wt-post-fifo");
+  const art = join(wt, ".orca", "artifacts");
+  fs.mkdirSync(join(art, ".dispatch-disp-active"), { recursive: true });
+  bindStepArtifactDispatchClaim(wt, ".orca/artifacts", step, { dispatchId: "disp-active", fsEpochMtimeMs: 0, clearedAtMs: 0 });
+  fs.writeFileSync(join(art, ".dispatch-disp-active", "REVIEW.md"), [
+    "<!-- orca-dispatch: disp-active -->",
+    "# Scoped Valid Report Swapped To FIFO Before Rename",
+    "",
+    "Body clearing minBytes check cleanly.",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\\n"));
+  const fifoSrc1 = join(root, "swap-1.fifo");
+  mkFifo(fifoSrc1);
+  swapState.active = true;
+  swapState.capturedTmpPath = null;
+  swapState.fifoSourcePath = fifoSrc1;
+  swapState.swappedToFifo = false;
+  let directThrew = false;
+  try {
+    writeFileAtomicNoFollow(wt, art, join(art, "DIRECT_FIFO.md"), "LEGIT_DATA");
+  } catch {
+    directThrew = true;
+  }
+  const directSwapped = swapState.swappedToFifo;
+
+  const fifoSrc2 = join(root, "swap-2.fifo");
+  mkFifo(fifoSrc2);
+  swapState.capturedTmpPath = null;
+  swapState.fifoSourcePath = fifoSrc2;
+  swapState.swappedToFifo = false;
+  const r = verifyStepArtifact(step, art, wt, 20, { mode: "settlement", dispatchId: "disp-active", clearedBeforeDispatch: true });
+  swapState.active = false;
+  console.log(JSON.stringify({
+    directSwapped,
+    directThrew,
+    gateSwapped: swapState.swappedToFifo,
+    ok: r.ok,
+    reason: r.reason,
+  }));
+}
+`);
+
+  const runBoundedFifoCase = (caseMode) => new Promise((resolveCase) => {
+    const t0Case = Date.now();
+    let timedOut = false;
+    let out = "";
+    let err = "";
+    const ch = spawn(NODE, [fifoRunnerScript, tmpV20, caseMode], {
+      cwd: REPO,
+      env: { ...process.env, NODE_OPTIONS: "" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const tmr = setTimeout(() => {
+      timedOut = true;
+      ch.kill("SIGKILL");
+    }, 2000);
+    ch.stdout.on("data", (d) => (out += d));
+    ch.stderr.on("data", (d) => (err += d));
+    ch.on("exit", (code) => {
+      clearTimeout(tmr);
+      const dtMs = Date.now() - t0Case;
+      let json = null;
+      try { json = JSON.parse(out.trim().split(/\r?\n/).pop()); } catch {}
+      resolveCase({ timedOut, code, dtMs, json, err });
+    });
+  });
+
+  const cCanon = await runBoundedFifoCase("canonical_fifo");
+  eq("V20 P1 FIFO 1: writerless canonical REVIEW.md FIFO returns ok=false immediately without blocking (<2s)",
+    [cCanon.timedOut, cCanon.code, cCanon.json?.ok],
+    [false, 0, false]);
+
+  const cScoped = await runBoundedFifoCase("scoped_fifo");
+  eq("V20 P1 FIFO 2: writerless scoped .dispatch-disp-active/REVIEW.md FIFO returns ok=false immediately without blocking (<2s)",
+    [cScoped.timedOut, cScoped.code, cScoped.json?.ok],
+    [false, 0, false]);
+
+  const cClaim = await runBoundedFifoCase("claim_fifo");
+  eq("V20 P1 FIFO 3: writerless .dispatch-gate-claims.json FIFO returns ok=false immediately without blocking (<2s)",
+    [cClaim.timedOut, cClaim.code, cClaim.json?.ok],
+    [false, 0, false]);
+
+  const cPostRename = await runBoundedFifoCase("post_rename_fifo");
+  eq("V20 P1 FIFO 4: swapping temp path to writerless FIFO right before renameSync rejects immediately without blocking (<2s)",
+    [
+      cPostRename.timedOut,
+      cPostRename.code,
+      cPostRename.json?.directSwapped,
+      cPostRename.json?.directThrew,
+      cPostRename.json?.gateSwapped,
+      cPostRename.json?.ok,
+    ],
+    [false, 0, true, true, true, false]);
+});
+
+// ---------------------------------------------------------------------------
 (async () => {
   const t0 = Date.now();
   for (const s of scenarios) {

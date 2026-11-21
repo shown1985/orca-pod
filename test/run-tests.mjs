@@ -5355,7 +5355,7 @@ out(0, { result: {} });
   const nudgeCtrl = createNudgeController({
     orca: (args, opts) => {
       nudgeCalls.push({ args, opts });
-      if (args[1] === "worker-show") return { ok: true, json: { result: { terminal: { handle: "sup-term-9" } } } };
+      if (args[1] === "worker-show") return { ok: true, json: { result: { dispatchId: "disp-sup-9", terminal: { handle: "sup-term-9" } } } };
       if (args[0] === "terminal" && args[1] === "show") return { ok: true, json: { result: { terminal: { preview: "Working...", lastOutputAt: 100 } } } };
       return { ok: true, json: { result: {} } };
     },
@@ -5833,6 +5833,669 @@ process.exit(0);
       MOCK_INSPECT_JSON: JSON.stringify({
         Config: { Healthcheck: { Test: ["CMD-SHELL", "curl -f http://localhost/health"] }, Labels: { "io.orca-pod.deploy-sha": rev13 } },
         State: { Status: "running", Health: { Status: "unhealthy" } },
+      }),
+    }).status, 1);
+});
+
+// ---------------------------------------------------------------------------
+// V14 — Round-6 final closure regressions (P0-01, P0-03, P1-02, P1-05, P1-06, P1-07, P1-11, P2-01)
+// ---------------------------------------------------------------------------
+scenario("V14 Round-6 final closure: full-receipt/stderr conflicts, dispatch-scoped nudge & retained release, blockquote/inline fence + parent symlink + nested writes gate, quoted -- / brace / opencode default / ledger effectiveModel, pre-probe startWorker deadline, --from --issues resume, multiline ref labels, multi-basePath tea login, and inspect exited override", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { symlinkSync } = await import("node:fs");
+  const {
+    createOrcaClient,
+    buildAgentCommand,
+    verifyManualTerminalClosed,
+  } = await import("../.orca/lib/orca-cli.mjs");
+  const { createNudgeController } = await import("../.orca/lib/nudge.mjs");
+  const { verifyStepArtifact } = await import("../.orca/gate-verify.mjs");
+  const { syncOutputsFromIsolatedWorktree } = await import("../.orca/worktree-isolation.mjs");
+  const { detectProjectStacks, renderSelfHostedCdWorkflow } = await import("../.orca/ci-generator.mjs");
+  const {
+    tokenizeShellCommand,
+    parseAgentCommandSpec,
+    resolveEffectiveLaunchSpec,
+    classifyModelFamily,
+  } = await import("../.orca/preflight.mjs");
+  const {
+    detectIssueProvider,
+    parseBacklogTasks,
+    extractExplicitLocalIssueNumber,
+    createIssueViaCli,
+  } = await import("../.orca/issue-tracker.mjs");
+
+  const tmpV14 = mkdtempSync(join(tmpdir(), "orca-v14-"));
+  dirsOfCurrentScenario.push(tmpV14);
+
+  // =========================================================================
+  // 1) P0-01a: Top-level handle on `permission_denied`, independent `stderr`
+  //    network conflict (`ECONNREFUSED`), gateway `endpoint not found` on
+  //    `terminal show`, and nested vs top-level handle mismatch
+  // =========================================================================
+  const rGatewayNotFound = verifyManualTerminalClosed((args) => {
+    if (args[1] === "close") return { ok: true, json: { result: { handle: "term-14", status: "closed", closed: true } } };
+    return { ok: false, stderr: "HTTP 404: endpoint not found", raw: "" };
+  }, "term-14");
+  eq("V14 P0-01 verifyManualTerminalClosed REJECTS generic gateway 'endpoint not found' on terminal show",
+    rGatewayNotFound.ok, false);
+
+  const rNestedHandleConflict = verifyManualTerminalClosed((args) => {
+    if (args[1] === "close") {
+      return {
+        ok: true,
+        json: { handle: "term-14", result: { terminal: { handle: "term-other-99", status: "closed", closed: true }, status: "closed", closed: true } },
+      };
+    }
+    return { ok: false, stderr: "unknown terminal term-14" };
+  }, "term-14");
+  eq("V14 P0-01 verifyManualTerminalClosed REJECTS top-level matching handle masking nested conflicting handle",
+    rNestedHandleConflict.ok, false);
+
+  const mockOrcaV14 = join(tmpV14, "mock-orca-v14.cjs");
+  const mockLogV14 = join(tmpV14, "mock-orca-v14.jsonl");
+  writeFileSync(mockOrcaV14, `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const mode = process.env.MOCK_V14_MODE || "";
+fs.appendFileSync(${JSON.stringify(mockLogV14)}, JSON.stringify({ mode, args }) + "\\n");
+const out = (code, obj) => { console.log(JSON.stringify(obj)); process.exit(code); };
+const key = args.slice(0, 2).join(" ");
+if (mode === "top_level_handle_on_perm_denied") {
+  if (key === "terminal create") return out(1, { error: "no warm terminal" });
+  if (key === "orchestration worker-start") {
+    return out(1, { handle: "term-top-leak", result: { code: "permission_denied", lastError: "denied" } });
+  }
+  if (key === "orchestration dispatch-show") return out(0, { result: { dispatch: { id: null, status: "unknown" } } });
+}
+if (mode === "stderr_econnrefused_on_perm_denied") {
+  if (key === "terminal create") return out(1, { error: "no warm terminal" });
+  if (key === "orchestration worker-start") {
+    process.stderr.write("daemon rpc error: connect ECONNREFUSED 127.0.0.1:4100\\n");
+    return out(1, { result: { code: "permission_denied", lastError: "permission check failed" } });
+  }
+  if (key === "orchestration dispatch-show") return out(0, { result: { dispatch: { id: null, status: "unknown" } } });
+}
+out(0, { result: { worktree: { path: ${JSON.stringify(tmpV14)} } } });
+`, { mode: 0o755 });
+
+  const prevOrca14 = process.env.ORCA_CLI_COMMAND;
+  const prevMode14 = process.env.MOCK_V14_MODE;
+  try {
+    process.env.ORCA_CLI_COMMAND = mockOrcaV14;
+    const cli14 = createOrcaClient({
+      cfg: { defaults: { startRetries: 0, warmTerminal: true } },
+      opt: {},
+      objective: "v14",
+      autoRun: true,
+      agentOf: (s) => s.agent,
+      modelOf: (s) => s.model,
+      writeStatus: () => {},
+      log: () => {},
+      warn: () => {},
+      die: (m) => { throw new Error(m); },
+    });
+    cli14.setRunId("run-v14");
+
+    // P1-02: Expired `deadlineAt` passed to `startWorker` BEFORE `orcaBin` or `wtPath` is resolved
+    // MUST return `deadlineExceeded: true` with ZERO CLI calls (`--version`, `worktree show`, `worktree current`)!
+    rmSync(mockLogV14, { force: true });
+    const rExpiredPreProbe = cli14.startWorker(
+      { id: "s-exp", title: "Expired", agent: "codex", model: "gpt-6.2-sol" },
+      "t-exp",
+      "name:testlab",
+      { deadlineAt: Date.now() - 25 }
+    );
+    eq("V14 P1-02 expired startWorker returns deadlineExceeded=true with ZERO CLI/worktree probes",
+      [rExpiredPreProbe.ok, rExpiredPreProbe.deadlineExceeded, existsSync(mockLogV14)], [false, true, false]);
+
+    process.env.MOCK_V14_MODE = "top_level_handle_on_perm_denied";
+    const rTopHandle = cli14.startWorker({ id: "s1", title: "S1", agent: "codex", model: "gpt-6.2-sol" }, "t1", "name:testlab");
+    eq("V14 P0-01 top-level handle on permission_denied worker-start stays ambiguous=true",
+      [rTopHandle.ok, rTopHandle.ambiguous], [false, true]);
+
+    process.env.MOCK_V14_MODE = "stderr_econnrefused_on_perm_denied";
+    const rStderrNet = cli14.startWorker({ id: "s2", title: "S2", agent: "codex", model: "gpt-6.2-sol" }, "t2", "name:testlab");
+    eq("V14 P0-01 independent stderr ECONNREFUSED on permission_denied worker-start stays ambiguous=true",
+      [rStderrNet.ok, rStderrNet.ambiguous], [false, true]);
+  } finally {
+    if (prevOrca14 === undefined) delete process.env.ORCA_CLI_COMMAND;
+    else process.env.ORCA_CLI_COMMAND = prevOrca14;
+    if (prevMode14 === undefined) delete process.env.MOCK_V14_MODE;
+    else process.env.MOCK_V14_MODE = prevMode14;
+  }
+
+  // =========================================================================
+  // 2) P0-01b: Dispatch-scoped `nudge` & respect Orca `retained`/`keptOpen` on supervised release!
+  // =========================================================================
+  // Unit check: `worker-show` with foreign or missing `dispatchId` is NEVER cached or sent to!
+  const foreignNudgeSends = [];
+  const nudgeCtrl14 = createNudgeController({
+    orca: (args) => {
+      if (args[1] === "worker-show") return { ok: true, json: { result: { dispatchId: "disp-foreign-99", terminal: { id: "term-foreign-99" } } } };
+      if (args[0] === "terminal" && args[1] === "send") foreignNudgeSends.push(args);
+      return { ok: true, json: { result: {} } };
+    },
+    res: (j) => j?.result ?? {},
+    pick: (o, ks) => ks.map((k) => o?.[k]).find((v) => v !== undefined),
+    sleepMs: () => {},
+    parkedPromptOf: () => null,
+    nudgeRetriesOf: () => 2,
+    nudgeTimeoutOf: () => 0,
+    outPath: (w) => `.orca/artifacts/${w}`,
+    artifactReady: () => false,
+    statusSet: () => {},
+    writeStatus: () => {},
+    warn: () => {},
+    settleMember: () => {},
+    syncOutputsFromIsolatedWorktree: () => {},
+    getWtDir: () => tmpV14,
+    artDir: ".orca/artifacts",
+  });
+  const foreignMem = {
+    step: { id: "s-for", title: "Foreign", writes: "OUT.md" },
+    startMode: "cold",
+    terminal: null,
+    dispatchId: "disp-active-14",
+    deadlineAt: Date.now() + 30000,
+    lastBusy: 0,
+    nudge: { left: 2, count: 0, sentAt: 0, phase: null },
+    health: { lastBusyMs: 0 },
+  };
+  nudgeCtrl14.maybeNudgeMidRun(foreignMem, { preview: "Working...", heartbeatMs: 0 });
+  nudgeCtrl14.holdForNudge(foreignMem, "succeeded", null);
+  eq("V14 P0-01 nudge rejects worker-show terminal with foreign dispatchId (zero sends, null nudgeTerminal)",
+    [foreignNudgeSends.length, foreignMem.nudgeTerminal ?? null], [0, null]);
+
+  // E2E check: (i) foreign `worker-show` + `retained/keptOpen:true` AND (ii) matching `worker-show` + `retained/keptOpen:true` -> ZERO `terminal close`!
+  const v14RetScen = join(REPO, "test", "scenarios", "_tmp-v14-retained-nudge.cjs");
+  writeFileSync(v14RetScen, `module.exports = {
+  handlers: {
+    "orchestration worker-start": (c) => {
+      const id = "disp-" + c.id();
+      c.state.dispatches[id] = { id, task: c.flags.task, status: "dispatching", created: Date.now() };
+      c.state.nudgeTask = c.flags.task;
+      c.state.activeDisp = id;
+      c.pushDone(c.flags.task, "succeeded", id);
+      c.ok({ dispatchId: id, state: "ready" });
+    },
+    "orchestration worker-show": (c) => {
+      if (process.env.V14_FOREIGN_SHOW === "1") {
+        return c.ok({ dispatchId: "disp-other-session", terminal: { id: "term-shared-user", lastOutputAt: Date.now(), preview: "user shell" } });
+      }
+      return c.ok({ dispatchId: c.flags.dispatch, terminal: { id: "term-retained-1", lastOutputAt: Date.now(), preview: "agent idle" } });
+    },
+    "terminal send": (c) => {
+      const text = String(c.flags.text ?? "");
+      const m = text.match(/\\.orca\\/artifacts\\/([\\w.\\-]+)/);
+      if (text.includes("[orca-flow]") && m) {
+        const fs = require("node:fs"), { join } = require("node:path");
+        const dir = join(process.env.ORCA_FAKE_WT || ".", ".orca", "artifacts");
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(join(dir, m[1]), "# Recovered\\n<!-- orca-dispatch: " + c.state.activeDisp + " -->\\n\\n" + "Filler content line.\\n".repeat(10));
+        c.pushDone(c.state.nudgeTask, "succeeded", c.state.activeDisp);
+      }
+      c.ok({});
+    },
+    "orchestration worker-release": (c) => {
+      c.ok({ dispatchId: c.flags.dispatch, status: "retained", keptOpen: true });
+    },
+  },
+};\n`);
+  try {
+    const rForeignEnv = await runFlow({
+      name: "v14-foreign-env",
+      config: "../test/configs/nudge-post.config.json",
+      scenario: "_tmp-v14-retained-nudge.cjs",
+      env: { V14_FOREIGN_SHOW: "1" },
+      budgetMs: 30000,
+    });
+    eq("V14 P0-01 E2E foreign worker-show + retained release issues ZERO terminal send and ZERO terminal close",
+      [rForeignEnv.by("terminal send").length, rForeignEnv.by("terminal close").length], [0, 0]);
+
+    const rRetainedEnv = await runFlow({
+      name: "v14-retained-env",
+      config: "../test/configs/nudge-post.config.json",
+      scenario: "_tmp-v14-retained-nudge.cjs",
+      budgetMs: 30000,
+    });
+    eq("V14 P0-01 E2E supervised nudge with worker-release status=retained/keptOpen=true NEVER calls terminal close",
+      [rRetainedEnv.code, rRetainedEnv.by("terminal send").length >= 1, rRetainedEnv.by("terminal close").length], [0, true, 0]);
+  } finally {
+    try { rmSync(v14RetScen, { force: true }); } catch {}
+  }
+
+  // =========================================================================
+  // 3) P0-01c: Blockquote fenced code, inline code, parent-dir symlink,
+  //    nested `reviews/REVIEW.md` promotion, and safe isolated copy-back!
+  // =========================================================================
+  const gateWt14 = join(tmpV14, "gate-wt");
+  const gateArt14 = join(gateWt14, ".orca", "artifacts");
+  mkdirSync(join(gateArt14, ".dispatch-disp-14", "reviews"), { recursive: true });
+  writeFileSync(join(gateArt14, ".dispatch-gate-claims.json"), JSON.stringify({
+    "REVIEW.md": { cleared: true, activeDispatchId: "disp-14", stepId: "code-review", fsEpochMtimeMs: 0 },
+    "reviews/REVIEW.md": { cleared: true, activeDispatchId: "disp-14", stepId: "nested-review", fsEpochMtimeMs: 0 },
+  }, null, 2));
+
+  // (a) Blockquoted fenced code block containing `<!-- orca-dispatch: disp-14 -->` -> REJECTED!
+  writeFileSync(join(gateArt14, "REVIEW.md"), [
+    "# Review",
+    "",
+    "> ```markdown",
+    "> <!-- orca-dispatch: disp-14 -->",
+    "> Dispatch-ID: disp-14",
+    "> ```",
+    "",
+    "Body lines here for review size check.",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\n"));
+  const gBlockquoteFence = verifyStepArtifact(
+    { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+    gateArt14, gateWt14, 30,
+    { mode: "settlement", dispatchId: "disp-14", clearedBeforeDispatch: true }
+  );
+  eq("V14 P0-01 gate REJECTS provenance marker inside blockquoted fenced code block", gBlockquoteFence.ok, false);
+
+  // (b) Inline code span containing `` `<!-- orca-dispatch: disp-14 -->` `` -> REJECTED!
+  writeFileSync(join(gateArt14, "REVIEW.md"), [
+    "# Review",
+    "",
+    "Example marker: `<!-- orca-dispatch: disp-14 -->` and ``Dispatch-ID: disp-14`` in prose.",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\n"));
+  const gInlineCode = verifyStepArtifact(
+    { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+    gateArt14, gateWt14, 30,
+    { mode: "settlement", dispatchId: "disp-14", clearedBeforeDispatch: true }
+  );
+  eq("V14 P0-01 gate REJECTS provenance marker inside inline Markdown code spans", gInlineCode.ok, false);
+
+  // (c) Legitimate nested `reviews/REVIEW.md` in `.dispatch-disp-14/reviews/REVIEW.md` promotes cleanly via basename temp!
+  writeFileSync(join(gateArt14, ".dispatch-disp-14", "reviews", "REVIEW.md"), [
+    "<!-- orca-dispatch: disp-14 -->",
+    "# Nested Review",
+    "",
+    "All nested path invariants verified.",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\n"));
+  const gNestedOk = verifyStepArtifact(
+    { id: "nested-review", writes: "reviews/REVIEW.md", verify: { requireVerdict: "PASS" } },
+    gateArt14, gateWt14, 30,
+    { mode: "settlement", dispatchId: "disp-14", clearedBeforeDispatch: true }
+  );
+  eq("V14 P0-01 nested step.writes 'reviews/REVIEW.md' promotes atomically via basename temp",
+    [gNestedOk.ok, existsSync(join(gateArt14, "reviews", "REVIEW.md"))], [true, true]);
+
+  // (d) Parent directory symlink (`reviews -> externalDir`) rejected by BOTH `verifyStepArtifact` and `syncOutputsFromIsolatedWorktree`!
+  const extSymDir = join(tmpV14, "ext-sym-dir");
+  mkdirSync(extSymDir, { recursive: true });
+  writeFileSync(join(extSymDir, "REVIEW.md"), "<!-- orca-dispatch: disp-14 -->\n# External\n\nFiller text.\n\nVERDICT: PASS\n");
+  rmSync(join(gateArt14, "reviews"), { recursive: true, force: true });
+  rmSync(join(gateArt14, ".dispatch-disp-14", "reviews"), { recursive: true, force: true });
+  symlinkSync(extSymDir, join(gateArt14, "reviews"));
+  const gParentSym = verifyStepArtifact(
+    { id: "nested-review", writes: "reviews/REVIEW.md", verify: { requireVerdict: "PASS" } },
+    gateArt14, gateWt14, 30,
+    { mode: "settlement", dispatchId: "disp-14", clearedBeforeDispatch: true }
+  );
+  eq("V14 P0-01 verifyStepArtifact REJECTS parent directory symlink in nested writes path", gParentSym.ok, false);
+
+  // (e) Isolated copy-back: wrong-ID canonical file OR parent symlink NEVER overwrites valid integration canonical file!
+  const isoWt14 = join(tmpV14, "iso-wt-14");
+  const mainWt14 = join(tmpV14, "main-wt-14");
+  mkdirSync(join(isoWt14, ".orca", "artifacts"), { recursive: true });
+  mkdirSync(join(mainWt14, ".orca", "artifacts"), { recursive: true });
+  const priorValidReview = "<!-- orca-dispatch: disp-prior -->\n# Prior Valid Review\n\nVERDICT: PASS\n";
+  writeFileSync(join(mainWt14, ".orca", "artifacts", "REVIEW.md"), priorValidReview);
+  writeFileSync(join(isoWt14, ".orca", "artifacts", "REVIEW.md"), "<!-- orca-dispatch: disp-wrong-99 -->\n# Wrong Dispatch\n\nVERDICT: PASS\n");
+  symlinkSync(extSymDir, join(isoWt14, ".orca", "artifacts", "symdir"));
+  syncOutputsFromIsolatedWorktree({
+    step: { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } },
+    stepWtDir: isoWt14,
+    wtDir: mainWt14,
+    artDirRel: ".orca/artifacts",
+    dispatchId: "disp-14",
+  });
+  syncOutputsFromIsolatedWorktree({
+    step: { id: "nested", writes: "symdir/REVIEW.md" },
+    stepWtDir: isoWt14,
+    wtDir: mainWt14,
+    artDirRel: ".orca/artifacts",
+    dispatchId: "disp-14",
+  });
+  eq("V14 P0-01 syncOutputsFromIsolatedWorktree NEVER overwrites canonical file with wrong-ID isolated file and skips parent symlink",
+    [
+      readFileSync(join(mainWt14, ".orca", "artifacts", "REVIEW.md"), "utf8") === priorValidReview,
+      existsSync(join(mainWt14, ".orca", "artifacts", "symdir", "REVIEW.md")),
+    ],
+    [true, false]);
+
+  // =========================================================================
+  // 4) P0-03 + P2-01: Quoted `"--"`, brace expansion rejection, explicit
+  //    `opencode --model default`, and ledger effectiveModel accuracy!
+  // =========================================================================
+  const quotedTermCmd = buildAgentCommand('agy "--" position', "gpt-6.2-sol", { effort: "high", worktreePath: "/tmp/wt", isWin: false });
+  const parsedQuotedTerm = parseAgentCommandSpec(quotedTermCmd);
+  const realBashArgv = spawnSync("bash", ["-c", `set -- ${quotedTermCmd}; printf '%s\\n' "$@"`], { encoding: "utf8" })
+    .stdout.trim().split(/\r?\n/);
+  const dashIdx = realBashArgv.indexOf("--");
+  const modelIdx = realBashArgv.indexOf("--model");
+  const effortIdx = realBashArgv.indexOf("--effort");
+  eq("V14 P0-03/P2-01 quoted '\"--\"' terminator receives --model/--effort BEFORE '--' in both parser and real Bash argv",
+    [parsedQuotedTerm.embeddedModel, parsedQuotedTerm.embeddedEffort, modelIdx > 0 && modelIdx < dashIdx, effortIdx > 0 && effortIdx < dashIdx, realBashArgv[realBashArgv.length - 1]],
+    ["gpt-6.2-sol", "high", true, true, "position"]);
+
+  const braceCmd = "agy --model {claude-sonnet-4-5,gpt-6.2-sol}";
+  eq("V14 P0-03 unquoted brace expansion returns parseable=false and family=unknown (NEVER anthropic)",
+    [tokenizeShellCommand(braceCmd).parseable, classifyModelFamily(braceCmd, null), buildAgentCommand(braceCmd, "gpt-6.2-sol", { effort: "high" })],
+    [false, "unknown", braceCmd]);
+
+  const ocProjDir = join(tmpV14, "oc-proj");
+  mkdirSync(ocProjDir, { recursive: true });
+  writeFileSync(join(ocProjDir, "opencode.json"), JSON.stringify({ model: "openai/gpt-6.2-sol" }));
+  const ocExplicitDefault = resolveEffectiveLaunchSpec("opencode --model default", "claude-sonnet-4-5", null, { projectDir: ocProjDir });
+  eq("V14 P0-03 'opencode --model default' ignores opencode.json model and fails closed as effectiveModel='default', family='unknown'",
+    [ocExplicitDefault.effectiveModel, classifyModelFamily("opencode --model default", "claude-sonnet-4-5", { projectDir: ocProjDir })],
+    ["default", "unknown"]);
+
+  // P2-01 E2E ledger check: `kiro-cli` (no model support) with step `model: "gpt-6.2-sol"` records `effectiveModel: "default"` (NEVER `"gpt-6.2-sol"`!)
+  const v14KiroCfg = join(REPO, ".orca", "_tmp-v14-kiro.config.json");
+  writeFileSync(v14KiroCfg, JSON.stringify({
+    defaults: { timeoutMs: 5000, hardTimeoutMs: 15000, preflight: { enabled: false } },
+    pipeline: [
+      { id: "coding", title: "Coding", agent: "kiro-cli", model: "gpt-6.2-sol", effort: "high", spec: "Code {out}.", writes: "CHANGES.md" },
+    ],
+  }));
+  try {
+    const ledHomeKiro = join(tmpV14, "kiro-ledger");
+    const rKiro = await runFlow({
+      name: "v14-kiro-ledger",
+      config: "_tmp-v14-kiro.config.json",
+      args: ["--ledger-home", ledHomeKiro],
+      budgetMs: 25000,
+    });
+    const kiroKey = rKiro.status?.meta?.ledgerRunKey;
+    const kiroSummary = JSON.parse(readFileSync(join(ledHomeKiro, "runs", `${kiroKey}.summary.json`), "utf8"));
+    eq("V14 P2-01 ledger records effectiveModel='default' and effectiveEffort=null (NEVER pre-estimated gpt-6.2-sol/high) when launch argv omits them",
+      [rKiro.code, kiroSummary.steps?.coding?.effectiveModel, kiroSummary.steps?.coding?.effectiveEffort],
+      [0, "default", null]);
+  } finally {
+    try { rmSync(v14KiroCfg, { force: true }); } catch {}
+  }
+
+  // =========================================================================
+  // 5) P1-05: `--from pr-submit --issues --epic-issue 42` AND `--from` plan re-run with `--issues`!
+  // =========================================================================
+  const v14IssCfg = join(REPO, ".orca", "_tmp-v14-issues.config.json");
+  writeFileSync(v14IssCfg, JSON.stringify({
+    defaults: { timeoutMs: 5000, hardTimeoutMs: 15000, preflight: { enabled: false } },
+    pipeline: [
+      { id: "po-backlog", title: "PO Backlog", agent: "opencode2", model: "deepseek-v4.1", spec: "Plan {out}.", writes: "BACKLOG.md" },
+      { id: "pr-submit", title: "PR Submit", agent: "opencode2", model: "deepseek-v4.1", reads: ["po-backlog"], spec: "Submit {out} {issuePrBlock}.", writes: "PR.md" },
+    ],
+  }));
+  const fakeGh14 = join(tmpV14, "fake-gh-14.cjs");
+  writeFileSync(fakeGh14, `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a.includes("--version")) { console.log("gh version 2.60.0"); process.exit(0); }
+if (a[0] === "auth") { console.log("Logged in to github.com"); process.exit(0); }
+if (a[0] === "repo" && a[1] === "view") { console.log(JSON.stringify({ defaultBranchRef: { name: "main" } })); process.exit(0); }
+if (a[0] === "issue" && a[1] === "create") {
+  const n = Math.floor(100 + Math.random() * 800);
+  console.log("https://github.com/shown1985/sxcj/issues/" + n);
+  process.exit(0);
+}
+if (a[0] === "issue" && a[1] === "comment") { console.log("ok"); process.exit(0); }
+process.exit(0);
+`, { mode: 0o755 });
+  const v14PlanScen = join(REPO, "test", "scenarios", "_tmp-v14-plan-issues.cjs");
+  writeFileSync(v14PlanScen, `module.exports = {
+  handlers: {
+    "orchestration worker-start": (c) => {
+      const id = "disp-" + c.id();
+      const wtDir = process.env.ORCA_FAKE_WT || ".";
+      c.state.dispatches[id] = { id, task: c.flags.task, wtDir, status: "dispatching", created: Date.now() };
+      const task = c.state.tasks[c.flags.task] || {};
+      const title = (task.spec.match(/^# (.+)$/m) || [])[1] || "";
+      const fs = require("node:fs"), { join } = require("node:path");
+      const dir = join(wtDir, ".orca", "artifacts");
+      fs.mkdirSync(dir, { recursive: true });
+      if (title === "PO Backlog") {
+        fs.writeFileSync(join(dir, "BACKLOG.md"), "# Backlog\\n<!-- orca-dispatch: " + id + " -->\\n\\n- [ ] T1: Implement backend API endpoint\\n" + "Planning details and acceptance criteria.\\n".repeat(12));
+      } else {
+        fs.writeFileSync(join(dir, "PR.md"), "# PR\\n<!-- orca-dispatch: " + id + " -->\\n\\n" + "Submitted pull request details.\\n".repeat(12));
+      }
+      c.pushDone(c.flags.task, "succeeded", id);
+      c.ok({ dispatchId: id, state: "ready" });
+    },
+  },
+};\n`);
+  try {
+    const rIssPrep = await runFlow({
+      name: "v14-iss-prep",
+      config: "_tmp-v14-issues.config.json",
+      scenario: "_tmp-v14-plan-issues.cjs",
+      args: ["--only", "po-backlog", "--no-issues"],
+      budgetMs: 25000,
+    });
+    // Initialize git origin inside `rIssPrep.wt` so `detectIssueProvider` resolves `github.com/shown1985/sxcj`!
+    spawnSync("git", ["init"], { cwd: rIssPrep.wt });
+    spawnSync("git", ["remote", "add", "origin", "https://github.com/shown1985/sxcj.git"], { cwd: rIssPrep.wt });
+
+    // (a) `--from pr-submit --issues --epic-issue 42` when existing state lacks Epic #42 -> MUST SUCCEED (zero ReferenceError)!
+    const rFromEpic42 = await runFlow({
+      name: "v14-from-epic42",
+      reuseDir: rIssPrep.dir,
+      config: "_tmp-v14-issues.config.json",
+      scenario: "_tmp-v14-plan-issues.cjs",
+      args: ["--from", "pr-submit", "--issues", "--epic-issue", "42"],
+      env: { ORCA_ISSUE_CLI: fakeGh14 },
+      stdinText: "n\n",
+      budgetMs: 25000,
+    });
+    const issAfter42 = JSON.parse(readFileSync(join(rIssPrep.wt, ".orca", "artifacts", "ISSUES.json"), "utf8"));
+    eq("V14 P1-05 --from pr-submit --issues --epic-issue 42 succeeds without ReferenceError and links Epic #42",
+      [rFromEpic42.code, /ReferenceError/.test(rFromEpic42.out + rFromEpic42.err), issAfter42.epic?.number],
+      [0, false, 42]);
+
+    // (b) Resuming and re-running planning step (`--from po-backlog --only po-backlog --issues`) syncs tasks cleanly!
+    const rRerunPlan = await runFlow({
+      name: "v14-rerun-plan",
+      reuseDir: rIssPrep.dir,
+      config: "_tmp-v14-issues.config.json",
+      scenario: "_tmp-v14-plan-issues.cjs",
+      args: ["--from", "po-backlog", "--only", "po-backlog", "--issues", "--epic-issue", "42"],
+      env: { ORCA_ISSUE_CLI: fakeGh14 },
+      stdinText: "n\n",
+      budgetMs: 25000,
+    });
+    const issAfterPlan = JSON.parse(readFileSync(join(rIssPrep.wt, ".orca", "artifacts", "ISSUES.json"), "utf8"));
+    eq("V14 P1-05 --from po-backlog --issues re-run syncs sub-task issues without ReferenceError",
+      [rRerunPlan.code, /ReferenceError|sync after .* failed/.test(rRerunPlan.out + rRerunPlan.err), issAfterPlan.tasks?.length >= 1],
+      [0, false, true]);
+  } finally {
+    try { rmSync(v14IssCfg, { force: true }); } catch {}
+    try { rmSync(v14PlanScen, { force: true }); } catch {}
+  }
+
+  // =========================================================================
+  // 6) P1-06: Multiline CommonMark reference link LABEL `[Issue #42\n details]: https://...` -> `null`
+  // =========================================================================
+  const multilineLabelMd = [
+    "- [ ] Audit compatibility [Issue #42 details]",
+    "",
+    "[Issue #42",
+    " details]: https://github.com/other/repo/issues/42",
+  ].join("\n");
+  const mlLabelTasks = parseBacklogTasks(multilineLabelMd, { currentHost: "github.com", currentRepo: "shown1985/sxcj" });
+  eq("V14 P1-06 multiline reference definition label '[Issue #42\\n details]' to external repo returns null (NEVER 42)",
+    [mlLabelTasks.length, mlLabelTasks[0]?.number, extractExplicitLocalIssueNumber(multilineLabelMd, { currentHost: "github.com", currentRepo: "shown1985/sxcj" })],
+    [1, null, null]);
+
+  // =========================================================================
+  // 7) P1-07: Self-hosted `tea` login selection matches BOTH `origin` AND `basePath`
+  //    (`/other` listed BEFORE `/forge` on same origin!)
+  // =========================================================================
+  const teaLoginsMultiBp = [
+    "| Name | URL | User | Default |",
+    "| other | https://git.example.test/other | bot1 | true |",
+    "| forge-login | https://git.example.test/forge | bot2 | false |",
+  ].join("\n");
+  const provMultiBp = detectIssueProvider({
+    repoDir: tmpV14,
+    mode: true,
+    providerOverride: "tea",
+    execFn: (cmd, args) => {
+      if (cmd === "git" && args.includes("get-url")) {
+        return { ok: true, status: 0, stdout: "https://git.example.test/forge/local/repo.git\n", stderr: "" };
+      }
+      if (args.includes("--version")) return { ok: true, status: 0, stdout: "tea 0.9.2\n", stderr: "" };
+      if (args[0] === "logins") return { ok: true, status: 0, stdout: teaLoginsMultiBp, stderr: "" };
+      return { ok: false, status: 1, stdout: "", stderr: "" };
+    },
+  });
+  eq("V14 P1-07 detectIssueProvider selects '/forge' login even when '/other' is listed first on same origin",
+    [provMultiBp.enabled, provMultiBp.teaLogin, provMultiBp.basePath],
+    [true, "forge-login", "/forge"]);
+
+  const wrongBpCreate = createIssueViaCli({
+    provider: "tea",
+    bin: "tea",
+    repoDir: tmpV14,
+    host: provMultiBp.host,
+    origin: provMultiBp.origin,
+    basePath: provMultiBp.basePath,
+    repo: provMultiBp.repo,
+    teaLogin: provMultiBp.teaLogin,
+    title: "T",
+    body: "B",
+    execFn: () => ({ ok: true, status: 0, stdout: "https://git.example.test/other/local/repo/issues/42\n", stderr: "", timedOut: false }),
+  });
+  const rightBpCreate = createIssueViaCli({
+    provider: "tea",
+    bin: "tea",
+    repoDir: tmpV14,
+    host: provMultiBp.host,
+    origin: provMultiBp.origin,
+    basePath: provMultiBp.basePath,
+    repo: provMultiBp.repo,
+    teaLogin: provMultiBp.teaLogin,
+    title: "T",
+    body: "B",
+    execFn: () => ({ ok: true, status: 0, stdout: "https://git.example.test/forge/local/repo/issues/42\n", stderr: "", timedOut: false }),
+  });
+  eq("V14 P1-07 selected '/forge' provider rejects '/other' URL and accepts '/forge' URL",
+    [wrongBpCreate.ok, rightBpCreate.ok, rightBpCreate.number], [false, true, 42]);
+
+  const provMismatchOnly = detectIssueProvider({
+    repoDir: tmpV14,
+    mode: true,
+    providerOverride: "tea",
+    execFn: (cmd, args) => {
+      if (cmd === "git" && args.includes("get-url")) {
+        return { ok: true, status: 0, stdout: "https://git.example.test/forge/local/repo.git\n", stderr: "" };
+      }
+      if (args.includes("--version")) return { ok: true, status: 0, stdout: "tea 0.9.2\n", stderr: "" };
+      if (args[0] === "logins") return { ok: true, status: 0, stdout: "| other | https://git.example.test/other | bot1 | true |\n", stderr: "" };
+      return { ok: false, status: 1, stdout: "", stderr: "" };
+    },
+  });
+  eq("V14 P1-07 detectIssueProvider refuses tea when only mismatched basePath '/other' exists for '/forge' remote",
+    provMismatchOnly.enabled, false);
+
+  // =========================================================================
+  // 8) P1-11: CD Health Probe overrides stale `compose ps` running state with
+  //    fresh `docker inspect` `State.Status=exited / Running=false / ExitCode!=0`!
+  // =========================================================================
+  const cdDir14 = join(tmpV14, "cd-14");
+  mkdirSync(cdDir14, { recursive: true });
+  writeFileSync(join(cdDir14, "docker-compose.prod.yml"), "services:\n  api:\n    image: alpine\n");
+  const cdYml14 = renderSelfHostedCdWorkflow(detectProjectStacks(cdDir14), { deployBranch: "main", serviceName: "api", healthUrl: "http://127.0.0.1:8000/health" });
+  const lines14 = cdYml14.split(/\r?\n/);
+  const hdr14 = lines14.findIndex((l) => l.includes("- name:") && l.includes("Post-deploy automated health check (PII-safe)"));
+  const run14 = lines14.findIndex((l, idx) => idx > hdr14 && /^\s+run:\s*\|\s*$/.test(l));
+  const ind14 = lines14[run14 + 1]?.match(/^(\s*)/)?.[1]?.length || 10;
+  const body14 = [];
+  for (let i = run14 + 1; i < lines14.length; i++) {
+    if (!lines14[i].trim()) { body14.push(""); continue; }
+    if (lines14[i].match(/^(\s*)/)[1].length < ind14) break;
+    body14.push(lines14[i].slice(ind14));
+  }
+  const cdHealth14 = body14.join("\n");
+  const bin14 = join(tmpV14, "bin-14");
+  mkdirSync(bin14, { recursive: true });
+  const rev14 = "f".repeat(40);
+  writeFileSync(join(bin14, "docker"), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a.includes("config") && a.includes("--services")) { console.log(process.env.MOCK_SERVICES || "api"); process.exit(0); }
+if (a.includes("ps") && a.includes("--format")) { process.stdout.write(process.env.MOCK_PS_JSON || "[]"); process.exit(0); }
+if (a.includes("inspect")) {
+  if (process.env.MOCK_INSPECT_MAP) {
+    const mp = JSON.parse(process.env.MOCK_INSPECT_MAP);
+    const cid = a[a.length - 1];
+    process.stdout.write(JSON.stringify(mp[cid] || {}));
+    process.exit(0);
+  }
+  process.stdout.write(process.env.MOCK_INSPECT_JSON || "{}");
+  process.exit(0);
+}
+process.exit(0);
+`, { mode: 0o755 });
+  writeFileSync(join(bin14, "curl"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const a = process.argv.slice(2);
+const oi = a.indexOf("-o");
+if (oi >= 0 && a[oi + 1]) fs.writeFileSync(a[oi + 1], "ok");
+process.stdout.write("200");
+process.exit(0);
+`, { mode: 0o755 });
+
+  const runH14 = (extra) => spawnSync("bash", ["-c", cdHealth14], {
+    cwd: cdDir14,
+    env: {
+      ...process.env,
+      PATH: `${bin14}:${process.env.PATH}`,
+      COMPOSE_FILE: "docker-compose.prod.yml",
+      SERVICE_NAME: "api",
+      ORCA_DEPLOY_SHA: rev14,
+      DEFAULT_HEALTHCHECK_URL: "http://127.0.0.1:8000/health",
+      HEALTHCHECK_URL: "",
+      DEPLOY_ONESHOT_SERVICES: "",
+      HEALTHCHECK_RETRIES: "1",
+      HEALTHCHECK_INTERVAL: "0",
+      ...extra,
+    },
+    encoding: "utf8",
+  });
+
+  // Long-running container: `compose ps` says `running`, fresh `docker inspect` says `exited / Running=false / ExitCode=1`, HTTP 200 -> MUST FAIL (exit 1)!
+  eq("V14 P1-11 CD health FAILS when compose ps says running but fresh docker inspect reports State.Status=exited/Running=false/ExitCode=1",
+    runH14({
+      MOCK_PS_JSON: JSON.stringify([{ ID: "c1", Service: "api", State: "running", Health: "", Labels: `io.orca-pod.deploy-sha=${rev14}` }]),
+      MOCK_INSPECT_JSON: JSON.stringify({
+        Config: { Labels: { "io.orca-pod.deploy-sha": rev14 } },
+        State: { Status: "exited", Running: false, ExitCode: 1 },
+      }),
+    }).status, 1);
+
+  // One-shot container: `api` is running & healthy, `compose ps` says `migrate` `Exited (0)`, fresh `docker inspect` says `migrate` `ExitCode: 2` -> MUST FAIL (exit 1)!
+  eq("V14 P1-11 CD health FAILS when fresh docker inspect reports non-zero ExitCode=2 on one-shot service",
+    runH14({
+      MOCK_SERVICES: "api\nmigrate",
+      DEPLOY_ONESHOT_SERVICES: "migrate",
+      MOCK_PS_JSON: JSON.stringify([
+        { ID: "c1", Service: "api", State: "running", Health: "", Labels: `io.orca-pod.deploy-sha=${rev14}` },
+        { ID: "c2", Service: "migrate", State: "exited", Status: "Exited (0) 1 second ago", Health: "", Labels: `io.orca-pod.deploy-sha=${rev14}` },
+      ]),
+      MOCK_INSPECT_MAP: JSON.stringify({
+        c1: { Config: { Labels: { "io.orca-pod.deploy-sha": rev14 } }, State: { Status: "running", Running: true, ExitCode: 0 } },
+        c2: { Config: { Labels: { "io.orca-pod.deploy-sha": rev14 } }, State: { Status: "exited", Running: false, ExitCode: 2 } },
       }),
     }).status, 1);
 });

@@ -389,11 +389,15 @@ export function createRunLedger({
       const mergedFams = Array.isArray(executedFamilies)
         ? [...new Set([...(cur.executedFamilies || []), ...executedFamilies])]
         : (cur.executedFamilies || []);
+      const resolvedEffModel = effectiveModel || cur.model || "default";
+      const resolvedEffEffort = effectiveEffort !== undefined ? effectiveEffort : (cur.effort || null);
       summary.steps[stepId] = {
         ...cur,
         agent: effectiveAgent || cur.agent,
-        model: effectiveModel || cur.model || "default",
-        effort: effectiveEffort !== undefined ? effectiveEffort : (cur.effort || null),
+        model: resolvedEffModel,
+        effectiveModel: resolvedEffModel,
+        effort: resolvedEffEffort,
+        effectiveEffort: resolvedEffEffort,
         executedFamilies: mergedFams,
         dispatchId,
         terminal,

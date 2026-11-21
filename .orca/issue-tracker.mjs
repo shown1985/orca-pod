@@ -148,11 +148,18 @@ export function buildGhRepoSelector(host, repo) {
   return repo;
 }
 
+function normalizeBasePath(bp) {
+  const s = String(bp || "").trim().replace(/\/+$/, "");
+  if (!s || s === "/") return "";
+  return s.startsWith("/") ? s : `/${s}`;
+}
+
 /**
  * Parse `tea logins list` table/plain output to find a login entry whose server URL
- * matches `targetHost` (and preserves exact `origin` including `:port` + `basePath`!).
+ * matches BOTH `targetOrigin`/`targetHost` AND `targetBasePath` (refusing mismatched
+ * basePaths or ambiguous multi-basePath host conflicts!).
  */
-export function matchTeaLoginForHost(stdoutText, targetHost = null, targetOrigin = null) {
+export function matchTeaLoginForHost(stdoutText, targetHost = null, targetOrigin = null, targetBasePath = null) {
   const lines = String(stdoutText || "").split(/\r?\n/);
   const entries = [];
   for (const rawLine of lines) {
@@ -166,7 +173,7 @@ export function matchTeaLoginForHost(stdoutText, targetHost = null, targetOrigin
     }
     const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
     const entryOrigin = parsed.origin.toLowerCase();
-    const entryBasePath = parsed.pathname.replace(/\/+$/, "") || "";
+    const entryBasePath = normalizeBasePath(parsed.pathname);
     const cols = rawLine
       .split(/[|│]/)
       .map((c) => c.trim())
@@ -184,18 +191,33 @@ export function matchTeaLoginForHost(stdoutText, targetHost = null, targetOrigin
       entries.push({ login: loginName, host: hostname, origin: entryOrigin, basePath: entryBasePath, url: urlMatch[0] });
     }
   }
+
+  const pickUnambiguous = (cands) => {
+    if (!cands.length) return null;
+    if (targetBasePath !== null && targetBasePath !== undefined) {
+      const wantBp = normalizeBasePath(targetBasePath);
+      const bpMatches = cands.filter((e) => e.basePath === wantBp);
+      if (!bpMatches.length) return null;
+      const distinctOrigins = new Set(bpMatches.map((e) => e.origin));
+      if (distinctOrigins.size > 1) return null;
+      return bpMatches[0];
+    }
+    // When `targetBasePath` is unknown (e.g. SCP remote without scheme/port), refuse if logins disagree on origin or basePath!
+    const distinctTargets = new Set(cands.map((e) => `${e.origin}|${e.basePath}`));
+    if (distinctTargets.size > 1) return null;
+    return cands[0];
+  };
+
   if (targetOrigin) {
     const wantOrigin = String(targetOrigin).trim().replace(/\/+$/, "").toLowerCase();
-    const exactOrigin = entries.find((e) => e.origin === wantOrigin);
-    if (exactOrigin) return exactOrigin;
-    return null;
+    return pickUnambiguous(entries.filter((e) => e.origin === wantOrigin));
   }
-  if (!targetHost) return entries[0] || null;
+  if (!targetHost) return pickUnambiguous(entries);
   const want = String(targetHost).trim().replace(/^\[|\]$/g, "").toLowerCase();
   if (want.includes(":")) {
-    return entries.find((e) => { try { return new URL(e.url).host.toLowerCase() === want; } catch { return false; } }) || null;
+    return pickUnambiguous(entries.filter((e) => { try { return new URL(e.url).host.toLowerCase() === want; } catch { return false; } }));
   }
-  return entries.find((e) => e.host === want) || null;
+  return pickUnambiguous(entries.filter((e) => e.host === want));
 }
 
 /**
@@ -292,7 +314,8 @@ export function detectIssueProvider({
       if (!ver.ok) continue;
       const logins = execFn(bin, ["logins", "list"], { cwd: repoDir, timeoutMs: 5000 });
       if (!logins.ok || !logins.stdout) continue;
-      const matchedLogin = matchTeaLoginForHost(logins.stdout, remote?.host || null, remote?.origin || null);
+      const expectedBp = remote?.origin ? (remote?.basePath ?? "") : (remote?.basePath ? remote.basePath : null);
+      const matchedLogin = matchTeaLoginForHost(logins.stdout, remote?.host || null, remote?.origin || null, expectedBp);
       if (remote?.host && !allowLocalRemote && !matchedLogin) {
         continue;
       }
@@ -334,16 +357,16 @@ function normalizeMarkdownRefKey(k) {
   return String(k || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-export function parseMarkdownRefDefinitions(markdown) {
-  const defs = new Map();
-  if (typeof markdown !== "string" || !markdown) return defs;
-  const lines = markdown.split(/\r?\n/);
+const MULTILINE_MD_REF_DEF_RE = /^[ \t]{0,3}\[([^\[\]]{1,999})\]:[ \t]*(?:\r?\n[ \t]*)?<?([^\s>\[\]]+)>?(?:[ \t]+(?:"[^"\r\n]*"|'[^'\r\n]*'|\([^)\r\n]*\)))?[ \t]*$/gm;
+
+function stripFencedBlocksForRefs(markdown) {
+  const out = [];
   let inFence = false;
   let fenceChar = "";
   let fenceLen = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const rawLine = lines[i];
-    const tf = rawLine.trimStart();
+  for (const rawLine of String(markdown || "").split(/\r?\n/)) {
+    const unq = rawLine.replace(/^\s*(?:>\s*)+/, "");
+    const tf = unq.trimStart();
     const fm = tf.match(/^(`{3,}|~{3,})/);
     if (fm) {
       const ch = fm[1][0];
@@ -351,24 +374,25 @@ export function parseMarkdownRefDefinitions(markdown) {
       if (!inFence) { inFence = true; fenceChar = ch; fenceLen = len; continue; }
       if (ch === fenceChar && len >= fenceLen && tf.slice(len).trim() === "") { inFence = false; fenceChar = ""; fenceLen = 0; continue; }
     }
-    if (inFence) continue;
-    // 1) Single-line reference definition: `[label]: https://...`
-    const m1 = rawLine.match(/^\s{0,3}\[([^\]]+)\]:\s*<?([^\s>]+)>?(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*$/);
-    if (m1) {
-      const key = normalizeMarkdownRefKey(m1[1]);
-      if (key && !defs.has(key)) defs.set(key, m1[2].trim());
-      continue;
-    }
-    // 2) CommonMark multiline reference definition: `[label]:\n  https://...`
-    const mHead = rawLine.match(/^\s{0,3}\[([^\]]+)\]:\s*$/);
-    if (mHead && i + 1 < lines.length) {
-      const nextLine = lines[i + 1];
-      const mUrl = nextLine.match(/^\s*<?([^\s>\[]+)>?(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*$/);
-      if (mUrl && mUrl[1]) {
-        const key = normalizeMarkdownRefKey(mHead[1]);
-        if (key && !defs.has(key)) defs.set(key, mUrl[1].trim());
-        i++;
-      }
+    if (!inFence) out.push(rawLine);
+  }
+  return out.join("\n");
+}
+
+export function parseMarkdownRefDefinitions(markdown) {
+  const defs = new Map();
+  if (typeof markdown !== "string" || !markdown) return defs;
+  const unfenced = stripFencedBlocksForRefs(markdown);
+  const re = new RegExp(MULTILINE_MD_REF_DEF_RE.source, "gm");
+  let m = null;
+  while ((m = re.exec(unfenced)) !== null) {
+    const rawLabel = m[1];
+    // CommonMark link labels cannot contain blank lines
+    if (/\r?\n[ \t]*\r?\n/.test(rawLabel)) continue;
+    const key = normalizeMarkdownRefKey(rawLabel);
+    const url = (m[2] || "").trim();
+    if (key && url && !defs.has(key)) {
+      defs.set(key, url);
     }
   }
   return defs;
@@ -403,10 +427,8 @@ export function extractExplicitLocalIssueNumber(text, { currentHost = null, curr
     return String(label || "").replace(/#\d+\b/g, "");
   };
 
-  // Remove both single-line and two-line reference definition lines before scanning
-  let sanitizedForScan = srcText
-    .replace(/^\s{0,3}\[([^\]]+)\]:\s*\r?\n\s*<?[^\s>\[]+>?.*$/gm, "")
-    .replace(/^\s{0,3}\[([^\]]+)\]:\s*<?([^\s>]+)>?.*$/gm, "");
+  // Remove single-line and multiline CommonMark reference definition blocks before scanning
+  let sanitizedForScan = srcText.replace(new RegExp(MULTILINE_MD_REF_DEF_RE.source, "gm"), "");
   // 1) Inline Markdown links `[label](url)`
   sanitizedForScan = sanitizedForScan.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_full, label, rawUrl) => inspectResolvedLink(label, rawUrl));
   // 2) Full & collapsed reference-style Markdown links `[label][ref]` / `[label][]`

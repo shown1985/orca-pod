@@ -162,7 +162,7 @@ function main(argv) {
     },
     "orchestration worker-show": () => {
       const d = state.dispatches[flags.dispatch] || {};
-      c.ok({ terminal: { lastOutputAt: d.created || Date.now() } });
+      c.ok({ dispatchId: d.id || flags.dispatch || null, terminal: { lastOutputAt: d.created || Date.now() } });
     },
     "orchestration worker-stop": () => {
       const d = state.dispatches[flags.dispatch];

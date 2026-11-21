@@ -11,7 +11,7 @@ module.exports = {
       c.ok({ dispatchId: id, state: "ready" });
     },
     "orchestration worker-show": (c) =>
-      c.ok({ terminal: { id: "term-post-parked", lastOutputAt: Date.now() } }),
+      c.ok({ dispatchId: c.flags.dispatch, terminal: { id: "term-post-parked", lastOutputAt: Date.now() } }),
     "terminal show": (c) =>
       c.ok({ terminal: { preview: "claude code\r\nQuick safety check — Yes, I trust this folder" } }),
     "terminal send": () => { /* must never be reached */ },

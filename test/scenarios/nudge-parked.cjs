@@ -18,7 +18,7 @@ module.exports = {
       c.ok({ dispatchId: id, state: "ready" });
     },
     "orchestration worker-show": (c) =>
-      c.ok({ terminal: { id: "term-parked", lastOutputAt: Date.now() - 30 * 60 * 1000,
+      c.ok({ dispatchId: c.flags.dispatch, terminal: { id: "term-parked", lastOutputAt: Date.now() - 30 * 60 * 1000,
         preview: "claude code\r\nBash command requires confirmation for this command. Do you want to proceed? (y/n)" } }),
   },
 };

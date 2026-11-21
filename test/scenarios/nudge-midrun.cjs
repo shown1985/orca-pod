@@ -21,7 +21,7 @@ module.exports = {
       c.ok({ dispatchId: id, state: "ready" });       // NO pushDone: stalled mid-run
     },
     "orchestration worker-show": (c) =>
-      c.ok({ terminal: { id: "term-mid", lastOutputAt: Date.now() - 30 * 60 * 1000, preview: "frozen mid-work screen" } }),
+      c.ok({ dispatchId: c.flags.dispatch, terminal: { id: "term-mid", lastOutputAt: Date.now() - 30 * 60 * 1000, preview: "frozen mid-work screen" } }),
     "terminal send": (c) => {
       const text = String(c.flags.text ?? "");
       const m = text.match(/\.orca\/artifacts\/([\w.\-]+)/);

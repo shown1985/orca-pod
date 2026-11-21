@@ -238,12 +238,16 @@ const SHELL_VALUE_FLAGS = new Set([
 export function tokenizeShellCommand(cmdStr) {
   const src = String(cmdStr ?? "");
   if (/[\r\n]/.test(src)) {
-    return { ok: false, parseable: false, tokens: [], reason: "newline_in_command" };
+    return { ok: false, parseable: false, tokens: [], tokenSpans: [], commentStart: -1, reason: "newline_in_command" };
   }
   const tokens = [];
+  const tokenSpans = [];
   let cur = "";
   let inToken = false;
+  let tokStart = -1;
+  let tokQuoted = false;
   let quote = null; // "'" | '"' | null
+  let commentStart = -1;
 
   for (let i = 0; i < src.length; i++) {
     const ch = src[i];
@@ -258,11 +262,11 @@ export function tokenizeShellCommand(cmdStr) {
         continue;
       }
       if (ch === "`" || ch === "$") {
-        return { ok: false, parseable: false, tokens: [], reason: "shell_expansion" };
+        return { ok: false, parseable: false, tokens: [], tokenSpans: [], commentStart: -1, reason: "shell_expansion" };
       }
       if (ch === "\\") {
         if (i + 1 >= src.length) {
-          return { ok: false, parseable: false, tokens: [], reason: "trailing_escape" };
+          return { ok: false, parseable: false, tokens: [], tokenSpans: [], commentStart: -1, reason: "trailing_escape" };
         }
         const nxt = src[++i];
         if (nxt === '"' || nxt === "\\" || nxt === "$" || nxt === "`") cur += nxt;
@@ -277,43 +281,64 @@ export function tokenizeShellCommand(cmdStr) {
     if (/\s/.test(ch)) {
       if (inToken) {
         tokens.push(cur);
+        tokenSpans.push({ text: cur, rawStart: tokStart, rawEnd: i, quoted: tokQuoted });
         cur = "";
         inToken = false;
+        tokStart = -1;
+        tokQuoted = false;
       }
       continue;
     }
     // POSIX shell comment: unquoted `#` at the start of a token discards the rest of the line!
     if (!inToken && ch === "#") {
+      commentStart = i;
       break;
     }
     if (ch === ";" || ch === "|" || ch === "&" || ch === "`" || ch === "<" || ch === ">" || ch === "(" || ch === ")") {
-      return { ok: false, parseable: false, tokens: [], reason: "shell_control_operator" };
+      return { ok: false, parseable: false, tokens: [], tokenSpans: [], commentStart: -1, reason: "shell_control_operator" };
     }
-    if (ch === "$") {
-      return { ok: false, parseable: false, tokens: [], reason: "shell_expansion" };
+    // Reject unquoted variable, command, brace (`{a,b}`), glob (`*`, `?`), or tilde (`~`) expansions!
+    if (ch === "$" || ch === "{" || ch === "}" || ch === "*" || ch === "?" || (!inToken && ch === "~")) {
+      return { ok: false, parseable: false, tokens: [], tokenSpans: [], commentStart: -1, reason: "shell_expansion" };
     }
     if (ch === "'" || ch === '"') {
+      if (!inToken) tokStart = i;
       quote = ch;
       inToken = true;
+      tokQuoted = true;
       continue;
     }
     if (ch === "\\") {
       if (i + 1 >= src.length) {
-        return { ok: false, parseable: false, tokens: [], reason: "trailing_escape" };
+        return { ok: false, parseable: false, tokens: [], tokenSpans: [], commentStart: -1, reason: "trailing_escape" };
       }
+      if (!inToken) tokStart = i;
       cur += src[++i];
       inToken = true;
+      tokQuoted = true;
       continue;
     }
+    if (!inToken) tokStart = i;
     cur += ch;
     inToken = true;
   }
 
   if (quote !== null) {
-    return { ok: false, parseable: false, tokens: [], reason: "unclosed_quote" };
+    return { ok: false, parseable: false, tokens: [], tokenSpans: [], commentStart: -1, reason: "unclosed_quote" };
   }
-  if (inToken) tokens.push(cur);
-  return { ok: tokens.length > 0, parseable: tokens.length > 0, tokens, reason: tokens.length > 0 ? null : "empty_command" };
+  if (inToken) {
+    const endIdx = commentStart >= 0 ? commentStart : src.length;
+    tokens.push(cur);
+    tokenSpans.push({ text: cur, rawStart: tokStart, rawEnd: endIdx, quoted: tokQuoted });
+  }
+  return {
+    ok: tokens.length > 0,
+    parseable: tokens.length > 0,
+    tokens,
+    tokenSpans,
+    commentStart,
+    reason: tokens.length > 0 ? null : "empty_command",
+  };
 }
 
 /**
@@ -408,6 +433,7 @@ export function parseAgentCommandSpec(agentCmd) {
   }
 
   const argv = tokens.slice(cmdIdx);
+  const argvSpans = tokRes.tokenSpans.slice(cmdIdx);
   const baseAgent = argv[0];
   const lowerBase = baseAgent.toLowerCase();
   const isKiro = lowerBase === "kiro-cli" || lowerBase === "kiro";
@@ -422,11 +448,13 @@ export function parseAgentCommandSpec(agentCmd) {
   let hasPermissionModeFlag = false;
   let hasDangerouslySkipFlag = false;
   let hasOptionTerminator = false;
+  let optionTerminatorRawStart = -1;
 
   for (let i = 1; i < argv.length; i++) {
     const t = argv[i];
     if (t === "--") {
       hasOptionTerminator = true;
+      optionTerminatorRawStart = argvSpans[i]?.rawStart ?? -1;
       break;
     }
 
@@ -524,6 +552,7 @@ export function parseAgentCommandSpec(agentCmd) {
     hasPermissionModeFlag,
     hasDangerouslySkipFlag,
     hasOptionTerminator,
+    optionTerminatorRawStart,
   };
 }
 
@@ -550,9 +579,9 @@ export function resolveEffectiveLaunchSpec(agent, model = null, effort = null, {
   }
 
   // P0-03 & P2-01: If the command explicitly passed `--model default` (or `-m default`),
-  // step `reqModel` will NOT override it in the launched command! Keep `passedModel: null`
-  // and `effectiveModel: "default"` (unless OpenCode config resolves a default model),
-  // NEVER claiming `reqModel`!
+  // the launched CLI receives literal `default` (step `reqModel` and project `opencode.json`
+  // default model do NOT override an explicit CLI `--model default` flag!). Keep `passedModel: null`,
+  // `effectiveModel: "default"` -> `family: "unknown"` (fail closed for cross-family proof!).
   let passedModel = null;
   if (!parsed.isKiro) {
     if (parsed.explicitDefaultModel) {
@@ -562,12 +591,12 @@ export function resolveEffectiveLaunchSpec(agent, model = null, effort = null, {
     }
   }
   let configModel = null;
-  if (!passedModel && (parsed.lowerBase === "opencode" || parsed.lowerBase === "opencode2") && (projectDir || configPaths)) {
+  if (!passedModel && !parsed.explicitDefaultModel && (parsed.lowerBase === "opencode" || parsed.lowerBase === "opencode2") && (projectDir || configPaths)) {
     const oc = resolveOpencodeConfig({ projectDir: projectDir || process.cwd(), configPaths });
     if (oc.configuredModel) configModel = oc.configuredModel;
   }
   const effectiveModel = parsed.explicitDefaultModel
-    ? (configModel || "default")
+    ? "default"
     : (passedModel || configModel || null);
   const effectiveEffort = parsed.embeddedEffort || reqEffort || null;
   return {

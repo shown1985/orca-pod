@@ -20,7 +20,7 @@ module.exports = {
       c.ok({ dispatchId: id, state: "ready" });
     },
     "orchestration worker-show": (c) =>
-      c.ok({ terminal: { id: "term-undeliv", lastOutputAt: Date.now() - 30 * 60 * 1000, preview: "frozen screen" } }),
+      c.ok({ dispatchId: c.flags.dispatch, terminal: { id: "term-undeliv", lastOutputAt: Date.now() - 30 * 60 * 1000, preview: "frozen screen" } }),
     "terminal send": (c) => {
       c.pushDone(c.state.nudgeTask, "succeeded");   // the agent finishes on its own around the failed nudge
       c.fail("simulated transient send failure");

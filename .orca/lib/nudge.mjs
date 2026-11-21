@@ -20,10 +20,11 @@ export function createNudgeController({
   }
 
   // P0-01 & P1-02: Never mutate `m.terminal` (which belongs to `m.startMode === "manual"`),
-  // and check remaining deadline BEFORE issuing `worker-show`!
+  // check remaining deadline BEFORE issuing `worker-show`, AND verify `worker-show`'s
+  // returned `dispatchId` matches `m.dispatchId` before caching or sending to any terminal!
   function terminalOf(m) {
     if (m.terminal) return m.terminal;
-    if (m.nudgeTerminal) return m.nudgeTerminal;
+    if (m.nudgeTerminal && m.nudgeTerminalDispatchId === m.dispatchId) return m.nudgeTerminal;
     if (!m.dispatchId) return null;
     const rem = remainingBudgetMs(m);
     if (rem <= 0) return null;
@@ -32,9 +33,21 @@ export function createNudgeController({
       deadlineAt: deadlineCapOf(m),
     });
     if (ws.deadlineExceeded || !ws.ok) return null;
-    const t = pick(res(ws.json), ["terminal"]) || {};
+    const wsJson = res(ws.json);
+    const wsDispId = pick(wsJson, ["dispatchId", "dispatch_id"])
+      || pick(wsJson.dispatch || {}, ["id", "dispatchId", "dispatch_id"])
+      || pick(ws.json || {}, ["dispatchId", "dispatch_id"])
+      || null;
+    if (!wsDispId || wsDispId !== m.dispatchId) {
+      warn(`[nudge] ignoring worker-show terminal for "${m.step.title}": returned dispatchId "${wsDispId || "missing"}" !== active "${m.dispatchId}"`);
+      return null;
+    }
+    const t = pick(wsJson, ["terminal"]) || {};
     const id = pick(t, ["id", "terminalId", "terminal_id", "handle", "terminalHandle"]);
-    if (id) m.nudgeTerminal = id;
+    if (id) {
+      m.nudgeTerminal = id;
+      m.nudgeTerminalDispatchId = m.dispatchId;
+    }
     return id || null;
   }
 

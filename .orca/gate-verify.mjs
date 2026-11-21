@@ -17,7 +17,7 @@
 
 import { existsSync, readFileSync, statSync, lstatSync, copyFileSync, renameSync, rmSync, utimesSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { verifyMergeDangerGate } from "./merge-danger.mjs";
 
@@ -306,13 +306,19 @@ export function verifyArtifactContent(text, verify, { gitDir = null, artDir = nu
   return { ok: true, reason: null, verdict: foundVerdict, contractCommit: foundCommit, expectedCommit, mergeDanger, mergeDangerResult, pendingHumanMerge };
 }
 
+function stripInlineCodeSpans(line) {
+  return String(line || "").replace(/(`+)([\s\S]*?)\1/g, " ");
+}
+
 function stripMarkdownCodeFences(text) {
   const out = [];
   let inFence = false;
   let fenceChar = "";
   let fenceLen = 0;
   for (const raw of String(text || "").split(/\r?\n/)) {
-    const tf = raw.trimStart();
+    // Strip leading blockquote markers (`> > `) BEFORE testing for fenced code blocks!
+    const unquoted = raw.replace(/^\s*(?:>\s*)+/, "");
+    const tf = unquoted.trimStart();
     const fm = tf.match(/^(`{3,}|~{3,})/);
     if (fm) {
       const ch = fm[1][0];
@@ -330,12 +336,12 @@ function stripMarkdownCodeFences(text) {
         continue;
       }
     }
-    if (!inFence) out.push(raw);
+    if (!inFence) out.push(stripInlineCodeSpans(raw));
   }
   return out;
 }
 
-function extractWriterAttestedDispatchIds(text) {
+export function extractWriterAttestedDispatchIds(text) {
   const ids = new Set();
   const unfencedLines = stripMarkdownCodeFences(text);
   const unfencedText = unfencedLines.join("\n");
@@ -354,6 +360,36 @@ function extractWriterAttestedDispatchIds(text) {
 
 function lstatSafe(p) {
   try { return lstatSync(p); } catch { return null; }
+}
+
+/**
+ * P0-01: Walk EVERY path component from `baseDir` down to `targetPath` with `lstatSync`
+ * so a symlink on any parent directory (e.g. `reviews -> /tmp/evil`) or path traversal
+ * (`..`) is rejected identically to a leaf symlink!
+ */
+export function hasSymlinkInPath(baseDir, targetPath) {
+  const baseAbs = resolve(baseDir);
+  const targetAbs = resolve(targetPath);
+  const rel = relative(baseAbs, targetAbs);
+  if (rel.startsWith("..") || isAbsolute(rel)) {
+    return { bad: true, reason: `path traversal outside artifact root rejected (${rel})` };
+  }
+  const baseLst = lstatSafe(baseAbs);
+  if (baseLst && baseLst.isSymbolicLink()) {
+    return { bad: true, reason: `symlink rejected on artifact root ${baseAbs}` };
+  }
+  if (!rel) return { bad: false, reason: null };
+  const parts = rel.split(sep).filter(Boolean);
+  let cur = baseAbs;
+  for (const seg of parts) {
+    cur = join(cur, seg);
+    const lst = lstatSafe(cur);
+    if (!lst) break;
+    if (lst.isSymbolicLink()) {
+      return { bad: true, reason: `symlink rejected in artifact path (${seg})` };
+    }
+  }
+  return { bad: false, reason: null };
 }
 
 /**
@@ -404,12 +440,13 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
     return { ok: true };
   };
 
-  // P0-01: Inspect dispatch-scoped candidate IN-PLACE FIRST (rejecting symlinks and wrong-ID/invalid
-  // content BEFORE touching canonical `<writes>`!), then atomically promote via temp + rename!
+  // P0-01: Inspect dispatch-scoped candidate IN-PLACE FIRST (rejecting symlinks along the
+  // entire path chain and wrong-ID/invalid content BEFORE touching canonical `<writes>`!),
+  // then atomically promote via basename temp + rename!
   if (isSettlement && dispatchScopedPath) {
-    const dirLst = lstatSafe(dispatchScopedDir);
-    if (dirLst && dirLst.isSymbolicLink()) {
-      return { ok: false, reason: `symlink rejected: dispatch directory .dispatch-${safeDisp} is a symbolic link` };
+    const scopedChain = hasSymlinkInPath(artDir, dispatchScopedPath);
+    if (scopedChain.bad) {
+      return { ok: false, reason: scopedChain.reason };
     }
     const scopedLst = lstatSafe(dispatchScopedPath);
     if (scopedLst) {
@@ -450,13 +487,13 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
         if (!contentRes.ok) return contentRes;
       }
 
-      // All checks passed in-place: refuse to overwrite a symlink at canonicalPath, then atomically promote!
-      const canonExistingLst = lstatSafe(canonicalPath);
-      if (canonExistingLst && canonExistingLst.isSymbolicLink()) {
-        return { ok: false, reason: `symlink rejected at canonical gate path ${step.writes}` };
+      // All checks passed in-place: verify entire canonical destination path has zero symlinks, then atomically promote!
+      const canonChain = hasSymlinkInPath(artDir, canonicalPath);
+      if (canonChain.bad) {
+        return { ok: false, reason: canonChain.reason };
       }
       mkdirSync(dirname(canonicalPath), { recursive: true });
-      const promoteTmp = join(dirname(canonicalPath), `.${step.writes}.promote.${process.pid}.${Date.now()}.tmp`);
+      const promoteTmp = join(dirname(canonicalPath), `.tmp-${basename(canonicalPath)}-${process.pid}-${Date.now()}`);
       try {
         copyFileSync(dispatchScopedPath, promoteTmp);
         try { utimesSync(promoteTmp, scopedLst.atime, scopedLst.mtime); } catch {}
@@ -469,6 +506,10 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
     }
   }
 
+  const canonPathCheck = hasSymlinkInPath(artDir, canonicalPath);
+  if (canonPathCheck.bad) {
+    return { ok: false, reason: canonPathCheck.reason };
+  }
   const filePath = canonicalPath;
   const st = lstatSafe(filePath);
   if (!st) {

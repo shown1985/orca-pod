@@ -540,7 +540,7 @@ if (ISSUE_CFG.mode === false) {
     ISSUE_STATE = syncPlanIssues({
       providerInfo: ISSUE_PROVIDER, config: ISSUE_CFG, repoDir: WT_DIR || ".", artDirAbs,
       objective, stepId: "init", artifactPath: null,
-      runScopeId: LEDGER.runKey, priorRunScopeIds: opt.from ? resumedLineageRunKeys : [], lineageId: activeLineageId, requireRunScope: Boolean(opt.from),
+      runScopeId: LEDGER.runKey, priorRunScopeIds: opt.from ? verifiedLineageRunKeys : [], lineageId: activeLineageId, requireRunScope: Boolean(opt.from),
       log, warn,
     });
     if (ISSUE_STATE) LEDGER?.recordIssueLinks(ISSUE_STATE);
@@ -649,7 +649,7 @@ while (gi < groups.length) {
           ISSUE_STATE = syncPlanIssues({
             providerInfo: ISSUE_PROVIDER, config: ISSUE_CFG, repoDir: WT_DIR || ".", artDirAbs,
             objective, stepId: r.step.id, artifactPath: planArt,
-            runScopeId: LEDGER.runKey, priorRunScopeIds: opt.from ? resumedLineageRunKeys : [], lineageId: activeLineageId, requireRunScope: Boolean(opt.from),
+            runScopeId: LEDGER.runKey, priorRunScopeIds: opt.from ? verifiedLineageRunKeys : [], lineageId: activeLineageId, requireRunScope: Boolean(opt.from),
             log, warn,
           });
           if (ISSUE_STATE) LEDGER?.recordIssueLinks(ISSUE_STATE);

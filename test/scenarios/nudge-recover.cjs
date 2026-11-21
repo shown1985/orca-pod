@@ -14,7 +14,7 @@ module.exports = {
       c.ok({ dispatchId: id, state: "ready" });
     },
     "orchestration worker-show": (c) =>
-      c.ok({ terminal: { id: "term-nudge", lastOutputAt: Date.now(), preview: "agent idle at prompt" } }),
+      c.ok({ dispatchId: c.flags.dispatch, terminal: { id: "term-nudge", lastOutputAt: Date.now(), preview: "agent idle at prompt" } }),
     "terminal send": (c) => {
       const text = String(c.flags.text ?? "");
       const m = text.match(/\.orca\/artifacts\/([\w.\-]+)/);

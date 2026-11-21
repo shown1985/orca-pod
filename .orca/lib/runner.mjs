@@ -490,11 +490,32 @@ export function createRunner({
       if (!mr.ok) warn(`manual terminal close/release '${m.step.title}' did not confirm: ${mr.reason}`);
     } else if (m.dispatchId) {
       const rel = orca(["orchestration", "worker-release", "--dispatch", m.dispatchId], { allowPostDeadlineCleanup: true, timeoutMs: 3000 });
-      const relAction = pick(res(rel.json), ["action", "status", "releaseStatus"]);
+      const relJson = res(rel.json);
+      const relDispId = pick(relJson, ["dispatchId", "dispatch_id", "id"]) || pick(relJson.dispatch || {}, ["id", "dispatchId"]) || null;
+      const relAction = String(pick(relJson, ["action", "status", "releaseStatus", "state"]) || "").trim().toLowerCase();
+      const keptOpen = Boolean(
+        relJson?.keptOpen === true ||
+        relJson?.kept_open === true ||
+        relJson?.retained === true ||
+        relAction === "retained" ||
+        relAction === "kept_open" ||
+        relAction === "release_unknown" ||
+        relAction === "release_pending"
+      );
       if (!rel.ok || relAction === "release_unknown" || relAction === "release_pending") {
         warn(`worker-release '${m.step.title}' (${m.dispatchId}) returned ${relAction || sanitizeText(rel.stderr || rel.raw, { maxLen: 200 })}`);
       }
-      if (m.nudgeTerminal) {
+      // P0-01: Respect Orca's supervised release retention decision — ONLY close `m.nudgeTerminal`
+      // when `nudgeTerminal` was positively attributed to `m.dispatchId` AND `worker-release`
+      // positively released `m.dispatchId` without `retained` / `keptOpen`!
+      if (
+        m.nudgeTerminal &&
+        m.nudgeTerminalDispatchId === m.dispatchId &&
+        rel.ok &&
+        relDispId === m.dispatchId &&
+        !keptOpen &&
+        (relAction === "released" || relAction === "already_released" || relAction === "closed")
+      ) {
         orca(["terminal", "close", "--terminal", m.nudgeTerminal], { allowPostDeadlineCleanup: true, timeoutMs: 3000 });
       }
     }
@@ -833,7 +854,10 @@ export function createRunner({
       }
 
       if (started?.dispatchId) {
-        recordExecutedStep(step.id, activeCand.agent, started.effectiveModel ?? launchSpec.effectiveModel ?? null, worktreeDir);
+        const interimModel = started.effectiveModelResolved === true
+          ? (started.effectiveModel || null)
+          : (started.effectiveModel ?? launchSpec.effectiveModel ?? null);
+        recordExecutedStep(step.id, activeCand.agent, interimModel, worktreeDir);
       }
 
       if (started?.deadlineExceeded) {
@@ -903,7 +927,14 @@ export function createRunner({
       activeCand.isPrimary ? (activeCand.requestedEffort ?? step.effort ?? null) : (activeCand.requestedEffort ?? activeCand.effort),
       { projectDir: worktreeDir }
     );
-    const finalModel = started.effectiveModel ?? finalLaunchSpec.effectiveModel ?? null;
+    // P2-01: Distinguish an explicitly resolved `null` model/effort from `undefined` (not yet resolved),
+    // NEVER falling back via `??` to a pre-estimated model/effort that was NOT present in the launched argv!
+    const finalModel = started.effectiveModelResolved === true
+      ? (started.effectiveModel || null)
+      : (started.effectiveModel !== undefined ? (started.effectiveModel || null) : (finalLaunchSpec.effectiveModel || null));
+    const finalEffort = started.effectiveEffortResolved === true
+      ? (started.effectiveEffort || null)
+      : (started.effectiveEffort !== undefined ? (started.effectiveEffort || null) : null);
     const execRec = recordExecutedStep(step.id, activeCand.agent, finalModel, worktreeDir);
 
     const dispatchedAt = Date.now();
@@ -939,8 +970,8 @@ export function createRunner({
         turnStart: health.turnStart,
         state: started.dispatchState || (terminal ? "manual" : "ready"),
         effectiveAgent: started.effectiveAgent || activeCand.agent,
-        effectiveModel: started.effectiveModel || finalModel || "default",
-        effectiveEffort: started.effectiveEffort ?? null,
+        effectiveModel: finalModel || "default",
+        effectiveEffort: finalEffort,
         executedFamilies: execRec.executedFamilies,
       });
     }

@@ -9,7 +9,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import readline from "node:readline";
 import { WATCHDOG_PARKED_PROMPTS, detectGatewayDisconnect, detectPromptBlocked } from "../watchdog.mjs";
-import { parseAgentCommandSpec, stripUnquotedShellComment } from "../preflight.mjs";
+import { parseAgentCommandSpec, resolveEffectiveLaunchSpec, stripUnquotedShellComment } from "../preflight.mjs";
 import { sanitizeText } from "./sanitize.mjs";
 
 export const IS_WIN = process.platform === "win32";
@@ -85,38 +85,18 @@ export function buildAgySettingsArg(trustedDirs, { isWin = IS_WIN, settingsDir =
 }
 
 /**
- * Insert synthesized CLI flags BEFORE any unquoted `--` end-of-options terminator
- * (after stripping any unquoted `#` trailing comment), so injected flags NEVER land
- * inside a comment or after `--` as positional arguments!
+ * Insert synthesized CLI flags BEFORE any `--` end-of-options terminator (whether
+ * written `--`, `"--"`, `'--'`, or `\-\-`) using the exact same `parseAgentCommandSpec`
+ * token spans as preflight! If the command is unparseable, NEVER inject `--model`/`--effort`.
  */
-function appendFlagsBeforeTerminator(cmdStr, extraFlags) {
+function appendFlagsBeforeTerminator(cmdStr, extraFlags, parsedSpec = null) {
   if (!extraFlags.length) return cmdStr;
+  const parsed = parsedSpec || parseAgentCommandSpec(cmdStr);
   const flagBlock = extraFlags.join(" ");
-  let quote = null;
-  let tokenStart = -1;
-  for (let i = 0; i <= cmdStr.length; i++) {
-    const ch = i < cmdStr.length ? cmdStr[i] : " ";
-    if (quote === "'") { if (ch === "'") quote = null; continue; }
-    if (quote === '"') {
-      if (ch === '"') quote = null;
-      else if (ch === "\\" && i + 1 < cmdStr.length) i++;
-      continue;
-    }
-    if (/\s/.test(ch)) {
-      if (tokenStart >= 0) {
-        const tok = cmdStr.slice(tokenStart, i);
-        if (tok === "--") {
-          const prefix = cmdStr.slice(0, tokenStart).trimEnd();
-          const suffix = cmdStr.slice(tokenStart);
-          return `${prefix} ${flagBlock} ${suffix}`;
-        }
-        tokenStart = -1;
-      }
-      continue;
-    }
-    if (tokenStart < 0) tokenStart = i;
-    if (ch === "'" || ch === '"') { quote = ch; continue; }
-    if (ch === "\\" && i + 1 < cmdStr.length) i++;
+  if (parsed.parseable && parsed.hasOptionTerminator && parsed.optionTerminatorRawStart >= 0) {
+    const prefix = cmdStr.slice(0, parsed.optionTerminatorRawStart).trimEnd();
+    const suffix = cmdStr.slice(parsed.optionTerminatorRawStart);
+    return prefix ? `${prefix} ${flagBlock} ${suffix}` : `${flagBlock} ${suffix}`;
   }
   return `${cmdStr} ${flagBlock}`;
 }
@@ -124,11 +104,15 @@ function appendFlagsBeforeTerminator(cmdStr, extraFlags) {
 export function buildAgentCommand(agent, model = null, { autoRun = true, effort = null, worktreePath = null, extraTrustedDirs = [], settingsDir = null, warn = () => {}, isWin = IS_WIN } = {}) {
   let cmd = stripUnquotedShellComment(String(agent || "").trim());
   const parsed = parseAgentCommandSpec(cmd);
-  const baseLower = parsed.parseable ? parsed.lowerBase : "";
-  const isKiro = parsed.parseable ? parsed.isKiro : isKiroCmd(cmd);
-  const isAgy = parsed.parseable ? (baseLower === "agy" || baseLower === "antigravity") : isAgyCmd(cmd);
-  const hasModel = parsed.parseable ? parsed.hasModelFlag : MODEL_FLAG_RE.test(cmd);
-  const hasEffort = parsed.parseable ? parsed.hasEffortFlag : EFFORT_FLAG_RE.test(cmd);
+  if (!parsed.parseable) {
+    // Fail closed on unparseable shell expressions/expansions: NEVER inject `--model` or `--effort`!
+    return cmd;
+  }
+  const baseLower = parsed.lowerBase;
+  const isKiro = parsed.isKiro;
+  const isAgy = baseLower === "agy" || baseLower === "antigravity";
+  const hasModel = parsed.hasModelFlag;
+  const hasEffort = parsed.hasEffortFlag;
   const normModel = (model != null && String(model).trim() && String(model).trim().toLowerCase() !== "default")
     ? String(model).trim()
     : null;
@@ -139,22 +123,22 @@ export function buildAgentCommand(agent, model = null, { autoRun = true, effort 
 
   if (isAgy) {
     if (effort && !hasEffort) extraFlags.push(`--effort ${effort}`);
-    if (autoRun && !(parsed.parseable ? parsed.hasDangerouslySkipFlag : cmd.includes("--dangerously-skip-permissions")) && !(parsed.parseable ? parsed.hasModeFlag : /(^|\s)--mode(\s|=|$)/.test(cmd))) {
+    if (autoRun && !parsed.hasDangerouslySkipFlag && !parsed.hasModeFlag) {
       extraFlags.push("--dangerously-skip-permissions");
     }
     const trustDirs = [worktreePath, ...(extraTrustedDirs || [])].filter(Boolean);
-    if (trustDirs.length && !(parsed.parseable ? parsed.hasSettingsFlag : cmd.includes("--settings"))) {
+    if (trustDirs.length && !parsed.hasSettingsFlag) {
       const settingsArg = buildAgySettingsArg(trustDirs, { isWin, settingsDir });
       if (settingsArg) extraFlags.push(settingsArg);
     }
-    return appendFlagsBeforeTerminator(cmd, extraFlags);
+    return appendFlagsBeforeTerminator(cmd, extraFlags, parsed);
   }
 
-  const isClaude = parsed.parseable ? baseLower === "claude" : (cmd === "claude" || cmd.startsWith("claude "));
-  if (!isClaude) return appendFlagsBeforeTerminator(cmd, extraFlags);
-  if (autoRun && !(parsed.parseable ? parsed.hasPermissionModeFlag : cmd.includes("--permission-mode")) && !(parsed.parseable ? parsed.hasDangerouslySkipFlag : cmd.includes("--dangerously-skip-permissions")))
+  const isClaude = baseLower === "claude";
+  if (!isClaude) return appendFlagsBeforeTerminator(cmd, extraFlags, parsed);
+  if (autoRun && !parsed.hasPermissionModeFlag && !parsed.hasDangerouslySkipFlag)
     extraFlags.push("--permission-mode bypassPermissions");
-  cmd = appendFlagsBeforeTerminator(cmd, extraFlags);
+  cmd = appendFlagsBeforeTerminator(cmd, extraFlags, parsed);
   if (!autoRun) return cmd;
   return isWin ? `cmd /c "set CLAUDE_AFK_TIMEOUT_MS=60000&& ${cmd}"` : `env CLAUDE_AFK_TIMEOUT_MS=60000 ${cmd}`;
 }
@@ -225,25 +209,43 @@ export function outcomeOf(done) {
 const CLEANUP_RPC_TIMEOUT_MS = 3000;
 const CONFIRMED_TERMINAL_CLOSE_STATES = new Set(["closed", "already_closed", "exited", "terminated", "stopped", "gone", "not_found", "removed"]);
 
-function extractReceiptTerminalHandle(obj) {
-  if (!obj || typeof obj !== "object") return null;
+function collectHandleValuesFromObject(obj, setOut) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
   for (const k of ["handle", "terminalHandle", "terminal_handle", "id", "terminalId", "terminal_id"]) {
-    if (typeof obj[k] === "string" && obj[k].trim()) return obj[k].trim();
+    if (typeof obj[k] === "string" && obj[k].trim()) setOut.add(obj[k].trim());
   }
-  if (typeof obj.terminal === "string" && obj.terminal.trim()) return obj.terminal.trim();
-  if (obj.terminal && typeof obj.terminal === "object") {
+  if (typeof obj.terminal === "string" && obj.terminal.trim()) {
+    setOut.add(obj.terminal.trim());
+  } else if (obj.terminal && typeof obj.terminal === "object" && !Array.isArray(obj.terminal)) {
     for (const k of ["handle", "terminalHandle", "terminal_handle", "id", "terminalId", "terminal_id"]) {
-      if (typeof obj.terminal[k] === "string" && obj.terminal[k].trim()) return obj.terminal[k].trim();
+      if (typeof obj.terminal[k] === "string" && obj.terminal[k].trim()) setOut.add(obj.terminal[k].trim());
     }
   }
-  return null;
 }
+
+function extractAllReceiptTerminalHandles(rawJson) {
+  const handles = new Set();
+  if (!rawJson || typeof rawJson !== "object") return [];
+  collectHandleValuesFromObject(rawJson, handles);
+  if (rawJson.result && typeof rawJson.result === "object") {
+    collectHandleValuesFromObject(rawJson.result, handles);
+  }
+  return [...handles];
+}
+
+function extractReceiptTerminalHandle(obj) {
+  const all = extractAllReceiptTerminalHandles(obj);
+  return all[0] || null;
+}
+
+const RUNTIME_NETWORK_CONFLICT_RE = /\b(?:ECONNREFUSED|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EPIPE|EAI_AGAIN|socket hang up|fetch failed|connection refused|connection reset|broken pipe|timed?\s*out)\b/i;
 
 /**
  * P0-01: Positively close a caller-created manual terminal AND confirm via `terminal show`
  * that the exact `termHandle` session is closed/gone.
  *   - NEVER accepts empty `{}` receipts on `terminal close` or `terminal show`!
- *   - NEVER accepts a receipt whose returned handle/id differs from `termHandle`!
+ *   - Inspects ALL top-level and nested handle fields so a matching top-level handle NEVER masks a conflicting nested handle!
+ *   - Rejects generic gateway errors like `endpoint not found` (only accepts explicit terminal-resource absence)!
  */
 export function verifyManualTerminalClosed(orcaFn, termHandle) {
   if (!termHandle || !String(termHandle).trim()) {
@@ -252,14 +254,16 @@ export function verifyManualTerminalClosed(orcaFn, termHandle) {
   const target = String(termHandle).trim();
   const cl = orcaFn(["terminal", "close", "--terminal", target], { allowPostDeadlineCleanup: true, timeoutMs: CLEANUP_RPC_TIMEOUT_MS });
   const clJson = res(cl.json);
-  const clHandle = extractReceiptTerminalHandle(clJson);
-  const clAction = String(pick(clJson, ["status", "action", "state"]) || "").trim().toLowerCase();
-  if (clHandle && clHandle !== target) {
+  const clHandles = extractAllReceiptTerminalHandles(cl.json);
+  const badClHandle = clHandles.find((h) => h !== target);
+  if (badClHandle) {
     return {
       ok: false,
-      reason: `terminal close handle mismatch (got "${clHandle}", expected "${target}")`,
+      reason: `terminal close handle mismatch (got "${badClHandle}", expected "${target}")`,
     };
   }
+  const clHandle = clHandles.includes(target) ? target : null;
+  const clAction = String(pick(clJson, ["status", "action", "state"]) || "").trim().toLowerCase();
   const closeReceiptPositive = Boolean(
     cl.ok &&
     cl.json &&
@@ -276,19 +280,34 @@ export function verifyManualTerminalClosed(orcaFn, termHandle) {
   if (checkRes.timedOut) {
     return { ok: false, reason: `terminal show (${target}) timed out while verifying manual terminal closure` };
   }
+  const showHandles = extractAllReceiptTerminalHandles(checkRes.json);
+  const badShowHandle = showHandles.find((h) => h !== target);
+  if (badShowHandle) {
+    return {
+      ok: false,
+      reason: `terminal show handle mismatch (got "${badShowHandle}", expected "${target}")`,
+    };
+  }
   if (!checkRes.ok) {
     const errJson = res(checkRes.json);
-    const errHandle = extractReceiptTerminalHandle(errJson);
-    if (errHandle && errHandle !== target) {
-      return { ok: false, reason: `terminal show error handle mismatch (got "${errHandle}", expected "${target}")` };
-    }
-    const errTxt = `${checkRes.stderr || ""} ${checkRes.raw || ""}`;
-    if (/not[\s_-]*found|unknown[\s_-]*terminal|no[\s_-]*such[\s_-]*terminal|closed|gone|does not exist|invalid terminal/i.test(errTxt)) {
+    const errCode = String(
+      pick(errJson, ["code", "errorCode", "error_code"]) ||
+      pick(checkRes.json || {}, ["code", "errorCode", "error_code"]) ||
+      ""
+    ).trim().toLowerCase();
+    const errTxt = `${checkRes.stderr || ""} ${checkRes.raw || ""} ${checkRes.json?.error || ""}`;
+    // Reject generic gateway errors like `endpoint not found` or `route not found` or `method not found`!
+    const isGenericGatewayNotFound = /\b(?:endpoint|route|url|path|method|command|service|server|daemon|gateway|rpc)\s+not[\s_-]*found\b/i.test(errTxt);
+    const explicitTerminalGone = !isGenericGatewayNotFound && (
+      /^(?:terminal_not_found|unknown_terminal|no_such_terminal|terminal_closed|terminal_gone)$/.test(errCode) ||
+      /\b(?:terminal(?:\s+handle|\s+id|\s+session)?(?:\s+["'`]?[A-Za-z0-9._:-]+["'`]?)?\s+(?:not[\s_-]*found|does not exist|is closed|already closed|gone)|unknown[\s_-]*terminal|no[\s_-]*such[\s_-]*terminal|invalid[\s_-]*terminal)\b/i.test(errTxt)
+    );
+    if (explicitTerminalGone) {
       return { ok: true, reason: null };
     }
     return {
       ok: false,
-      reason: `terminal show (${target}) failed without not-found confirmation: ${sanitizeText(errTxt || "unknown error", { maxLen: 180 })}`,
+      reason: `terminal show (${target}) failed without explicit terminal-not-found confirmation: ${sanitizeText(errTxt || "unknown error", { maxLen: 180 })}`,
     };
   }
 
@@ -297,13 +316,7 @@ export function verifyManualTerminalClosed(orcaFn, termHandle) {
   if (!termObj || typeof termObj !== "object" || Array.isArray(termObj)) {
     return { ok: false, reason: `terminal show (${target}) returned empty/missing terminal record instead of explicit closed/not_found confirmation` };
   }
-  const shownHandle = extractReceiptTerminalHandle(termObj) || extractReceiptTerminalHandle(checkJson);
-  if (shownHandle && shownHandle !== target) {
-    return {
-      ok: false,
-      reason: `terminal show handle mismatch (got "${shownHandle}", expected "${target}")`,
-    };
-  }
+  const shownHandle = showHandles.includes(target) ? target : null;
   const tState = String(pick(termObj, ["status", "state"]) || "").trim().toLowerCase();
   if ((termObj.closed === true || CONFIRMED_TERMINAL_CLOSE_STATES.has(tState)) && (shownHandle === target || clHandle === target)) {
     return { ok: true, reason: null };
@@ -486,11 +499,16 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     "  - set ORCA_FLOW_WORKTREE for this machine/shell, or\n" +
     '  - set "defaults": { "worktree": "name:<displayName>" } in the config.';
 
-  function resolveOrca() {
+  function resolveOrca(deadlineAt = null) {
+    if (deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      return null;
+    }
     const bases = process.env.ORCA_CLI_COMMAND ? [process.env.ORCA_CLI_COMMAND] : ["orca", "orca-dev", "orca-ide"];
     const cands = IS_WIN ? bases.flatMap((b) => (b.includes(".") ? [b] : [`${b}.cmd`, `${b}.exe`, b])) : bases;
     for (const c of cands) {
-      const p = spawnSync(c, ["--version"], { encoding: "utf8" });
+      const rem = clampTimeoutToDeadline(deadlineAt, 3000);
+      if (rem === 0) return null;
+      const p = spawnSync(c, ["--version"], { encoding: "utf8", timeout: rem });
       if (!p.error) { orcaBin = c; return c; }
     }
     die("Could not find the orca CLI. Set ORCA_CLI_COMMAND.");
@@ -520,7 +538,19 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
         deadlineExceeded: true,
       };
     }
-    if (!orcaBin) resolveOrca();
+    if (!orcaBin) {
+      const resolvedBin = resolveOrca(allowPostDeadlineCleanup ? null : deadlineAt);
+      if (!resolvedBin) {
+        return {
+          ok: false,
+          json: null,
+          raw: "",
+          stderr: "step deadline reached before resolving orca CLI",
+          timedOut: true,
+          deadlineExceeded: true,
+        };
+      }
+    }
     const full = args.includes("--json") ? args : [...args, "--json"];
     const r = spawnSync(orcaBin, full, { encoding: "utf8", timeout: effTimeout, maxBuffer: 64 * 1024 * 1024 });
     const raw = (r.stdout || "").trim();
@@ -539,8 +569,9 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     };
   }
 
-  function worktreeCandidates() {
-    const l = orca(["worktree", "list"]);
+  function worktreeCandidates(deadlineAt = null) {
+    const l = orca(["worktree", "list"], { deadlineAt });
+    if (l.deadlineExceeded) return "";
     const ws = (pick(res(l.json), ["worktrees"]) || [])
       .map((w) => ({ name: pick(w, ["displayName"]) || "", path: pick(w, ["path"]) || "" }))
       .filter((w) => w.name && w.path);
@@ -585,33 +616,42 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     log(`[worktree] created ${name}${cp ? " -> " + cp : ""}`);
   }
 
-  function resolveWorktree(soft = false) {
+  function resolveWorktree(soft = false, deadlineAt = null) {
     if (wt) return wt;
+    if (deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      return null;
+    }
     if (wtPin) {
-      const shown = orca(["worktree", "show", "--worktree", wtPin]);
+      const shown = orca(["worktree", "show", "--worktree", wtPin], { deadlineAt });
+      if (shown.deadlineExceeded) return null;
       const p = pick(res(shown.json).worktree || {}, ["path"]);
       if (shown.ok && p) { wt = wtPin; wtPath = p; return wt; }
-      const cands = worktreeCandidates();
+      const cands = worktreeCandidates(deadlineAt);
       const msg = `worktree "${wtPin}" (from ${wtSource()}) does not exist.\n${wtFixHint()}${cands ? `\nAvailable worktrees:\n${cands}` : ""}`;
       if (soft) { if (!wtWarned) { wtWarned = true; warn(msg); } return null; }
       die(msg);
     }
-    const w = orca(["worktree", "current"]);
+    const w = orca(["worktree", "current"], { deadlineAt });
+    if (w.deadlineExceeded) return null;
     const entry = pick(res(w.json), ["worktree"]) || res(w.json);
     const p = pick(entry, ["path"]);
     if (w.ok && p) { wt = `path:${p}`; wtPath = p; return wt; }
     if (soft) return null;
-    const cands = worktreeCandidates();
+    const cands = worktreeCandidates(deadlineAt);
     die(`Could not auto-detect the worktree: the invoking directory is not inside an Orca-managed worktree.\n${wtFixHint()}${cands ? `\nAvailable worktrees:\n${cands}` : ""}`);
   }
 
-  function resolveWorktreePath(soft = false) {
+  function resolveWorktreePath(soft = false, deadlineAt = null) {
     if (wtPath != null) return wtPath;
-    const sel = resolveWorktree(soft);
+    if (deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      return null;
+    }
+    const sel = resolveWorktree(soft, deadlineAt);
     if (!sel) return null;
     if (sel.startsWith("path:")) wtPath = sel.slice("path:".length);
     else {
-      const w = orca(["worktree", "show", "--worktree", sel]);
+      const w = orca(["worktree", "show", "--worktree", sel], { deadlineAt });
+      if (w.deadlineExceeded) return null;
       wtPath = pick(res(w.json).worktree || {}, ["path"]) || null;
     }
     return wtPath;
@@ -621,10 +661,10 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     return buildAgentCommand(agent, model, { autoRun, effort, worktreePath, warn, isWin: IS_WIN });
   }
 
-  function resolveEffectiveWtPath(wtSelector, explicitPath) {
+  function resolveEffectiveWtPath(wtSelector, explicitPath, deadlineAt = null) {
     if (explicitPath) return explicitPath;
     if (wtSelector && wtSelector.startsWith("path:")) return wtSelector.slice("path:".length);
-    return resolveWorktreePath(true);
+    return resolveWorktreePath(true, deadlineAt);
   }
 
   function warmTerminal(agent, model = null, wtSelector = null, { effort = null, worktreePath = null, deadlineAt = null } = {}) {
@@ -632,16 +672,24 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       return { ok: false, deadlineExceeded: true, uncreated: true, handle: null };
     }
     const startedAt = Date.now();
-    const effWtPath = resolveEffectiveWtPath(wtSelector, worktreePath);
+    const effWtPath = resolveEffectiveWtPath(wtSelector, worktreePath, deadlineAt);
+    if (deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      return { ok: false, deadlineExceeded: true, uncreated: true, handle: null };
+    }
+    const effWtSel = wtSelector || resolveWorktree(false, deadlineAt);
+    if (!effWtSel && deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      return { ok: false, deadlineExceeded: true, uncreated: true, handle: null };
+    }
     const cmd = agentCommand(agent, model, { effort, worktreePath: effWtPath });
-    const c = orca(["terminal", "create", "--worktree", wtSelector || resolveWorktree(), "--command", cmd], {
+    const c = orca(["terminal", "create", "--worktree", effWtSel, "--command", cmd], {
       deadlineAt,
     });
     if (c.deadlineExceeded) {
       return { ok: false, deadlineExceeded: true, uncreated: true, handle: null, command: cmd };
     }
     const cr = res(c.json);
-    const handle = pick(cr, ["handle", "terminalHandle"]) || pick(cr.terminal || {}, ["handle"]) || null;
+    const allCreateHandles = extractAllReceiptTerminalHandles(c.json);
+    const handle = pick(cr, ["handle", "terminalHandle"]) || pick(cr.terminal || {}, ["handle"]) || allCreateHandles[0] || null;
     if (!c.ok || !handle) {
       // P0-01: If `terminal create` failed AFTER returning a terminal handle, NEVER discard it!
       // Explicitly close and verify closure; if closure cannot be positively proven, return `ambiguous: true`!
@@ -724,19 +772,50 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
   }
 
   function manualStart(step, taskId, wtSelector = null, launchOpts = {}) {
+    const deadlineAt = launchOpts.deadlineAt ?? null;
     const effAgent = launchOpts.agentOverride ?? agentOf(step);
+    // P1-02: Check `deadlineAt` BEFORE any worktree/CLI resolution probes!
+    if (deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      return {
+        ok: false,
+        deadlineExceeded: true,
+        dispatchId: null,
+        terminal: null,
+        effectiveAgent: effAgent,
+        effectiveModel: null,
+        effectiveModelResolved: true,
+        effectiveEffort: null,
+        effectiveEffortResolved: true,
+        attempts: [],
+        error: "reached step deadline before manualStart",
+      };
+    }
     const reqModel = launchOpts.modelOverride !== undefined ? launchOpts.modelOverride : modelOf(step);
     const reqEffort = launchOpts.effortOverride !== undefined ? launchOpts.effortOverride : (step.effort || null);
-    const effWtPath = resolveEffectiveWtPath(wtSelector, launchOpts.worktreePath || null);
+    const effWtPath = resolveEffectiveWtPath(wtSelector, launchOpts.worktreePath || null, deadlineAt);
+    if (deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      return {
+        ok: false,
+        deadlineExceeded: true,
+        dispatchId: null,
+        terminal: null,
+        effectiveAgent: effAgent,
+        effectiveModel: null,
+        effectiveModelResolved: true,
+        effectiveEffort: null,
+        effectiveEffortResolved: true,
+        attempts: [],
+        error: "reached step deadline resolving worktree path",
+      };
+    }
     // P0-03 & P2-01: Build the EXACT final command string first and parse its real shell `argv`
-    // so comments, `--`, and `--model default` never diverge between launch and ledger!
+    // so comments, `--`/`"--"`, and `--model default` never diverge between launch and ledger!
     const previewBuiltCmd = agentCommand(effAgent, reqModel, { effort: reqEffort, worktreePath: effWtPath });
     const parsedFinal = parseAgentCommandSpec(previewBuiltCmd);
     const effectivePassedModel = (!parsedFinal.parseable || parsedFinal.isKiro)
       ? null
-      : (parsedFinal.embeddedModel || null);
+      : (parsedFinal.explicitDefaultModel ? "default" : (parsedFinal.embeddedModel || null));
     const effectivePassedEffort = parsedFinal.parseable ? (parsedFinal.embeddedEffort || null) : null;
-    const deadlineAt = launchOpts.deadlineAt ?? null;
     const manualReqId = `start-${process.pid}-${++startReqSeq}`;
 
     let lastClearedInfo = null;
@@ -920,7 +999,9 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
             terminal: term,
             effectiveAgent: effAgent,
             effectiveModel: effectivePassedModel,
+            effectiveModelResolved: true,
             effectiveEffort: effectivePassedEffort,
+            effectiveEffortResolved: true,
             lastClearedInfo,
             attempts: [{ attempt, requestId: manualReqId, mode: "manual", agent: effAgent, model: effectivePassedModel, effort: effectivePassedEffort, dispatchId, state: "manual", ok: true }],
           };
@@ -959,10 +1040,30 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
   }
 
   function coldStart(step, taskId, wtSelector = null, launchOpts = {}) {
+    const deadlineAt = launchOpts.deadlineAt ?? null;
     let retryOf = launchOpts.retryOfDispatchId || null;
     const effAgent = launchOpts.agentOverride ?? agentOf(step);
-    const parsedCmd = parseAgentCommandSpec(effAgent);
     const orcaAgent = normalizeOrcaWorkerAgent(effAgent);
+    const attempts = [...(launchOpts.priorAttempts || [])];
+    let lastClearedInfo = launchOpts.initialClearedInfo || null;
+    // P1-02: Check `deadlineAt` BEFORE any worktree/CLI resolution probes!
+    if (deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      return {
+        ok: false,
+        deadlineExceeded: true,
+        dispatchId: null,
+        terminal: null,
+        effectiveAgent: orcaAgent,
+        effectiveModel: null,
+        effectiveModelResolved: true,
+        effectiveEffort: null,
+        effectiveEffortResolved: true,
+        lastClearedInfo,
+        attempts,
+        error: "reached step deadline before coldStart",
+      };
+    }
+    const parsedCmd = parseAgentCommandSpec(effAgent);
     const reqModel = launchOpts.modelOverride !== undefined ? launchOpts.modelOverride : modelOf(step);
     const reqEffort = launchOpts.effortOverride !== undefined ? launchOpts.effortOverride : (step.effort || null);
     const normReqModel = (reqModel != null && String(reqModel).trim() && String(reqModel).trim().toLowerCase() !== "default")
@@ -973,12 +1074,30 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     const model = (!parsedCmd.parseable || parsedCmd.isKiro || parsedCmd.explicitDefaultModel)
       ? null
       : (parsedCmd.embeddedModel || normReqModel || null);
-    const recordedColdModel = parsedCmd.explicitDefaultModel ? "default" : (model || null);
-    const effort = parsedCmd.parseable ? (parsedCmd.embeddedEffort || reqEffort || null) : (reqEffort || null);
-    const effWtPath = resolveEffectiveWtPath(wtSelector, launchOpts.worktreePath || null);
-    const deadlineAt = launchOpts.deadlineAt ?? null;
-    const attempts = [...(launchOpts.priorAttempts || [])];
-    let lastClearedInfo = launchOpts.initialClearedInfo || null;
+    const effWtPath = resolveEffectiveWtPath(wtSelector, launchOpts.worktreePath || null, deadlineAt);
+    if (deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      return {
+        ok: false,
+        deadlineExceeded: true,
+        dispatchId: null,
+        terminal: null,
+        effectiveAgent: orcaAgent,
+        effectiveModel: null,
+        effectiveModelResolved: true,
+        effectiveEffort: null,
+        effectiveEffortResolved: true,
+        lastClearedInfo,
+        attempts,
+        error: "reached step deadline resolving worktree path in coldStart",
+      };
+    }
+    const resolvedColdSpec = parsedCmd.explicitDefaultModel
+      ? { effectiveModel: "default" }
+      : resolveEffectiveLaunchSpec(effAgent, model, null, { projectDir: effWtPath || null });
+    const recordedColdModel = parsedCmd.explicitDefaultModel
+      ? "default"
+      : (model || (parsedCmd.parseable && /^opencode2?$/i.test(orcaAgent) ? resolvedColdSpec.effectiveModel : null) || null);
+    const effort = parsedCmd.parseable ? (parsedCmd.embeddedEffort || reqEffort || null) : null;
 
     const enforceColdAgyTrust = process.env.ORCA_ENFORCE_COLD_AGY_TRUST === "1" || process.env.ORCA_TEST_MODE !== "1";
     if (orcaAgent === "antigravity" && enforceColdAgyTrust && effWtPath && !isAgyWorkspaceTrusted(effWtPath)) {
@@ -1020,11 +1139,28 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       }
 
       const startReqId = `start-${process.pid}-${++startReqSeq}`;
+      const effWtSel = wtSelector || resolveWorktree(false, deadlineAt);
+      if (!effWtSel && deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+        return {
+          ok: false,
+          deadlineExceeded: true,
+          dispatchId: null,
+          terminal: null,
+          effectiveAgent: orcaAgent,
+          effectiveModel: recordedColdModel,
+          effectiveModelResolved: true,
+          effectiveEffort: null,
+          effectiveEffortResolved: true,
+          lastClearedInfo,
+          attempts,
+          error: "reached step deadline resolving worktree before worker-start",
+        };
+      }
       const args = [
         "orchestration", "worker-start",
         "--task", taskId,
         "--run", runId,
-        "--worktree", wtSelector || resolveWorktree(),
+        "--worktree", effWtSel,
         "--agent", orcaAgent,
       ];
       let passedEffort = null;
@@ -1062,23 +1198,28 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
         };
       }
       const result = res(r.json);
-      const rawDispId = pick(result, ["dispatchId", "dispatch_id"]) || pick(result.dispatch || {}, ["id"]);
+      const rawDispId = pick(result, ["dispatchId", "dispatch_id"])
+        || pick(result.dispatch || {}, ["id"])
+        || pick(r.json || {}, ["dispatchId", "dispatch_id"])
+        || pick(r.json?.dispatch || {}, ["id"]);
       const dispatchId = rawDispId && String(rawDispId).trim() ? String(rawDispId).trim() : null;
-      const state = pick(result, ["state"]);
+      const state = pick(result, ["state"]) || pick(r.json || {}, ["state"]);
       const receiptTurnStart = pick(result, ["turnStart", "turn_start"]) || null;
 
       if (r.ok && (state === "ready" || !state)) {
         if (!dispatchId) {
           const noIdErr = "worker-start returned ok without a dispatchId — refusing unattributed worker on worktree";
-          attempts.push({ attempt: attempts.length + 1, requestId: startReqId, mode: "cold", agent: orcaAgent, model: model || null, effort: passedEffort, dispatchId: null, state: state || "ok_missing_id", ok: false, error: noIdErr });
+          attempts.push({ attempt: attempts.length + 1, requestId: startReqId, mode: "cold", agent: orcaAgent, model: recordedColdModel, effort: passedEffort, dispatchId: null, state: state || "ok_missing_id", ok: false, error: noIdErr });
           return {
             ok: false,
             ambiguous: true,
             dispatchId: null,
             terminal: null,
             effectiveAgent: orcaAgent,
-            effectiveModel: model || null,
+            effectiveModel: recordedColdModel,
+            effectiveModelResolved: true,
             effectiveEffort: passedEffort,
+            effectiveEffortResolved: true,
             lastClearedInfo,
             attempts,
             error: noIdErr,
@@ -1095,7 +1236,9 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
           receiptTurnStart,
           effectiveAgent: orcaAgent,
           effectiveModel: recordedColdModel,
+          effectiveModelResolved: true,
           effectiveEffort: passedEffort,
+          effectiveEffortResolved: true,
           lastClearedInfo,
           attempts,
         };
@@ -1103,16 +1246,16 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
 
       const rawErr = pick(result, ["lastError"]) || r.json?.error || r.stderr || "unknown error";
       const lastError = sanitizeText(String(rawErr), { maxLen: 260 });
-      const failedStage = pick(result, ["failedStage", "stage"]) || null;
+      const failedStage = pick(result, ["failedStage", "stage"]) || pick(r.json || {}, ["failedStage", "stage"]) || null;
       const normFailedStage = String(failedStage || "").trim().toLowerCase();
-      const residual = pick(result, ["residualResources", "effects"]);
+      const residual = pick(result, ["residualResources", "effects"]) ?? pick(r.json || {}, ["residualResources", "effects"]);
       const hasResiduals = Array.isArray(residual) ? residual.length > 0 : Boolean(residual && typeof residual === "object" && Object.keys(residual).length > 0);
       attempts.push({
         attempt: attempts.length + 1,
         requestId: startReqId,
         mode: "cold",
         agent: orcaAgent,
-        model: model || null,
+        model: recordedColdModel,
         effort: passedEffort,
         dispatchId,
         state: state || "failed",
@@ -1121,9 +1264,17 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
         error: lastError,
       });
 
-      const combinedText = `${lastError} ${sanitizeText(String(r.raw || ""), { maxLen: 300 })}`;
-      const gwErr = Boolean(detectGatewayDisconnect(combinedText));
-      const pbErr = Boolean(detectPromptBlocked(combinedText));
+      // P0-01: Scan FULL untruncated diagnostic channels (`lastError`, `json.error`, `stderr`, `raw`)
+      // independently so runtime/network conflicts in `stderr` or beyond 300 chars are NEVER missed!
+      const fullDiagText = [
+        String(pick(result, ["lastError"]) || ""),
+        String(r.json?.error || ""),
+        String(r.stderr || ""),
+        String(r.raw || ""),
+      ].join("\n");
+      const gwErr = Boolean(detectGatewayDisconnect(fullDiagText));
+      const netConflict = RUNTIME_NETWORK_CONFLICT_RE.test(fullDiagText);
+      const pbErr = Boolean(detectPromptBlocked(fullDiagText));
 
       if (dispatchId) {
         const sr = verifyStopAndReleaseReceipt(orca, dispatchId);
@@ -1134,8 +1285,10 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
             dispatchId,
             terminal: null,
             effectiveAgent: orcaAgent,
-            effectiveModel: model || null,
+            effectiveModel: recordedColdModel,
+            effectiveModelResolved: true,
             effectiveEffort: passedEffort,
+            effectiveEffortResolved: true,
             lastClearedInfo,
             attempts,
             error: `${sr.reason} (after worker-start ${state || failedStage || "failure"}: ${lastError})`,
@@ -1146,7 +1299,7 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       } else {
         // P0-01: Failed worker-start WITHOUT a `dispatchId`:
         // 1) Reconcile via `dispatch-show --task <taskId>` to check if a stray dispatch was created anyway!
-        const recon = orca(["orchestration", "dispatch-show", "--task", taskId], { allowPostDeadlineCleanup: true, timeoutMs: 5000 });
+        const recon = orca(["orchestration", "dispatch-show", "--task", taskId], { allowPostDeadlineCleanup: true, timeoutMs: CLEANUP_RPC_TIMEOUT_MS });
         const reconDisp = pick(res(recon.json), ["dispatch"]) || {};
         const reconDispId = pick(reconDisp, ["id", "dispatchId", "dispatch_id"]) || null;
         if (reconDispId && reconDispId !== retryOf) {
@@ -1158,8 +1311,10 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
               dispatchId: reconDispId,
               terminal: null,
               effectiveAgent: orcaAgent,
-              effectiveModel: model || null,
+              effectiveModel: recordedColdModel,
+              effectiveModelResolved: true,
               effectiveEffort: passedEffort,
+              effectiveEffortResolved: true,
               lastClearedInfo,
               attempts,
               error: `reconciled stray dispatch ${reconDispId} after unattributed worker-start failure could not be stopped/released: ${sr.reason}`,
@@ -1170,13 +1325,14 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
         } else {
           // 2) No dispatchId in receipt or dispatch-show: ONLY classify as `ambiguous: false` when
           //    structured Orca error code/stage is strictly a pre-launch validation rejection AND
-          //    NO conflicting runtime/post-start signal (`failedStage`, returned handle, `gwErr`) is present!
+          //    NO conflicting runtime/post-start signal (`failedStage`, top-level or nested handle,
+          //    `gwErr`, or `netConflict` in stderr/stdout) is present!
           const structuredCode = String(
             pick(result, ["code", "errorCode", "error_code"]) ||
             pick(r.json || {}, ["code", "errorCode", "error_code"]) ||
             ""
           ).trim().toLowerCase();
-          const retTermHandle = extractReceiptTerminalHandle(result);
+          const allRetHandles = extractAllReceiptTerminalHandles(r.json);
           const hasConflictingStage = Boolean(normFailedStage && !STRICT_PRE_LAUNCH_REJECTION_CODES.has(normFailedStage));
           const provenPreSpawnFailure = Boolean(
             r.json &&
@@ -1184,8 +1340,9 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
             !r.ok &&
             state !== "outcome_unknown" &&
             !hasResiduals &&
-            !retTermHandle &&
+            allRetHandles.length === 0 &&
             !gwErr &&
+            !netConflict &&
             !hasConflictingStage &&
             (
               STRICT_PRE_LAUNCH_REJECTION_CODES.has(structuredCode) ||
@@ -1199,8 +1356,10 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
               dispatchId: null,
               terminal: null,
               effectiveAgent: orcaAgent,
-              effectiveModel: model || null,
+              effectiveModel: recordedColdModel,
+              effectiveModelResolved: true,
               effectiveEffort: passedEffort,
+              effectiveEffortResolved: true,
               lastClearedInfo,
               attempts,
               error: `worker-start failed without dispatchId or strict pre-launch rejection proof (code=${structuredCode || "none"}, stage=${failedStage || "none"}, state=${state || "none"}: ${lastError}) — refusing blind retry/reuse on worktree`,
@@ -1276,6 +1435,24 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
   }
 
   function startWorker(step, taskId, wtSelector = null, launchOpts = {}) {
+    const effDeadline = launchOpts.deadlineAt ?? null;
+    // P1-02: Hard gate at the entry of `startWorker` BEFORE any worktree/CLI probes!
+    if (effDeadline != null && Number.isFinite(effDeadline) && Date.now() >= effDeadline) {
+      const effAgent = launchOpts.agentOverride ?? agentOf(step);
+      return {
+        ok: false,
+        deadlineExceeded: true,
+        dispatchId: null,
+        terminal: null,
+        effectiveAgent: effAgent,
+        effectiveModel: null,
+        effectiveModelResolved: true,
+        effectiveEffort: null,
+        effectiveEffortResolved: true,
+        attempts: [],
+        error: "reached step deadline before startWorker",
+      };
+    }
     const manual = manualStart(step, taskId, wtSelector, launchOpts);
     const manualAttempts = Array.isArray(manual?.attempts) ? manual.attempts : [];
     if (manual) {

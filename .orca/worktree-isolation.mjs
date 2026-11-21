@@ -5,7 +5,8 @@
 import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { extractWriterAttestedDispatchIds, hasSymlinkInPath } from "./gate-verify.mjs";
 
 export const WORKTREES_MANIFEST = "WORKTREES.json";
 export const DISPATCH_GATE_CLAIMS_FILE = ".dispatch-gate-claims.json";
@@ -325,33 +326,60 @@ export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDir
   if (!stepWtDir || samePath(stepWtDir, wtDir)) return;
   const srcArt = join(stepWtDir, artDirRel);
   const dstArt = join(wtDir, artDirRel);
+  if (hasSymlinkInPath(wtDir, dstArt).bad) return;
   mkdirSync(dstArt, { recursive: true });
-  const relCandidates = [step.writes, step.progress].filter(Boolean);
-  if (dispatchId && step.writes) {
-    relCandidates.push(dispatchIsolatedArtifactRel(dispatchId, step.writes));
-  }
+  const scopedWriteRel = (dispatchId && step.writes) ? dispatchIsolatedArtifactRel(dispatchId, step.writes) : null;
+  const relCandidates = [
+    ...(scopedWriteRel ? [scopedWriteRel] : []),
+    ...(step.writes ? [step.writes] : []),
+    ...(step.progress ? [step.progress] : []),
+  ];
+  let syncedScopedWrite = false;
   for (const fname of relCandidates) {
     const src = join(srcArt, fname);
     try {
-      const parentLst = fname.includes("/") ? lstatSync(join(src, "..")) : null;
-      if (parentLst && parentLst.isSymbolicLink()) continue;
+      // P0-01: Walk the ENTIRE source path from `stepWtDir` down to `src` to reject parent or leaf symlinks!
+      if (hasSymlinkInPath(stepWtDir, src).bad) continue;
       const st = lstatSync(src);
-      // P0-01: NEVER follow or copy symbolic links out of an isolated worktree!
       if (st.isSymbolicLink() || !st.isFile()) continue;
-      const isMainWrite = fname === step.writes || fname.endsWith(`/${step.writes}`);
+      const isScopedWrite = Boolean(scopedWriteRel && fname === scopedWriteRel);
+      const isCanonicalWrite = Boolean(step.writes && fname === step.writes);
+      const isMainWrite = isScopedWrite || isCanonicalWrite;
       if (isMainWrite && minSourceMtimeMs != null && Number.isFinite(minSourceMtimeMs) && st.mtimeMs < minSourceMtimeMs) {
         continue;
       }
-      const dst = join(dstArt, fname);
-      try {
-        const dstLst = lstatSync(dst);
-        if (dstLst.isSymbolicLink()) continue;
-      } catch {}
-      mkdirSync(join(dst, ".."), { recursive: true });
-      const tmpDst = `${dst}.sync.${process.pid}.${Date.now()}.tmp`;
+
+      let dstRel = fname;
+      if (dispatchId && isMainWrite) {
+        const srcText = readFileSync(src, "utf8");
+        const writerIds = extractWriterAttestedDispatchIds(srcText);
+        // Reject any artifact carrying a mismatched Dispatch-ID!
+        if (writerIds.some((id) => id !== dispatchId)) {
+          continue;
+        }
+        if (isCanonicalWrite) {
+          if (syncedScopedWrite) continue;
+          const existingCanonDst = join(dstArt, step.writes);
+          // Require positive writer attestation before overwriting an existing canonical file or staging a gated step!
+          if ((step.verify || existsSync(existingCanonDst)) && !writerIds.includes(dispatchId)) {
+            continue;
+          }
+          // For gated steps (`step.verify`), stage into `.dispatch-<id>/<writes>` so `verifyStepArtifact`
+          // validates content in-place BEFORE promoting to canonical `<writes>`!
+          if (step.verify && scopedWriteRel) {
+            dstRel = scopedWriteRel;
+          }
+        }
+      }
+
+      const dst = join(dstArt, dstRel);
+      if (hasSymlinkInPath(wtDir, dst).bad) continue;
+      mkdirSync(dirname(dst), { recursive: true });
+      const tmpDst = join(dirname(dst), `.tmp-${basename(dst)}-sync-${process.pid}-${Date.now()}`);
       copyFileSync(src, tmpDst);
       try { utimesSync(tmpDst, st.atime, st.mtime); } catch {}
       renameSync(tmpDst, dst);
+      if (isScopedWrite || dstRel === scopedWriteRel) syncedScopedWrite = true;
     } catch { /* best-effort / ENOENT */ }
   }
 }

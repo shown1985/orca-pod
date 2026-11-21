@@ -11,7 +11,7 @@ module.exports = {
       c.ok({ dispatchId: id, state: "ready" });
     },
     "orchestration worker-show": (c) =>
-      c.ok({ terminal: { id: "term-nudge", lastOutputAt: Date.now(), preview: "agent idle at prompt" } }),
+      c.ok({ dispatchId: c.flags.dispatch, terminal: { id: "term-nudge", lastOutputAt: Date.now(), preview: "agent idle at prompt" } }),
     // The nudge must be DELIVERED and ignored: a handler that returns without
     // ok/fail exits the fake with code 3, which flow.mjs reads as a FAILED
     // send (the E24 undeliverable path) — here the sends must land and do

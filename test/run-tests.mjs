@@ -3647,7 +3647,7 @@ if (a.includes("inspect")) {
 }
 process.exit(0);
 `, { mode: 0o755 });
-  writeFileSync(join(mockCdBin, "curl"), `#!/usr/bin/env node\nconsole.log("HTTP/1.1 200 OK\\r\\n\\r\\nok");\nprocess.exit(0);\n`, { mode: 0o755 });
+  writeFileSync(join(mockCdBin, "curl"), `#!/usr/bin/env node\nconst fs = require("node:fs");\nconst a = process.argv.slice(2);\nconst oi = a.indexOf("-o");\nif (oi >= 0 && a[oi + 1]) fs.writeFileSync(a[oi + 1], process.env.MOCK_CURL_BODY || "ok");\nprocess.stdout.write(process.env.MOCK_CURL_HTTP_CODE || "200");\nprocess.exit(Number(process.env.MOCK_CURL_EXIT || 0));\n`, { mode: 0o755 });
 
   const runCdHealth = (extraEnv) => spawnSync("bash", ["-c", cdHealthScript], {
     cwd: cdComposeDir,
@@ -4003,13 +4003,38 @@ if (mode === "vitals_mismatch") {
   if (key === "orchestration worker-show") return out(0, { result: { status: "completed", outcome: "succeeded" } });
   if (key === "orchestration task-list") return out(0, { result: { tasks: [{ id: "task-1", status: "completed", result: { outcome: "succeeded" } }] } });
 }
+if (mode === "vitals_match_missing_ws_id") {
+  if (key === "orchestration dispatch-show") return out(0, { result: { dispatch: { id: "disp-current", status: "running" } } });
+  if (key === "orchestration worker-show") return out(0, { result: { status: "completed", outcome: "succeeded" } });
+}
+if (mode === "vitals_match_missing_task_res_id") {
+  if (key === "orchestration dispatch-show") return out(0, { result: { dispatch: { id: "disp-current", status: "completed" } } });
+  if (key === "orchestration worker-show") return out(0, { result: { dispatchId: "disp-current", status: "completed" } });
+  if (key === "orchestration task-list") return out(0, { result: { tasks: [{ id: "task-1", status: "completed", result: { outcome: "succeeded" } }] } });
+}
 if (mode === "unattributed_start_fail") {
   if (key === "terminal create") return out(1, { error: "terminal disabled" });
   if (key === "orchestration worker-start") return out(1, { error: "internal daemon error without failedStage" });
   if (key === "orchestration dispatch-show") return out(0, { result: { dispatch: { id: null, status: "unknown" } } });
 }
 if (mode === "manual_then_cold") {
-  if (key === "terminal create") return out(1, { error: "warm terminal unavailable" });
+  if (key === "terminal create") return out(0, { result: { handle: "term-man-1" } });
+  if (key === "terminal show") {
+    const closedFlag = ${JSON.stringify(join(tmpV11, "term-man-1.closed"))};
+    if (fs.existsSync(closedFlag)) return out(0, { result: { terminal: {} } });
+    return out(0, { result: { terminal: { lastOutputAt: 1000, preview: "ready prompt" } } });
+  }
+  if (key === "orchestration dispatch") {
+    if (args.includes("--dry-run")) return out(1, { error: "preamble unavailable" });
+    return out(0, { result: { dispatch: { id: "disp-man-1" } } });
+  }
+  if (key === "orchestration worker-stop") return out(0, { result: { dispatchId: "disp-man-1", state: "fenced" } });
+  if (key === "terminal close") {
+    fs.writeFileSync(${JSON.stringify(join(tmpV11, "term-man-1.closed"))}, "1");
+    return out(0, { result: { status: "closed" } });
+  }
+  if (key === "orchestration worker-release") return out(0, { result: { dispatchId: "disp-man-1", status: "retained" } });
+  if (key === "orchestration task-update") return out(0, { result: {} });
   if (key === "orchestration worker-start") return out(0, { result: { dispatchId: "disp-cold-1", state: "ready" } });
 }
 out(0, { result: {} });
@@ -4031,11 +4056,22 @@ out(0, { result: {} });
       warn: () => {},
       die: (m) => { throw new Error(m); },
     });
+    client.setRunId("run-1");
 
     process.env.MOCK_V11_MODE = "vitals_mismatch";
-    const vit = client.workerVitals("task-1", "run-1", "disp-current");
+    const vit = client.workerVitals("task-1", null, "disp-current");
     eq("V11 P0-01 workerVitals NEVER settles on unattributed worker-show/task-list when dispatch mismatches",
       [vit.dispatchMismatch, vit.settled, vit.outcome], [true, false, null]);
+
+    process.env.MOCK_V11_MODE = "vitals_match_missing_ws_id";
+    const vitMissingWs = client.workerVitals("task-1", null, "disp-current");
+    eq("V11 P2-02 matching dispatch-show + worker-show missing ID does NOT adopt completed status",
+      [vitMissingWs.dispatchMismatch, vitMissingWs.settled, vitMissingWs.outcome], [false, false, null]);
+
+    process.env.MOCK_V11_MODE = "vitals_match_missing_task_res_id";
+    const vitMissingTaskRes = client.workerVitals("task-1", null, "disp-current");
+    eq("V11 P2-02 matching dispatch-show + task-list result missing dispatchId settles as unknown (never succeeded)",
+      [vitMissingTaskRes.settled, vitMissingTaskRes.outcome], [true, "unknown"]);
 
     process.env.MOCK_V11_MODE = "unattributed_start_fail";
     rmSync(mockOrcaLog, { force: true });
@@ -4052,8 +4088,10 @@ out(0, { result: {} });
     ok("V11 P0-01 unattributed worker-start failure reconciled via dispatch-show",
       startLogLines.some((c) => c.args[1] === "dispatch-show"));
 
-    // P2-01 + P0-01: manual -> cold transition merges manual attempt before cold attempt & runs beforeEachStartAttempt before EACH attempt!
+    // P2-01 + P2-02 + P0-01: ALREADY-CREATED manual dispatch fences (`fenced`), closes terminal (`terminal close` + `terminal show`),
+    // releases (`retained`), and falls back to `cold`, merging `manual` + `cold` attempts in order!
     process.env.MOCK_V11_MODE = "manual_then_cold";
+    rmSync(mockOrcaLog, { force: true });
     let hookCalls = 0;
     const mcRes = await client.startWorker(
       { id: "s2", title: "S2", agent: "agy", model: "gemini-4-neon" },
@@ -4061,8 +4099,13 @@ out(0, { result: {} });
       "name:testlab",
       { effort: "medium", beforeEachStartAttempt: () => { hookCalls++; } }
     );
+    const mcLogs = readFileSync(mockOrcaLog, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
     eq("V11 P2-01 manual->cold start merges manual + cold attempts in order",
-      (mcRes.attempts || []).map((a) => a.mode), ["manual", "cold"]);
+      [mcRes.ok, (mcRes.attempts || []).map((a) => a.mode)], [true, ["manual", "cold"]]);
+    ok("V11 P2-02 manual dispatch executed worker-stop(fenced) -> terminal close -> worker-release(retained) -> cold retry",
+      mcLogs.some((c) => c.args[1] === "worker-stop") &&
+      mcLogs.some((c) => c.args[0] === "terminal" && c.args[1] === "close") &&
+      mcLogs.some((c) => c.args[1] === "worker-release"));
     eq("V11 P0-01 beforeEachStartAttempt fired before manual AND before cold attempt", hookCalls, 2);
 
     // P1-02: startWorker respects expired deadlineAt immediately
@@ -4253,10 +4296,11 @@ out(0, { result: {} });
       ],
     }));
 
-    // 3a) Same-repo, same-objective status.js WITHOUT ledgerRunKey + `--only code-review` -> MUST FAIL (exit 1)!
+    // 3a) Same-repo, same-objective, SAME-CONFIG status.js WITHOUT ledgerRunKey + `--only code-review` -> MUST FAIL (exit 1)!
     const unboundStatusPayload = {
       meta: {
         objective: "test objective",
+        config: "_tmp-v11-cf.config.json",
         ledgerRunKey: null,
         steps: [{ id: "coding", title: "Coding" }, { id: "code-review", title: "Code Review" }, { id: "pr-submit", title: "PR Submit" }],
       },
@@ -4446,7 +4490,7 @@ if (a.includes("inspect")) {
 }
 process.exit(0);
 `, { mode: 0o755 });
-  writeFileSync(join(mockDockerDir, "curl"), "#!/usr/bin/env node\nconsole.log('HTTP/1.1 200 OK\\r\\n\\r\\nok');\nprocess.exit(0);\n", { mode: 0o755 });
+  writeFileSync(join(mockDockerDir, "curl"), `#!/usr/bin/env node\nconst fs = require("node:fs");\nconst a = process.argv.slice(2);\nconst oi = a.indexOf("-o");\nif (oi >= 0 && a[oi + 1]) fs.writeFileSync(a[oi + 1], "ok");\nprocess.stdout.write("200");\nprocess.exit(0);\n`, { mode: 0o755 });
   const expectedRevSha = "b".repeat(40);
   // Even if directory marker .orca-deploy-sha exists, container revision MUST still be verified!
   writeFileSync(join(cdDir, ".orca-deploy-sha"), expectedRevSha + "\n");
@@ -4592,6 +4636,585 @@ process.exit(0);
     ok("V11 P1-09 TokenHub redacted straddling credential BEFORE 40,000-char truncation",
       sentBody.length > 0 && !sentBody.includes("boundary_straddling_super_secret_value_999888777"));
   }
+});
+
+// ---------------------------------------------------------------------------
+// V12 — Round-4 Final Closure:
+// Covers ALL 10 remaining Round-3 findings (3 P0 + 5 P1 + 2 P2):
+//   - P0-01: agent_readiness unknown-stage ambiguity, terminal create fail-with-handle cleanup,
+//            manual fenced/retained stop-release vs supervised, writer-attested gate provenance
+//   - P0-02: Process-isolated unittest across all 4 CI scripts (same-name fixture_support.py + package relative imports)
+//   - P0-03 + P2-01: Config-bound ledger + primary ledgerRunKey + mandatory review digest + real shell argv tokenizer
+//   - P1-02: Pre-preflight deadline & zero-overshoot RPC clamping
+//   - P1-06: Reference-style external Markdown links
+//   - P1-07: Exit-0 external URL rejection on issue create
+//   - P1-09: Suppressed raw stdout on git diff failure across all 3 TokenHub scripts
+//   - P1-11: Strict HTTP 2xx + curl exit check & declared Healthcheck empty-status rejection
+// ---------------------------------------------------------------------------
+scenario("V12 Round-4 final closure: writer-attested gate provenance, manual fence/close/release, 4x isolated Python unittest, config/digest resume, shell tokenizer, ref-links, exit-0 URL, diff-fail PII & HTTP 500/healthcheck", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const {
+    buildAgentCommand,
+    verifyStopAndReleaseReceipt,
+    verifyManualStopAndReleaseReceipt,
+    createOrcaClient,
+  } = await import(join(REPO, ".orca", "lib", "orca-cli.mjs"));
+  const { verifyStepArtifact } = await import(join(REPO, ".orca", "gate-verify.mjs"));
+  const {
+    bindStepArtifactDispatchClaim,
+    clearStaleStepArtifact,
+  } = await import(join(REPO, ".orca", "worktree-isolation.mjs"));
+  const {
+    tokenizeShellCommand,
+    parseAgentCommandSpec,
+    resolveEffectiveLaunchSpec,
+    classifyModelFamily,
+    selectHealthyCandidate,
+  } = await import(join(REPO, ".orca", "preflight.mjs"));
+  const {
+    parseBacklogTasks,
+    extractExplicitLocalIssueNumber,
+    createIssueViaCli,
+  } = await import(join(REPO, ".orca", "issue-tracker.mjs"));
+  const {
+    detectProjectStacks,
+    renderCiWorkflow,
+    renderSelfHostedCdWorkflow,
+  } = await import(join(REPO, ".orca", "ci-generator.mjs"));
+  const { createRunLedger } = await import(join(REPO, ".orca", "ledger.mjs"));
+
+  const tmpV12 = mkdtempSync(join(tmpdir(), "orca-v12-"));
+  dirsOfCurrentScenario.push(tmpV12);
+
+  const extractStepScript = (yml, stepName) => {
+    const lines = yml.split(/\r?\n/);
+    const startIdx = lines.findIndex((l) => l.includes(`- name: ${stepName}`));
+    if (startIdx < 0) return null;
+    let runIdx = -1;
+    for (let i = startIdx + 1; i < Math.min(lines.length, startIdx + 20); i++) {
+      if (/^\s+run:\s*\|\s*$/.test(lines[i])) { runIdx = i; break; }
+    }
+    if (runIdx < 0) return null;
+    const baseIndent = lines[runIdx + 1]?.match(/^(\s*)/)?.[1]?.length || 10;
+    const body = [];
+    for (let i = runIdx + 1; i < lines.length; i++) {
+      const l = lines[i];
+      if (!l.trim()) { body.push(""); continue; }
+      const ind = l.match(/^(\s*)/)[1].length;
+      if (ind < baseIndent) break;
+      body.push(l.slice(baseIndent));
+    }
+    return body.join("\n");
+  };
+
+  // =========================================================================
+  // 1) P0-01: Unknown-stage ambiguity, failed create-with-handle cleanup,
+  //    manual fenced/retained stop-release, & writer-attested gate provenance
+  // =========================================================================
+  const mockOrcaV12 = join(tmpV12, "mock-orca-v12.cjs");
+  const mockLogV12 = join(tmpV12, "mock-orca-v12.jsonl");
+  writeFileSync(mockOrcaV12, `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const mode = process.env.MOCK_V12_MODE || "";
+fs.appendFileSync(${JSON.stringify(mockLogV12)}, JSON.stringify({ mode, args }) + "\\n");
+const out = (code, obj) => { console.log(JSON.stringify(obj)); process.exit(code); };
+const key = args.slice(0, 2).join(" ");
+if (mode === "agent_readiness_net_err") {
+  if (key === "terminal create") return out(1, { error: "no warm terminal" });
+  if (key === "orchestration worker-start") return out(1, { result: { failedStage: "agent_readiness", lastError: "connect ECONNREFUSED 127.0.0.1:4100" } });
+  if (key === "orchestration dispatch-show") return out(0, { result: { dispatch: { id: null, status: "unknown" } } });
+}
+if (mode === "strict_unknown_agent") {
+  if (key === "terminal create") return out(1, { error: "no warm terminal" });
+  if (key === "orchestration worker-start") return out(1, { result: { code: "unknown_agent", failedStage: "arg_validation", lastError: "unknown agent bogus" } });
+  if (key === "orchestration dispatch-show") return out(0, { result: { dispatch: { id: null, status: "unknown" } } });
+}
+if (mode === "create_fail_with_handle_closed") {
+  if (key === "terminal create") return out(1, { result: { handle: "term-leak-1" }, error: "post-spawn init failed" });
+  if (key === "terminal close") return out(0, { result: { status: "closed" } });
+  if (key === "terminal show") return out(1, { error: "unknown terminal term-leak-1" });
+  if (key === "orchestration worker-start") return out(0, { result: { dispatchId: "disp-after-close", state: "ready" } });
+}
+if (mode === "create_fail_with_handle_unclosed") {
+  if (key === "terminal create") return out(1, { result: { handle: "term-leak-2" }, error: "post-spawn init failed" });
+  if (key === "terminal close") return out(0, { result: { status: "closed" } });
+  if (key === "terminal show") return out(0, { result: { terminal: { preview: "still alive!", lastOutputAt: Date.now() } } });
+}
+out(0, { result: {} });
+`, { mode: 0o755 });
+
+  const prevOrca = process.env.ORCA_CLI_COMMAND;
+  const prevMode = process.env.MOCK_V12_MODE;
+  try {
+    process.env.ORCA_CLI_COMMAND = mockOrcaV12;
+    const cli = createOrcaClient({
+      cfg: { defaults: { startRetries: 0, warmTerminal: true } },
+      opt: {},
+      objective: "v12",
+      autoRun: true,
+      agentOf: (s) => s.agent,
+      modelOf: (s) => s.model,
+      writeStatus: () => {},
+      log: () => {},
+      warn: () => {},
+      die: (m) => { throw new Error(m); },
+    });
+    cli.setRunId("run-v12");
+
+    // 1a) agent_readiness network error with no dispatchId MUST stay ambiguous:true!
+    process.env.MOCK_V12_MODE = "agent_readiness_net_err";
+    const rReadiness = cli.startWorker({ id: "s1", title: "S1", agent: "codex", model: "gpt-6.2-sol" }, "t1", "name:testlab");
+    eq("V12 P0-01 agent_readiness network error without dispatchId stays ambiguous=true",
+      [rReadiness.ok, rReadiness.ambiguous], [false, true]);
+
+    // Strict pre-launch validation rejection `code: "unknown_agent"` IS provably pre-start (`ambiguous: false`)
+    process.env.MOCK_V12_MODE = "strict_unknown_agent";
+    const rPreVal = cli.startWorker({ id: "s1", title: "S1", agent: "bogus", model: null }, "t1", "name:testlab");
+    eq("V12 P0-01 strict pre-launch unknown_agent rejection is ambiguous=false",
+      [rPreVal.ok, rPreVal.ambiguous], [false, false]);
+
+    // 1b) terminal create failing AFTER returning handle MUST close & verify handle before coldStart!
+    process.env.MOCK_V12_MODE = "create_fail_with_handle_closed";
+    rmSync(mockLogV12, { force: true });
+    const rLeakClosed = cli.startWorker({ id: "s2", title: "S2", agent: "claude", model: "claude-sonnet-4-5" }, "t2", "name:testlab");
+    const leakLogs = readFileSync(mockLogV12, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    eq("V12 P0-01 failed terminal create with returned handle closed handle then entered coldStart",
+      [rLeakClosed.ok, leakLogs.filter((c) => c.args[0] === "terminal" && c.args[1] === "close").length], [true, 1]);
+
+    // If terminal show proves handle is STILL live after terminal close, block as ambiguous:true (zero coldStart!)
+    process.env.MOCK_V12_MODE = "create_fail_with_handle_unclosed";
+    rmSync(mockLogV12, { force: true });
+    const rLeakOpen = cli.startWorker({ id: "s3", title: "S3", agent: "claude", model: "claude-sonnet-4-5" }, "t3", "name:testlab");
+    const leakOpenLogs = readFileSync(mockLogV12, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    eq("V12 P0-01 failed terminal create whose handle remains live blocks ambiguous=true with zero worker-start",
+      [rLeakOpen.ok, rLeakOpen.ambiguous, leakOpenLogs.filter((c) => c.args[1] === "worker-start").length], [false, true, 0]);
+
+    // P1-02: orca() work RPC refuses to spawn subprocess once deadlineAt has passed
+    rmSync(mockLogV12, { force: true });
+    const deadRpc = cli.orca(["orchestration", "task-list", "--run", "run-v12"], { deadlineAt: Date.now() - 10 });
+    eq("V12 P1-02 expired deadlineAt blocks work RPC with zero subprocess spawns",
+      [deadRpc.ok, deadRpc.deadlineExceeded, existsSync(mockLogV12)], [false, true, false]);
+  } finally {
+    if (prevOrca === undefined) delete process.env.ORCA_CLI_COMMAND;
+    else process.env.ORCA_CLI_COMMAND = prevOrca;
+    if (prevMode === undefined) delete process.env.MOCK_V12_MODE;
+    else process.env.MOCK_V12_MODE = prevMode;
+  }
+
+  // 1c) Manual stop/release (`fenced` + confirmed `terminal close` + `retained`) vs supervised (`fenced`/`retained` rejected)
+  let manualTermClosed = false;
+  const rManOk = verifyManualStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "dm-1", state: "fenced" } } };
+    if (args[0] === "terminal" && args[1] === "close") { manualTermClosed = true; return { ok: true, json: { result: { status: "closed" } } }; }
+    if (args[0] === "terminal" && args[1] === "show") return manualTermClosed ? { ok: false, stderr: "unknown terminal tm-1" } : { ok: true, json: { result: { terminal: { preview: "alive" } } } };
+    if (args[1] === "worker-release") return { ok: true, json: { result: { dispatchId: "dm-1", status: "retained" } } };
+    return { ok: true, json: {} };
+  }, "dm-1", "tm-1");
+  eq("V12 P0-01 verifyManualStopAndReleaseReceipt accepts fenced + verified terminal close + retained", rManOk.ok, true);
+
+  const rManUnclosed = verifyManualStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "dm-2", state: "fenced" } } };
+    if (args[0] === "terminal" && args[1] === "close") return { ok: true, json: { result: { status: "closed" } } };
+    if (args[0] === "terminal" && args[1] === "show") return { ok: true, json: { result: { terminal: { preview: "still running", lastOutputAt: Date.now() } } } };
+    if (args[1] === "worker-release") return { ok: true, json: { result: { dispatchId: "dm-2", status: "retained" } } };
+    return { ok: true, json: {} };
+  }, "dm-2", "tm-2");
+  eq("V12 P0-01 verifyManualStopAndReleaseReceipt REJECTS retained when terminal is still live", rManUnclosed.ok, false);
+
+  const rSupRetained = verifyStopAndReleaseReceipt((args) => {
+    if (args[1] === "worker-stop") return { ok: true, json: { result: { dispatchId: "ds-1", state: "stopped" } } };
+    return { ok: true, json: { result: { dispatchId: "ds-1", status: "retained", retained: true } } };
+  }, "ds-1");
+  eq("V12 P0-01 supervised verifyStopAndReleaseReceipt still REJECTS retained", rSupRetained.ok, false);
+
+  // 1d) Writer-attested per-dispatch gate provenance: fresh canonical write WITHOUT writer identity MUST FAIL!
+  const gateWt = join(tmpV12, "gate-prov");
+  const gateArt = join(gateWt, ".orca", "artifacts");
+  mkdirSync(gateArt, { recursive: true });
+  const gateStep = { id: "code-review", writes: "REVIEW.md", verify: { requireVerdict: "PASS" } };
+  const clrGate = clearStaleStepArtifact(gateStep, gateWt, null, ".orca/artifacts");
+  bindStepArtifactDispatchClaim(gateWt, ".orca/artifacts", gateStep, {
+    dispatchId: "disp-writer-1",
+    taskId: "task-writer-1",
+    fsEpochMtimeMs: clrGate.fsEpochMtimeMs,
+    clearedAtMs: clrGate.clearedAtMs,
+  });
+  // Write a BRAND NEW file with current mtime directly to canonical path, NO writer identity!
+  writeFileSync(join(gateArt, "REVIEW.md"), "# Fresh Unattributed Review\n\n" + "Looks fine.\n".repeat(12) + "\nVERDICT: PASS\n");
+  const unattestedRes = verifyStepArtifact(gateStep, gateArt, gateWt, 50, {
+    mode: "settlement",
+    dispatchId: "disp-writer-1",
+    fsEpochMtimeMs: clrGate.fsEpochMtimeMs,
+    clearedBeforeDispatch: true,
+  });
+  eq("V12 P0-01 fresh canonical gate file WITHOUT writer identity is REJECTED", unattestedRes.ok, false);
+  ok("V12 P0-01 rejection cites missing writer-attested provenance", /unattested gate artifact/.test(unattestedRes.reason || ""));
+
+  // Writing to per-dispatch isolated target `.dispatch-disp-writer-1/REVIEW.md` succeeds and promotes!
+  rmSync(join(gateArt, "REVIEW.md"), { force: true });
+  writeFileSync(join(gateArt, ".dispatch-disp-writer-1", "REVIEW.md"), "# Dispatch-scoped Review\n\n" + "Verified.\n".repeat(12) + "\nVERDICT: PASS\n");
+  const scopedOk = verifyStepArtifact(gateStep, gateArt, gateWt, 50, {
+    mode: "settlement",
+    dispatchId: "disp-writer-1",
+    fsEpochMtimeMs: clrGate.fsEpochMtimeMs,
+    clearedBeforeDispatch: true,
+  });
+  eq("V12 P0-01 per-dispatch isolated target .dispatch-<id>/REVIEW.md is ACCEPTED & promoted",
+    [scopedOk.ok, existsSync(join(gateArt, "REVIEW.md"))], [true, true]);
+
+  // =========================================================================
+  // 2) P0-02: Process-isolated unittest across ALL FOUR Python CI scripts:
+  //    (a) Same-named `fixture_support.py` across dir1 (pass) + dir2 (fail) -> ALL 4 exit 1!
+  //    (b) Package with `__init__.py` + `from .support import ...` -> ALL 4 exit 0!
+  // =========================================================================
+  const pyCheck = spawnSync("python3", ["--version"], { encoding: "utf8" });
+  if (!pyCheck.error && pyCheck.status === 0) {
+    const ghYml = readFileSync(join(REPO, ".github", "workflows", "ci-release.yml"), "utf8");
+    const gtYml = readFileSync(join(REPO, ".gitea", "workflows", "ci-release.yml"), "utf8");
+    const genYml = renderCiWorkflow({ summary: "Gen", python: [], node: [], go: [], rust: [], dockerfiles: [], composeFile: null, composeFiles: [] });
+    const pyDetDir = join(tmpV12, "py-det");
+    mkdirSync(pyDetDir, { recursive: true });
+    writeFileSync(join(pyDetDir, "requirements.txt"), "# offline\n");
+    const custYml = renderCiWorkflow(detectProjectStacks(pyDetDir), { includeTokenHub: false });
+    const stripPip = (s) => s.replace(/^\s*python3 -m pip install .*$/gm, ":");
+    const pyScripts = [
+      { label: "GitHub bundled", script: stripPip(extractStepScript(ghYml, "Verify Python projects (root / backend)")) },
+      { label: "Gitea bundled", script: stripPip(extractStepScript(gtYml, "Verify Python projects (root / backend)")) },
+      { label: "Generated generic", script: stripPip(extractStepScript(genYml, "Verify Python projects (root / backend)")) },
+      { label: "Generated tailored", script: stripPip(extractStepScript(custYml, "Run Python lint & tests")) },
+    ];
+    const blockPytest = join(tmpV12, "block-pytest");
+    mkdirSync(blockPytest, { recursive: true });
+    writeFileSync(join(blockPytest, "pytest.py"), "raise ImportError('stdlib unittest mode')\n");
+
+    // Probe (a): Same-named helper `fixture_support.py` in dir1 (passes) & dir2 (MUST FAIL!)
+    const helperClashDir = join(tmpV12, "py-helper-clash");
+    mkdirSync(join(helperClashDir, "dir1"), { recursive: true });
+    mkdirSync(join(helperClashDir, "dir2"), { recursive: true });
+    writeFileSync(join(helperClashDir, "requirements.txt"), "# deps\n");
+    writeFileSync(join(helperClashDir, "dir1", "fixture_support.py"), "EXPECTED = 1\n");
+    writeFileSync(join(helperClashDir, "dir1", "unit_test.py"),
+      "import unittest, fixture_support\nclass T1(unittest.TestCase):\n    def test_a(self): self.assertEqual(fixture_support.EXPECTED, 1)\n");
+    writeFileSync(join(helperClashDir, "dir2", "fixture_support.py"), "EXPECTED = 999\n");
+    writeFileSync(join(helperClashDir, "dir2", "unit_test.py"),
+      "import unittest, fixture_support\nclass T2(unittest.TestCase):\n    def test_b(self): self.assertEqual(fixture_support.EXPECTED, 1)\n");
+    for (const item of pyScripts) {
+      const rClash = spawnSync("bash", ["-c", item.script], {
+        cwd: helperClashDir,
+        env: { ...process.env, PYTHONPATH: blockPytest },
+        encoding: "utf8",
+      });
+      eq(`V12 P0-02 [${item.label}] same-named fixture_support.py in dir2 fails cleanly (exit 1, zero sys.modules bleed)`, rClash.status, 1);
+    }
+
+    // Probe (b): Package relative import `from .support import ...` and `from ..shared import ...` -> MUST PASS (exit 0)!
+    const pkgRelDir = join(tmpV12, "py-pkg-rel");
+    mkdirSync(join(pkgRelDir, "mypkg", "sub"), { recursive: true });
+    writeFileSync(join(pkgRelDir, "requirements.txt"), "# deps\n");
+    writeFileSync(join(pkgRelDir, "mypkg", "__init__.py"), "");
+    writeFileSync(join(pkgRelDir, "mypkg", "shared.py"), "ROOT_VAL = 40\n");
+    writeFileSync(join(pkgRelDir, "mypkg", "sub", "__init__.py"), "");
+    writeFileSync(join(pkgRelDir, "mypkg", "sub", "support.py"), "SUB_VAL = 2\n");
+    writeFileSync(join(pkgRelDir, "mypkg", "sub", "unit_test.py"),
+      "import unittest\nfrom .support import SUB_VAL\nfrom ..shared import ROOT_VAL\nclass PkgRelTest(unittest.TestCase):\n    def test_rel(self): self.assertEqual(ROOT_VAL + SUB_VAL, 42)\n");
+    for (const item of pyScripts) {
+      const rPkg = spawnSync("bash", ["-c", item.script], {
+        cwd: pkgRelDir,
+        env: { ...process.env, PYTHONPATH: blockPytest },
+        encoding: "utf8",
+      });
+      eq(`V12 P0-02 [${item.label}] package relative import 'from .support import ...' exits exact 0`, rPkg.status, 0);
+    }
+  }
+
+  // =========================================================================
+  // 3) P0-03 + P2-01: Real Shell Argv Tokenizer & All 3 Resume Bypass Probes
+  // =========================================================================
+  const trickyCmd = `agy --settings '{"hint":"--model gemini-4-neon --effort low"}' --model claude-sonnet-5-5 --effort high`;
+  const parsedTricky = parseAgentCommandSpec(trickyCmd);
+  const launchTricky = resolveEffectiveLaunchSpec(trickyCmd, null, null);
+  eq("V12 P0-03/P2-01 shell tokenizer ignores --model/--effort inside quoted --settings JSON",
+    [parsedTricky.parseable, classifyModelFamily(trickyCmd), launchTricky.effectiveModel, launchTricky.effectiveEffort],
+    [true, "anthropic", "claude-sonnet-5-5", "high"]);
+
+  const cmdOnlySettings = `agy --settings '{"hint":"--model gemini-4-neon --effort low"}'`;
+  const builtCmd = buildAgentCommand(cmdOnlySettings, "claude-sonnet-5-5", { effort: "high", autoRun: false });
+  ok("V12 P2-01 buildAgentCommand appends real --model and --effort even when --settings JSON mentions --model/--effort",
+    builtCmd.includes("--model claude-sonnet-5-5") && builtCmd.includes("--effort high"));
+
+  eq("V12 P0-03 unclosed quote in agent command returns parseable=false & family=unknown",
+    [ tokenizeShellCommand('agy --model "claude-sonnet-5-5').parseable, classifyModelFamily('agy --model "claude-sonnet-5-5') ],
+    [false, "unknown"]);
+  eq("V12 P0-03 shell control operator ';' in agent command returns parseable=false & family=unknown",
+    [ tokenizeShellCommand("agy --model claude-sonnet-5-5; echo x").parseable, classifyModelFamily("agy --model claude-sonnet-5-5; echo x") ],
+    [false, "unknown"]);
+
+  // All 3 Codex `--from pr-submit` E2E resume probes (same worktree + same objective + matching meta.config!)
+  const v12ResCfg = join(REPO, ".orca", "_tmp-v12-resume.config.json");
+  try {
+    writeFileSync(v12ResCfg, JSON.stringify({
+      defaults: { timeoutMs: 5000, hardTimeoutMs: 15000, preflight: { enabled: false } },
+      pipeline: [
+        { id: "coding", title: "Coding", agent: "opencode2", model: "deepseek-v4.1", spec: "Code {out}.", writes: "CHANGES.md" },
+        { id: "code-review", title: "Code Review", agent: "codex", model: "gpt-6.2-sol", crossFamilyWith: ["coding"], reads: ["coding"], verify: { requireVerdict: "PASS" }, spec: "Review {out}.", writes: "REVIEW.md" },
+        { id: "pr-submit", title: "PR Submit", agent: "opencode2", model: "deepseek-v4.1", reads: ["code-review"], spec: "Submit {out}.", writes: "PR.md" },
+      ],
+    }));
+
+    // Probe 3a: Bound ledger exists & matches config, but `code-review` lacks `artifactSha256` digest -> MUST FAIL!
+    const dirNoDigest = mkdtempSync(join(tmpdir(), "orca-v12-nodigest-"));
+    dirsOfCurrentScenario.push(dirNoDigest);
+    mkdirSync(join(dirNoDigest, "wt", ".orca", "artifacts"), { recursive: true });
+    mkdirSync(join(dirNoDigest, "home"), { recursive: true });
+    const ledHomeA = join(dirNoDigest, "ledger-home");
+    const ledA = createRunLedger({
+      runKey: "run-no-digest-1",
+      repoDir: join(dirNoDigest, "wt"),
+      ledgerHome: ledHomeA,
+      objective: "test objective",
+      configFile: "_tmp-v12-resume.config.json",
+    });
+    ledA.recordIntent({ requestId: "r1", stepId: "coding", title: "Coding", agent: "opencode2", model: "deepseek-v4.1", family: "deepseek", attempt: 1 });
+    ledA.recordDispatchResult({ requestId: "r1", stepId: "coding", dispatchId: "d1", executedFamilies: ["deepseek"] });
+    writeFileSync(join(dirNoDigest, "wt", ".orca", "artifacts", "CHANGES.md"), "# Changes\n\n" + "Code line.\n".repeat(15));
+    const { computeFileSha256 } = await import(join(REPO, ".orca", "ledger.mjs"));
+    ledA.recordStepSettled({ stepId: "coding", outcome: "succeeded", verifyOk: true, artifactSha256: computeFileSha256(join(dirNoDigest, "wt", ".orca", "artifacts", "CHANGES.md")) });
+    ledA.recordIntent({ requestId: "r2", stepId: "code-review", title: "Code Review", agent: "codex", model: "gpt-6.2-sol", family: "openai", attempt: 1 });
+    ledA.recordDispatchResult({ requestId: "r2", stepId: "code-review", dispatchId: "d2", executedFamilies: ["openai"] });
+    // Intentionally omit `artifactSha256` on `code-review`!
+    ledA.recordStepSettled({ stepId: "code-review", outcome: "succeeded", verifyOk: true, artifactSha256: null });
+    writeFileSync(join(dirNoDigest, "wt", ".orca", "artifacts", "REVIEW.md"), "# Review\n\n" + "Approved.\n".repeat(15) + "\nVERDICT: PASS\n");
+    writeFileSync(join(dirNoDigest, "wt", ".orca", "artifacts", "status.js"), `window.__STATUS=${JSON.stringify({
+      meta: { objective: "test objective", config: "_tmp-v12-resume.config.json", ledgerRunKey: "run-no-digest-1", steps: [{ id: "coding" }, { id: "code-review" }, { id: "pr-submit" }] },
+      overall: "failed",
+      steps: [
+        { id: "coding", status: "succeeded", family: "deepseek", executedFamilies: ["deepseek"] },
+        { id: "code-review", status: "succeeded", family: "openai", executedFamilies: ["openai"] },
+        { id: "pr-submit", status: "pending" },
+      ],
+    })};window.__ON_STATUS&&window.__ON_STATUS();\n`);
+    const rNoDigest = await runFlow({
+      name: "v12-nodigest",
+      reuseDir: dirNoDigest,
+      config: "_tmp-v12-resume.config.json",
+      args: ["--from", "pr-submit", "--ledger-home", ledHomeA],
+      stdinText: "n\n",
+      budgetMs: 25000,
+    });
+    eq("V12 P0-03 --from pr-submit REJECTS ledger missing review artifactSha256 digest",
+      [rNoDigest.code, rNoDigest.by("orchestration worker-start").length], [1, 0]);
+
+    // Probe 3b: Status with ONLY secondary `lineageRunKeys` and NO primary `ledgerRunKey` -> MUST FAIL!
+    const rPrepValid = await runFlow({
+      name: "v12-prep-valid",
+      config: "_tmp-v12-resume.config.json",
+      args: ["--only", "coding,code-review"],
+      budgetMs: 25000,
+    });
+    eq("V12 P0-03 prep coding,code-review succeeded", rPrepValid.code, 0);
+    const validKey = rPrepValid.status?.meta?.ledgerRunKey;
+    rmSync(join(rPrepValid.dir, "calls.jsonl"), { force: true });
+    // Overwrite status.js to drop primary `ledgerRunKey: null` while keeping `lineageRunKeys: [validKey]`
+    writeFileSync(join(rPrepValid.wt, ".orca", "artifacts", "status.js"), `window.__STATUS=${JSON.stringify({
+      meta: { objective: "test objective", config: "_tmp-v12-resume.config.json", ledgerRunKey: null, lineageRunKeys: [validKey], steps: [{ id: "coding" }, { id: "code-review" }, { id: "pr-submit" }] },
+      overall: "failed",
+      steps: rPrepValid.status.steps,
+    })};window.__ON_STATUS&&window.__ON_STATUS();\n`);
+    const rSecondaryOnly = await runFlow({
+      name: "v12-secondary-only",
+      reuseDir: rPrepValid.dir,
+      config: "_tmp-v12-resume.config.json",
+      args: ["--from", "pr-submit"],
+      stdinText: "n\n",
+      budgetMs: 25000,
+    });
+    eq("V12 P0-03 --from pr-submit REJECTS status with secondary lineageRunKeys but missing primary ledgerRunKey",
+      [rSecondaryOnly.code, rSecondaryOnly.by("orchestration worker-start").length], [1, 0]);
+
+    // Probe 3c: Ledger from a DIFFERENT config (`other-flow.json`) -> MUST FAIL!
+    const dirDiffCfg = mkdtempSync(join(tmpdir(), "orca-v12-diffcfg-"));
+    dirsOfCurrentScenario.push(dirDiffCfg);
+    mkdirSync(join(dirDiffCfg, "wt", ".orca", "artifacts"), { recursive: true });
+    mkdirSync(join(dirDiffCfg, "home"), { recursive: true });
+    const ledHomeC = join(dirDiffCfg, "ledger-home");
+    writeFileSync(join(dirDiffCfg, "wt", ".orca", "artifacts", "CHANGES.md"), "# Changes\n\n" + "Code line.\n".repeat(15));
+    writeFileSync(join(dirDiffCfg, "wt", ".orca", "artifacts", "REVIEW.md"), "# Review\n\n" + "Approved.\n".repeat(15) + "\nVERDICT: PASS\n");
+    const ledC = createRunLedger({
+      runKey: "run-other-cfg-1",
+      repoDir: join(dirDiffCfg, "wt"),
+      ledgerHome: ledHomeC,
+      objective: "test objective",
+      configFile: "flow-hotfix.json", // DIFFERENT config!
+    });
+    ledC.recordIntent({ requestId: "r1", stepId: "coding", title: "Coding", agent: "opencode2", model: "deepseek-v4.1", family: "deepseek", attempt: 1 });
+    ledC.recordDispatchResult({ requestId: "r1", stepId: "coding", dispatchId: "d1", executedFamilies: ["deepseek"] });
+    ledC.recordStepSettled({ stepId: "coding", outcome: "succeeded", verifyOk: true, artifactSha256: computeFileSha256(join(dirDiffCfg, "wt", ".orca", "artifacts", "CHANGES.md")) });
+    ledC.recordIntent({ requestId: "r2", stepId: "code-review", title: "Code Review", agent: "codex", model: "gpt-6.2-sol", family: "openai", attempt: 1 });
+    ledC.recordDispatchResult({ requestId: "r2", stepId: "code-review", dispatchId: "d2", executedFamilies: ["openai"] });
+    ledC.recordStepSettled({ stepId: "code-review", outcome: "succeeded", verifyOk: true, artifactSha256: computeFileSha256(join(dirDiffCfg, "wt", ".orca", "artifacts", "REVIEW.md")) });
+    writeFileSync(join(dirDiffCfg, "wt", ".orca", "artifacts", "status.js"), `window.__STATUS=${JSON.stringify({
+      meta: { objective: "test objective", config: "_tmp-v12-resume.config.json", ledgerRunKey: "run-other-cfg-1", steps: [{ id: "coding" }, { id: "code-review" }, { id: "pr-submit" }] },
+      overall: "failed",
+      steps: [
+        { id: "coding", status: "succeeded", family: "deepseek", executedFamilies: ["deepseek"] },
+        { id: "code-review", status: "succeeded", family: "openai", executedFamilies: ["openai"] },
+        { id: "pr-submit", status: "pending" },
+      ],
+    })};window.__ON_STATUS&&window.__ON_STATUS();\n`);
+    const rDiffCfg = await runFlow({
+      name: "v12-diffcfg",
+      reuseDir: dirDiffCfg,
+      config: "_tmp-v12-resume.config.json",
+      args: ["--from", "pr-submit", "--ledger-home", ledHomeC],
+      stdinText: "n\n",
+      budgetMs: 25000,
+    });
+    eq("V12 P0-03 --from pr-submit REJECTS ledger recorded under a different config file",
+      [rDiffCfg.code, rDiffCfg.by("orchestration worker-start").length], [1, 0]);
+  } finally {
+    try { rmSync(v12ResCfg, { force: true }); } catch {}
+  }
+
+  // =========================================================================
+  // 4) P1-02, P1-06, P1-07, P1-09, P1-11: Remaining P1 Closure Checks
+  // =========================================================================
+  // P1-02: selectHealthyCandidate clamps TCP probe timeout strictly to remaining deadlineAt (no 250ms floor overshoot!)
+  let observedProbeBudgetMs = null;
+  const pfDeadlineRes = await selectHealthyCandidate(
+    [{ agent: "opencode2", model: "deepseek-v4.1", preflight: { enabled: true, tcp: "127.0.0.1:3425", timeoutMs: 2000 } }],
+    {
+      deadlineAt: Date.now() + 45,
+      probeTcpFn: async (_h, _p, bgt) => {
+        observedProbeBudgetMs = bgt;
+        return { ok: true };
+      },
+    }
+  );
+  ok(`V12 P1-02 preflight clamped 2000ms probe timeout to <=45ms remaining budget (got ${observedProbeBudgetMs}ms)`,
+    pfDeadlineRes.candidate != null && observedProbeBudgetMs != null && observedProbeBudgetMs <= 50);
+
+  // P1-06: Reference-style external Markdown link `[Issue #42][upstream]` MUST NOT bind local issue #42!
+  const refBacklogMd = [
+    "- [ ] Fix parser [Issue #42][upstream]",
+    "- [ ] Wire local handler [Issue #88][localref]",
+    "",
+    "[upstream]: https://github.com/other/repo/issues/42",
+    "[localref]: https://github.com/shown1985/sxcj/issues/88",
+  ].join("\n");
+  const refTasks = parseBacklogTasks(refBacklogMd, { currentHost: "github.com", currentRepo: "shown1985/sxcj" });
+  eq("V12 P1-06 reference-style external link [Issue #42][upstream] returns null while local [Issue #88][localref] returns 88",
+    [refTasks[0]?.number, refTasks[1]?.number], [null, 88]);
+  eq("V12 P1-06 extractExplicitLocalIssueNumber rejects external reference-style link",
+    extractExplicitLocalIssueNumber("[Issue #42][upstream]\n[upstream]: https://github.com/other/repo/issues/42", { currentHost: "github.com", currentRepo: "shown1985/sxcj" }),
+    null);
+
+  // P1-07: Exit-0 issue creation returning an external repo URL in stdout MUST return ok:false!
+  const extExit0 = createIssueViaCli({
+    provider: "gh",
+    bin: "gh",
+    repoDir: tmpV12,
+    host: "github.com",
+    repo: "shown1985/sxcj",
+    title: "Test",
+    body: "Body",
+    execFn: () => ({ ok: true, status: 0, stdout: "https://github.com/other/repo/issues/42\n", stderr: "", timedOut: false }),
+  });
+  eq("V12 P1-07 exit-0 stdout with external repository issue URL is REJECTED (ok=false)",
+    [extExit0.ok, extExit0.number], [false, null]);
+
+  // P1-09: `git diff` non-zero failure with partial secret stdout across ALL THREE TokenHub scripts MUST NOT print secret!
+  const fakeGitDir = join(tmpV12, "fake-git-bin");
+  mkdirSync(fakeGitDir, { recursive: true });
+  writeFileSync(join(fakeGitDir, "git"), `#!/usr/bin/env node
+process.stdout.write("+ const API_SECRET = \\"sk-live-UNREDACTED_PARTIAL_DIFF_987654321\\";\\n");
+process.stderr.write("fatal: bad revision\\n");
+process.exit(128);
+`, { mode: 0o755 });
+  const threeTokenHubYmls = [
+    { label: "GitHub bundled", yml: readFileSync(join(REPO, ".github", "workflows", "ci-release.yml"), "utf8") },
+    { label: "Gitea bundled", yml: readFileSync(join(REPO, ".gitea", "workflows", "ci-release.yml"), "utf8") },
+    { label: "Generated CI", yml: renderCiWorkflow({ summary: "Gen", python: [], node: [], go: [], rust: [], dockerfiles: [], composeFile: null, composeFiles: [] }) },
+  ];
+  for (const item of threeTokenHubYmls) {
+    const thScript = extractStepScript(item.yml, "Generate Chinese PR Risk Summary via TokenHub API");
+    const rFailDiff = spawnSync("bash", ["-c", thScript], {
+      env: { ...process.env, PATH: `${fakeGitDir}:${process.env.PATH}`, TOKENHUB_API_KEY: "th_k", TOKENHUB_BASE_URL: "https://example.invalid/v1", TOKENHUB_MODEL: "m", BASE_SHA: "a", HEAD_SHA: "b", PR_NUMBER: "1" },
+      encoding: "utf8",
+    });
+    const combinedOut = (rFailDiff.stdout || "") + (rFailDiff.stderr || "");
+    ok(`V12 P1-09 [${item.label}] failing git diff NEVER leaks raw partial stdout secret to logs`,
+      !combinedOut.includes("UNREDACTED_PARTIAL_DIFF_987654321") && combinedOut.includes("[tokenhub] git diff failed"));
+  }
+
+  // P1-11: CD Health Probe REJECTS HTTP 500 / curl exit 22 with stdout AND REJECTS empty health when container declares Healthcheck!
+  const cdDir12 = join(tmpV12, "cd-12");
+  mkdirSync(cdDir12, { recursive: true });
+  writeFileSync(join(cdDir12, "docker-compose.prod.yml"), "services:\n  api:\n    image: alpine\n");
+  const cdYml12 = renderSelfHostedCdWorkflow(detectProjectStacks(cdDir12), { deployBranch: "main", serviceName: "api", healthUrl: "http://127.0.0.1:8000/health" });
+  const cdHealth12 = extractStepScript(cdYml12, "Post-deploy automated health check (PII-safe)");
+  const bin12 = join(tmpV12, "bin-12");
+  mkdirSync(bin12, { recursive: true });
+  const rev12 = "d".repeat(40);
+  writeFileSync(join(bin12, "docker"), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a.includes("config") && a.includes("--services")) { console.log("api"); process.exit(0); }
+if (a.includes("ps") && a.includes("--format")) { process.stdout.write(process.env.MOCK_PS_JSON || "[]"); process.exit(0); }
+if (a.includes("inspect")) { process.stdout.write(process.env.MOCK_INSPECT_JSON || "{}"); process.exit(0); }
+process.exit(0);
+`, { mode: 0o755 });
+  writeFileSync(join(bin12, "curl"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const a = process.argv.slice(2);
+const oi = a.indexOf("-o");
+if (oi >= 0 && a[oi + 1]) fs.writeFileSync(a[oi + 1], process.env.MOCK_CURL_BODY || "HTTP/1.1 500 Internal Server Error");
+process.stdout.write(process.env.MOCK_HTTP_CODE || "200");
+process.exit(Number(process.env.MOCK_CURL_RC || 0));
+`, { mode: 0o755 });
+
+  const runH12 = (extra) => spawnSync("bash", ["-c", cdHealth12], {
+    cwd: cdDir12,
+    env: {
+      ...process.env,
+      PATH: `${bin12}:${process.env.PATH}`,
+      COMPOSE_FILE: "docker-compose.prod.yml",
+      SERVICE_NAME: "api",
+      ORCA_DEPLOY_SHA: rev12,
+      DEFAULT_HEALTHCHECK_URL: "http://127.0.0.1:8000/health",
+      HEALTHCHECK_URL: "",
+      DEPLOY_ONESHOT_SERVICES: "",
+      HEALTHCHECK_RETRIES: "1",
+      HEALTHCHECK_INTERVAL: "0",
+      ...extra,
+    },
+    encoding: "utf8",
+  });
+
+  // (a) HTTP 500 + curl exit 22 with non-empty output -> MUST FAIL (exit 1)!
+  eq("V12 P1-11 CD health REJECTS curl HTTP 500 / exit 22 even with non-empty response body",
+    runH12({
+      MOCK_PS_JSON: JSON.stringify([{ ID: "c1", Service: "api", State: "running", Health: "healthy", Labels: `io.orca-pod.deploy-sha=${rev12}` }]),
+      MOCK_HTTP_CODE: "500",
+      MOCK_CURL_RC: "22",
+    }).status, 1);
+
+  // (b) Container declares Healthcheck in Config, but Health status is empty `""` -> MUST FAIL (exit 1)!
+  eq("V12 P1-11 CD health REJECTS empty health status when container declares a Docker Healthcheck",
+    runH12({
+      MOCK_PS_JSON: JSON.stringify([{ ID: "c1", Service: "api", State: "running", Health: "", Labels: `io.orca-pod.deploy-sha=${rev12}` }]),
+      MOCK_INSPECT_JSON: JSON.stringify({ Config: { Healthcheck: { Test: ["CMD-SHELL", "curl -f http://localhost/health"] }, Labels: { "io.orca-pod.deploy-sha": rev12 } }, State: {} }),
+      MOCK_HTTP_CODE: "200",
+      MOCK_CURL_RC: "0",
+    }).status, 1);
+
+  // (c) Container genuinely has NO Healthcheck (`Config.Healthcheck` absent) and HTTP 200 -> ACCEPTS (exit 0)!
+  eq("V12 P1-11 CD health ACCEPTS empty health status ONLY when container declares no Healthcheck and HTTP 200",
+    runH12({
+      MOCK_PS_JSON: JSON.stringify([{ ID: "c1", Service: "api", State: "running", Health: "", Labels: `io.orca-pod.deploy-sha=${rev12}` }]),
+      MOCK_INSPECT_JSON: JSON.stringify({ Config: { Labels: { "io.orca-pod.deploy-sha": rev12 } }, State: {} }),
+      MOCK_HTTP_CODE: "200",
+      MOCK_CURL_RC: "0",
+    }).status, 0);
 });
 
 // ---------------------------------------------------------------------------

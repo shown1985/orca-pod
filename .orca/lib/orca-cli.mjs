@@ -19,21 +19,27 @@ export const isKiroCmd = (a) => a === "kiro-cli" || a.startsWith("kiro-cli ");
 export const isAgyCmd = (a) => /^(?:agy|antigravity)(?:\s|$)/.test(String(a || "").trim());
 
 const CONFIRMED_STOP_STATES = new Set(["stopped", "terminated", "exited", "already_stopped", "completed", "not_found"]);
+const CONFIRMED_MANUAL_FENCE_STATES = new Set(["fenced", ...CONFIRMED_STOP_STATES]);
 const REJECTED_PROC_ACTIONS = new Set(["stop_unknown", "none", "failed", "kept_open", "retained"]);
 const CONFIRMED_RELEASE_STATES = new Set(["released", "already_released", "closed", "not_found"]);
-const PRE_SPAWN_FAILED_STAGES = new Set([
-  "arg_validation",
+const CONFIRMED_MANUAL_RELEASE_STATES = new Set(["retained", ...CONFIRMED_RELEASE_STATES]);
+// P0-01: Only strictly provable pre-launch validation error codes may be treated as non-ambiguous
+// when `worker-start` fails with NO `dispatchId` and `dispatch-show` finds no dispatch!
+const STRICT_PRE_LAUNCH_REJECTION_CODES = new Set([
+  "invalid_argument",
   "invalid_args",
-  "validation",
-  "precheck",
-  "workspace_trust",
+  "arg_validation",
+  "unknown_agent",
   "agent_not_found",
   "worktree_not_found",
-  "task_not_ready",
+  "task_not_found",
+  "permission_denied",
+  "workspace_trust",
 ]);
 
 export function normalizeOrcaWorkerAgent(agentCmd) {
-  const base = String(agentCmd || "").trim().split(/\s+/)[0];
+  const parsed = parseAgentCommandSpec(agentCmd);
+  const base = parsed.parseable ? parsed.baseAgent : String(agentCmd || "").trim().split(/\s+/)[0];
   if (base === "agy") return "antigravity";
   if (base === "kiro-cli") return "kiro";
   if (base === "cursor-agent") return "cursor";
@@ -80,25 +86,32 @@ export function buildAgySettingsArg(trustedDirs, { isWin = IS_WIN, settingsDir =
 
 export function buildAgentCommand(agent, model = null, { autoRun = true, effort = null, worktreePath = null, extraTrustedDirs = [], settingsDir = null, warn = () => {}, isWin = IS_WIN } = {}) {
   let cmd = String(agent || "").trim();
-  if (model && !MODEL_FLAG_RE.test(cmd) && !isKiroCmd(cmd)) cmd += ` --model ${model}`;
-  else if (model && isKiroCmd(cmd) && !MODEL_FLAG_RE.test(cmd)) warn(`step model "${model}" ignored: kiro-cli has no model selection.`);
+  const parsed = parseAgentCommandSpec(cmd);
+  const baseLower = parsed.parseable ? parsed.lowerBase : "";
+  const isKiro = parsed.parseable ? parsed.isKiro : isKiroCmd(cmd);
+  const isAgy = parsed.parseable ? (baseLower === "agy" || baseLower === "antigravity") : isAgyCmd(cmd);
+  const hasModel = parsed.parseable ? parsed.hasModelFlag : MODEL_FLAG_RE.test(cmd);
+  const hasEffort = parsed.parseable ? parsed.hasEffortFlag : EFFORT_FLAG_RE.test(cmd);
 
-  if (isAgyCmd(cmd)) {
-    if (effort && !EFFORT_FLAG_RE.test(cmd)) cmd += ` --effort ${effort}`;
-    if (autoRun && !cmd.includes("--dangerously-skip-permissions") && !/(^|\s)--mode(\s|=|$)/.test(cmd)) {
+  if (model && !hasModel && !isKiro) cmd += ` --model ${model}`;
+  else if (model && isKiro && !hasModel) warn(`step model "${model}" ignored: kiro-cli has no model selection.`);
+
+  if (isAgy) {
+    if (effort && !hasEffort) cmd += ` --effort ${effort}`;
+    if (autoRun && !(parsed.parseable ? parsed.hasDangerouslySkipFlag : cmd.includes("--dangerously-skip-permissions")) && !(parsed.parseable ? parsed.hasModeFlag : /(^|\s)--mode(\s|=|$)/.test(cmd))) {
       cmd += " --dangerously-skip-permissions";
     }
     const trustDirs = [worktreePath, ...(extraTrustedDirs || [])].filter(Boolean);
-    if (trustDirs.length && !cmd.includes("--settings")) {
+    if (trustDirs.length && !(parsed.parseable ? parsed.hasSettingsFlag : cmd.includes("--settings"))) {
       const settingsArg = buildAgySettingsArg(trustDirs, { isWin, settingsDir });
       if (settingsArg) cmd += ` ${settingsArg}`;
     }
     return cmd;
   }
 
-  const isClaude = cmd === "claude" || cmd.startsWith("claude ");
+  const isClaude = parsed.parseable ? baseLower === "claude" : (cmd === "claude" || cmd.startsWith("claude "));
   if (!isClaude) return cmd;
-  if (autoRun && !cmd.includes("--permission-mode") && !cmd.includes("--dangerously-skip-permissions"))
+  if (autoRun && !(parsed.parseable ? parsed.hasPermissionModeFlag : cmd.includes("--permission-mode")) && !(parsed.parseable ? parsed.hasDangerouslySkipFlag : cmd.includes("--dangerously-skip-permissions")))
     cmd += " --permission-mode bypassPermissions";
   if (!autoRun) return cmd;
   return isWin ? `cmd /c "set CLAUDE_AFK_TIMEOUT_MS=60000&& ${cmd}"` : `env CLAUDE_AFK_TIMEOUT_MS=60000 ${cmd}`;
@@ -116,8 +129,9 @@ export function sleepMs(ms) {
 function clampTimeoutToDeadline(deadlineAt, fallbackMs = undefined) {
   if (deadlineAt == null || !Number.isFinite(deadlineAt)) return fallbackMs;
   const rem = deadlineAt - Date.now();
-  if (rem <= 0) return 1;
-  return fallbackMs != null ? Math.min(fallbackMs, Math.max(200, rem)) : Math.max(200, rem);
+  if (rem <= 0) return 0;
+  const raw = fallbackMs != null ? Math.min(fallbackMs, rem) : rem;
+  return Math.max(1, Math.floor(raw));
 }
 
 export function wtStamp(d = new Date()) {
@@ -167,7 +181,131 @@ export function outcomeOf(done) {
 }
 
 /**
- * P0-01: Require explicit POSITIVE stop AND release confirmation for `dispatchId`:
+ * P0-01: Positively close a caller-created manual terminal AND confirm via `terminal show`
+ * that the terminal session is actually gone/closed (never assuming bare exit-0 proves closure!).
+ */
+export function verifyManualTerminalClosed(orcaFn, termHandle) {
+  if (!termHandle || !String(termHandle).trim()) {
+    return { ok: false, reason: "missing manual terminal handle for close verification" };
+  }
+  const cl = orcaFn(["terminal", "close", "--terminal", termHandle], { allowPostDeadlineCleanup: true });
+  const clJson = res(cl.json);
+  const clAction = String(pick(clJson, ["status", "action", "state"]) || "").trim().toLowerCase();
+  if (!cl.ok || clAction === "kept_open" || clAction === "retained" || clAction === "failed") {
+    return {
+      ok: false,
+      reason: `terminal close (${termHandle}) did not confirm: ${sanitizeText(cl.stderr || cl.raw || clAction || "unconfirmed", { maxLen: 200 })}`,
+    };
+  }
+  const checkRes = orcaFn(["terminal", "show", "--terminal", termHandle], { allowPostDeadlineCleanup: true });
+  if (checkRes.timedOut) {
+    return { ok: false, reason: `terminal show (${termHandle}) timed out while verifying manual terminal closure` };
+  }
+  if (!checkRes.ok) {
+    const errTxt = `${checkRes.stderr || ""} ${checkRes.raw || ""}`;
+    if (/not[\s_-]*found|unknown[\s_-]*terminal|no[\s_-]*such[\s_-]*terminal|closed|gone|does not exist|invalid terminal/i.test(errTxt)) {
+      return { ok: true, reason: null };
+    }
+    return {
+      ok: false,
+      reason: `terminal show (${termHandle}) failed without not-found confirmation: ${sanitizeText(errTxt || "unknown error", { maxLen: 180 })}`,
+    };
+  }
+  const termObj = pick(res(checkRes.json), ["terminal"]);
+  if (termObj == null) return { ok: true, reason: null };
+  if (typeof termObj === "object") {
+    const tState = String(pick(termObj, ["status", "state"]) || "").trim().toLowerCase();
+    if (termObj.closed === true || /^(closed|exited|terminated|stopped|gone|not_found)$/.test(tState)) {
+      return { ok: true, reason: null };
+    }
+    const keys = Object.keys(termObj);
+    if (keys.length === 0) {
+      return { ok: true, reason: null };
+    }
+    return {
+      ok: false,
+      reason: `terminal (${termHandle}) still appears live after terminal close (state=${tState || "active"})`,
+    };
+  }
+  return { ok: false, reason: `could not confirm manual terminal (${termHandle}) closure` };
+}
+
+/**
+ * P0-01: Stop & release verification for caller-created MANUAL terminal dispatches:
+ *   Per `orca orchestration worker-stop --help` & `worker-release --help`, a dispatch created by
+ *   `orchestration dispatch` reports `fenced` on `worker-stop` and `retained` on `worker-release`.
+ *   Therefore:
+ *     1) Fence via `worker-stop` (accepting `fenced` or confirmed stop states, zero live helpers);
+ *     2) Explicitly close the manual terminal via `verifyManualTerminalClosed` (requiring positive close confirmation!);
+ *     3) Release via `worker-release` (accepting `retained` / `released` / `already_released` ONLY AFTER step 2 proved terminal closure!).
+ */
+export function verifyManualStopAndReleaseReceipt(orcaFn, dispatchId, termHandle) {
+  if (!termHandle || !String(termHandle).trim()) {
+    return { ok: false, reason: "manual dispatch stop/release requires a valid terminal handle" };
+  }
+  if (dispatchId && String(dispatchId).trim()) {
+    const stopRes = orcaFn(["orchestration", "worker-stop", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
+    const stopJson = res(stopRes.json);
+    const stopDispId = pick(stopJson, ["dispatchId", "dispatch_id", "id"]) || pick(stopJson.dispatch || {}, ["id", "dispatchId"]) || null;
+    const stopState = String(pick(stopJson, ["state", "status", "stopStatus"]) || "").trim().toLowerCase();
+    const procAction = String(pick(stopJson, ["processAction"]) || "").trim().toLowerCase();
+    const helpers = Array.isArray(stopJson.helpers) ? stopJson.helpers : [];
+    const liveHelper = helpers.some((h) => h && (
+      h.keptOpen === true ||
+      h.running === true ||
+      /^(running|starting|pending|stop_unknown|unknown)$/i.test(String(h.status || h.state || ""))
+    ));
+    const idMatchedStop = !stopDispId || stopDispId === dispatchId;
+    const fencedOk = Boolean(
+      stopRes.ok &&
+      stopRes.json &&
+      idMatchedStop &&
+      !liveHelper &&
+      (CONFIRMED_MANUAL_FENCE_STATES.has(stopState) || stopJson.fenced === true) &&
+      procAction !== "stop_unknown" &&
+      procAction !== "failed" &&
+      procAction !== "kept_open"
+    );
+    if (!fencedOk) {
+      return {
+        ok: false,
+        reason: liveHelper
+          ? `worker-stop (${dispatchId}) left kept-open/running helper(s)`
+          : `manual worker-stop (${dispatchId}) failed to fence cleanly (state=${stopState || "empty"}, action=${procAction || "none"}: ${sanitizeText(stopRes.stderr || stopRes.raw || "unconfirmed", { maxLen: 180 })})`,
+      };
+    }
+  }
+
+  const termClosed = verifyManualTerminalClosed(orcaFn, termHandle);
+  if (!termClosed.ok) {
+    return termClosed;
+  }
+
+  if (dispatchId && String(dispatchId).trim()) {
+    const relRes = orcaFn(["orchestration", "worker-release", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
+    const relJson = res(relRes.json);
+    const relDispId = pick(relJson, ["dispatchId", "dispatch_id", "id"]) || pick(relJson.dispatch || {}, ["id", "dispatchId"]) || null;
+    const relState = String(pick(relJson, ["action", "status", "releaseStatus"]) || "").trim().toLowerCase();
+    const idMatchedRel = !relDispId || relDispId === dispatchId;
+    const relOk = Boolean(
+      relRes.ok &&
+      relRes.json &&
+      idMatchedRel &&
+      CONFIRMED_MANUAL_RELEASE_STATES.has(relState) &&
+      relJson.keptOpen !== true
+    );
+    if (!relOk) {
+      return {
+        ok: false,
+        reason: `manual worker-release (${dispatchId}) lacked confirmation after terminal close (status=${relState || "empty"}: ${sanitizeText(relRes.stderr || relRes.raw || "unconfirmed", { maxLen: 180 })})`,
+      };
+    }
+  }
+  return { ok: true, reason: null };
+}
+
+/**
+ * P0-01: Require explicit POSITIVE stop AND release confirmation for SUPERVISED (`cold`) `dispatchId`:
  *   - `worker-stop` MUST confirm an actual stopped state (`stopped|terminated|exited|already_stopped|completed|not_found`);
  *     `"fenced"` or bare `processAction` without a confirmed stop state is REJECTED!
  *   - `worker-release` MUST return a non-empty confirmed release state (`released|already_released|closed|not_found`);
@@ -177,7 +315,7 @@ export function verifyStopAndReleaseReceipt(orcaFn, dispatchId) {
   if (!dispatchId || !String(dispatchId).trim()) {
     return { ok: false, reason: "missing dispatchId for stop/release verification" };
   }
-  const stopRes = orcaFn(["orchestration", "worker-stop", "--dispatch", dispatchId]);
+  const stopRes = orcaFn(["orchestration", "worker-stop", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
   const stopJson = res(stopRes.json);
   const stopDispId = pick(stopJson, ["dispatchId", "dispatch_id", "id"]) || pick(stopJson.dispatch || {}, ["id", "dispatchId"]) || null;
   const stopStateRaw = pick(stopJson, ["state", "status", "stopStatus"]);
@@ -209,7 +347,7 @@ export function verifyStopAndReleaseReceipt(orcaFn, dispatchId) {
     };
   }
 
-  const relRes = orcaFn(["orchestration", "worker-release", "--dispatch", dispatchId]);
+  const relRes = orcaFn(["orchestration", "worker-release", "--dispatch", dispatchId], { allowPostDeadlineCleanup: true });
   const relJson = res(relRes.json);
   const relDispId = pick(relJson, ["dispatchId", "dispatch_id", "id"]) || pick(relJson.dispatch || {}, ["id", "dispatchId"]) || null;
   const relActionRaw = pick(relJson, ["action", "status", "releaseStatus"]);
@@ -268,10 +406,33 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     die("Could not find the orca CLI. Set ORCA_CLI_COMMAND.");
   }
 
-  function orca(args, { timeoutMs } = {}) {
+  function orca(args, { timeoutMs, deadlineAt = null, allowPostDeadlineCleanup = false } = {}) {
+    if (!allowPostDeadlineCleanup && deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      return {
+        ok: false,
+        json: null,
+        raw: "",
+        stderr: "step deadline reached before RPC",
+        timedOut: true,
+        deadlineExceeded: true,
+      };
+    }
+    const effTimeout = allowPostDeadlineCleanup
+      ? timeoutMs
+      : clampTimeoutToDeadline(deadlineAt, timeoutMs);
+    if (!allowPostDeadlineCleanup && effTimeout === 0) {
+      return {
+        ok: false,
+        json: null,
+        raw: "",
+        stderr: "step deadline reached before RPC",
+        timedOut: true,
+        deadlineExceeded: true,
+      };
+    }
     if (!orcaBin) resolveOrca();
     const full = args.includes("--json") ? args : [...args, "--json"];
-    const r = spawnSync(orcaBin, full, { encoding: "utf8", timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
+    const r = spawnSync(orcaBin, full, { encoding: "utf8", timeout: effTimeout, maxBuffer: 64 * 1024 * 1024 });
     const raw = (r.stdout || "").trim();
     let json = null;
     for (const line of raw.split(/\r?\n/).reverse()) {
@@ -384,11 +545,38 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     const effWtPath = resolveEffectiveWtPath(wtSelector, worktreePath);
     const cmd = agentCommand(agent, model, { effort, worktreePath: effWtPath });
     const c = orca(["terminal", "create", "--worktree", wtSelector || resolveWorktree(), "--command", cmd], {
-      timeoutMs: clampTimeoutToDeadline(deadlineAt),
+      deadlineAt,
     });
+    if (c.deadlineExceeded) {
+      return { ok: false, deadlineExceeded: true, uncreated: true, handle: null, command: cmd };
+    }
     const cr = res(c.json);
-    const handle = pick(cr, ["handle", "terminalHandle"]) || pick(cr.terminal || {}, ["handle"]);
+    const handle = pick(cr, ["handle", "terminalHandle"]) || pick(cr.terminal || {}, ["handle"]) || null;
     if (!c.ok || !handle) {
+      // P0-01: If `terminal create` failed AFTER returning a terminal handle, NEVER discard it!
+      // Explicitly close and verify closure; if closure cannot be positively proven, return `ambiguous: true`!
+      if (handle) {
+        const cl = verifyManualTerminalClosed(orca, handle);
+        if (!cl.ok) {
+          return {
+            ok: false,
+            ambiguous: true,
+            uncreated: false,
+            handle,
+            command: cmd,
+            error: `terminal create ('${agent}') failed after returning handle ${handle}, and close could not be confirmed: ${cl.reason}`,
+          };
+        }
+        warn(`terminal create ('${agent}') failed after returning handle ${handle} (closed cleanly); cold-starting instead.`);
+        return {
+          ok: false,
+          uncreated: false,
+          closedCleanly: true,
+          handle: null,
+          command: cmd,
+          error: sanitizeText(c.stderr || c.raw || "terminal create failed after returning handle", { maxLen: 200 }),
+        };
+      }
       warn(`terminal create ('${agent}') failed: ${sanitizeText(c.stderr || c.raw || "no handle", { maxLen: 240 })}; cold-starting instead.`);
       return { ok: false, uncreated: true, handle: null, command: cmd, error: sanitizeText(c.stderr || c.raw || "no handle", { maxLen: 200 }) };
     }
@@ -405,7 +593,10 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       if (deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
         return { ok: false, deadlineExceeded: true, handle, command: cmd };
       }
-      const s = orca(["terminal", "show", "--terminal", handle], { timeoutMs: clampTimeoutToDeadline(deadlineAt) });
+      const s = orca(["terminal", "show", "--terminal", handle], { deadlineAt });
+      if (s.deadlineExceeded) {
+        return { ok: false, deadlineExceeded: true, handle, command: cmd };
+      }
       const out = pick(pick(res(s.json), ["terminal"]) || {}, ["lastOutputAt"]) || 0;
       if (out !== lastOut) { lastOut = out; quietSince = Date.now(); }
       const elapsed = Date.now() - startedAt;
@@ -418,39 +609,26 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       return { ok: false, deadlineExceeded: true, handle, command: cmd };
     }
     warn(`agent '${agent}' TUI not ready within ${WARMUP_TIMEOUT_MS}ms; closing terminal before fallback.`);
-    const cl = orca(["terminal", "close", "--terminal", handle]);
-    const clAction = String(pick(res(cl.json), ["status", "action"]) || "").toLowerCase();
-    if (!cl.ok || clAction === "kept_open" || clAction === "retained") {
+    const cl = verifyManualTerminalClosed(orca, handle);
+    if (!cl.ok) {
       return {
         ok: false,
         ambiguous: true,
         handle,
         command: cmd,
-        error: `terminal close (${handle}) after warmup timeout did not confirm: ${sanitizeText(cl.stderr || cl.raw || clAction || "unconfirmed", { maxLen: 200 })}`,
+        error: `after warmup timeout: ${cl.reason}`,
       };
     }
     return { ok: false, uncreated: false, closedCleanly: true, handle: null, command: cmd, error: "warmup timeout" };
   }
 
   function closeManualSessionSafely(dispatchId, term, stageLabel) {
-    if (dispatchId) {
-      const sr = verifyStopAndReleaseReceipt(orca, dispatchId);
-      if (!sr.ok) {
-        return {
-          ok: false,
-          reason: `${sr.reason} (after ${stageLabel})`,
-        };
-      }
-    }
-    if (term) {
-      const cl = orca(["terminal", "close", "--terminal", term]);
-      const clAction = String(pick(res(cl.json), ["status", "action"]) || "").toLowerCase();
-      if (!cl.ok || clAction === "kept_open" || clAction === "retained") {
-        return {
-          ok: false,
-          reason: `terminal close (${term}) after ${stageLabel} did not confirm: ${sanitizeText(cl.stderr || cl.raw || clAction || "unconfirmed", { maxLen: 200 })}`,
-        };
-      }
+    const mr = verifyManualStopAndReleaseReceipt(orca, dispatchId, term);
+    if (!mr.ok) {
+      return {
+        ok: false,
+        reason: `${mr.reason} (after ${stageLabel})`,
+      };
     }
     return { ok: true, reason: null };
   }
@@ -755,14 +933,28 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       } else if (effort && attempt === 0) {
         warn(`[orca-cli] omitting --effort "${effort}" on cold-start of "${orcaAgent}" because Orca worker-start requires --model with --effort.`);
       }
-      const remMs = (deadlineAt != null && Number.isFinite(deadlineAt)) ? Math.max(200, deadlineAt - Date.now()) : null;
+      const remMs = (deadlineAt != null && Number.isFinite(deadlineAt)) ? Math.max(1, Math.floor(deadlineAt - Date.now())) : null;
       const effStartTimeout = step.startTimeoutMs
         ? (remMs != null ? Math.min(step.startTimeoutMs, remMs) : step.startTimeoutMs)
         : remMs;
       if (effStartTimeout != null && step.startTimeoutMs) args.push("--timeout-ms", String(Math.floor(effStartTimeout)));
       if (retryOf) args.push("--retry-of", retryOf);
 
-      const r = orca(args, { timeoutMs: clampTimeoutToDeadline(deadlineAt, step.startTimeoutMs ? step.startTimeoutMs + 5000 : undefined) });
+      const r = orca(args, { deadlineAt, timeoutMs: step.startTimeoutMs ? step.startTimeoutMs + 5000 : undefined });
+      if (r.deadlineExceeded) {
+        return {
+          ok: false,
+          deadlineExceeded: true,
+          dispatchId: null,
+          terminal: null,
+          effectiveAgent: orcaAgent,
+          effectiveModel: model || null,
+          effectiveEffort: passedEffort,
+          lastClearedInfo,
+          attempts,
+          error: "reached step deadline during worker-start",
+        };
+      }
       const result = res(r.json);
       const rawDispId = pick(result, ["dispatchId", "dispatch_id"]) || pick(result.dispatch || {}, ["id"]);
       const dispatchId = rawDispId && String(rawDispId).trim() ? String(rawDispId).trim() : null;
@@ -847,7 +1039,7 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       } else {
         // P0-01: Failed worker-start WITHOUT a `dispatchId`:
         // 1) Reconcile via `dispatch-show --task <taskId>` to check if a stray dispatch was created anyway!
-        const recon = orca(["orchestration", "dispatch-show", "--task", taskId], { timeoutMs: clampTimeoutToDeadline(deadlineAt, 5000) });
+        const recon = orca(["orchestration", "dispatch-show", "--task", taskId], { allowPostDeadlineCleanup: true, timeoutMs: 5000 });
         const reconDisp = pick(res(recon.json), ["dispatch"]) || {};
         const reconDispId = pick(reconDisp, ["id", "dispatchId", "dispatch_id"]) || null;
         if (reconDispId && reconDispId !== retryOf) {
@@ -869,15 +1061,24 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
           }
           retryOf = reconDispId;
         } else {
-          // 2) No dispatchId in receipt or dispatch-show: ONLY allow retry/fallback when structured JSON
-          //    proves a clean pre-spawn validation failure (or explicit gateway error with zero residuals)!
+          // 2) No dispatchId in receipt or dispatch-show: ONLY classify as `ambiguous: false` when
+          //    structured Orca error code/stage is strictly a pre-launch validation rejection!
+          //    Any `agent_readiness`, network/gateway, transport, or unknown error stays `ambiguous: true`!
+          const structuredCode = String(
+            pick(result, ["code", "errorCode", "error_code"]) ||
+            pick(r.json || {}, ["code", "errorCode", "error_code"]) ||
+            ""
+          ).trim().toLowerCase();
           const provenPreSpawnFailure = Boolean(
             r.json &&
             !r.timedOut &&
             !r.ok &&
             state !== "outcome_unknown" &&
             !hasResiduals &&
-            (PRE_SPAWN_FAILED_STAGES.has(normFailedStage) || gwErr)
+            (
+              STRICT_PRE_LAUNCH_REJECTION_CODES.has(structuredCode) ||
+              (STRICT_PRE_LAUNCH_REJECTION_CODES.has(normFailedStage) && !gwErr)
+            )
           );
           if (!provenPreSpawnFailure) {
             return {
@@ -890,7 +1091,7 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
               effectiveEffort: passedEffort,
               lastClearedInfo,
               attempts,
-              error: `worker-start failed without dispatchId or pre-spawn proof (stage=${failedStage || "none"}, state=${state || "none"}: ${lastError}) — refusing blind retry/reuse on worktree`,
+              error: `worker-start failed without dispatchId or strict pre-launch rejection proof (code=${structuredCode || "none"}, stage=${failedStage || "none"}, state=${state || "none"}: ${lastError}) — refusing blind retry/reuse on worktree`,
               failedStage,
               raw: sanitizeText(r.raw || r.stderr, { maxLen: 300 }),
             };
@@ -995,9 +1196,17 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     });
   }
 
-  function workerVitals(taskId, terminal, dispatchId) {
-    const v = { status: null, settled: false, outcome: null, lastBusyMs: 0, heartbeatMs: 0, preview: null, agentWait: null, dispatchMismatch: false };
-    const d = orca(["orchestration", "dispatch-show", "--task", taskId]);
+  function workerVitals(taskId, terminal, dispatchId, { deadlineAt = null } = {}) {
+    const v = { status: null, settled: false, outcome: null, lastBusyMs: 0, heartbeatMs: 0, preview: null, agentWait: null, dispatchMismatch: false, deadlineExceeded: false };
+    if (deadlineAt != null && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      v.deadlineExceeded = true;
+      return v;
+    }
+    const d = orca(["orchestration", "dispatch-show", "--task", taskId], { deadlineAt });
+    if (d.deadlineExceeded) {
+      v.deadlineExceeded = true;
+      return v;
+    }
     const dd = pick(res(d.json), ["dispatch"]) || {};
     const shownDispId = pick(dd, ["id", "dispatchId", "dispatch_id"]) || null;
 
@@ -1020,9 +1229,13 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
     let wsOutcome = null;
     let wsExplicitMatch = false;
     if (terminal) {
-      tinfo = pick(res(orca(["terminal", "show", "--terminal", terminal]).json), ["terminal"]) || {};
+      const ts = orca(["terminal", "show", "--terminal", terminal], { deadlineAt });
+      if (ts.deadlineExceeded) { v.deadlineExceeded = true; return v; }
+      tinfo = pick(res(ts.json), ["terminal"]) || {};
     } else if (dispatchId) {
-      const ws = res(orca(["orchestration", "worker-show", "--dispatch", dispatchId]).json);
+      const wsResp = orca(["orchestration", "worker-show", "--dispatch", dispatchId], { deadlineAt });
+      if (wsResp.deadlineExceeded) { v.deadlineExceeded = true; return v; }
+      const ws = res(wsResp.json);
       const wsDispId = pick(ws, ["dispatchId", "dispatch_id", "id"]) || pick(ws.dispatch || {}, ["id", "dispatchId"]) || null;
       if (wsDispId && wsDispId !== dispatchId) {
         v.dispatchMismatch = true;
@@ -1064,14 +1277,16 @@ export function createOrcaClient({ cfg, opt, objective, autoRun, agentOf, modelO
       v.settled = true;
       let resolvedOutcome = (matchesActiveDispatch && pick(dd, ["outcome", "result"])) || (wsExplicitMatch ? wsOutcome : null) || null;
       if (!resolvedOutcome) {
-        const tl = orca(["orchestration", "task-list", "--run", runId]);
-        const t = (pick(res(tl.json), ["tasks"]) || []).find((x) => x.id === taskId);
-        let r = t?.result;
-        if (typeof r === "string") { try { r = JSON.parse(r); } catch { r = null; } }
-        const resDispId = pick(r || {}, ["dispatchId", "dispatch_id"]) || null;
-        // P0-01: When `dispatchId` is set, REQUIRE `resDispId === dispatchId` (never accept unattributed task result!)
-        if (r && (dispatchId ? (resDispId === dispatchId) : true)) {
-          resolvedOutcome = pick(r, ["outcome", "result"]) || null;
+        const tl = orca(["orchestration", "task-list", "--run", runId], { deadlineAt });
+        if (!tl.deadlineExceeded) {
+          const t = (pick(res(tl.json), ["tasks"]) || []).find((x) => x.id === taskId);
+          let r = t?.result;
+          if (typeof r === "string") { try { r = JSON.parse(r); } catch { r = null; } }
+          const resDispId = pick(r || {}, ["dispatchId", "dispatch_id"]) || null;
+          // P0-01: When `dispatchId` is set, REQUIRE `resDispId === dispatchId` (never accept unattributed task result!)
+          if (r && (dispatchId ? (resDispId === dispatchId) : true)) {
+            resolvedOutcome = pick(r, ["outcome", "result"]) || null;
+          }
         }
       }
       v.outcome = resolvedOutcome || "unknown";

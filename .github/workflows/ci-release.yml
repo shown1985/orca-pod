@@ -131,11 +131,12 @@ jobs:
                     fi
                   else
                     ORCA_PY_ROOT_PRUNE="$is_root_dir" python3 - <<'PY'
-          import importlib.util, os, sys, unittest
+          import json, os, subprocess, sys
           SKIP = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", ".tox", ".mypy_cache", ".pytest_cache", ".orca"}
           ROOT_SUBPROJECTS = {"backend", "server", "api", "frontend", "web", "client", "ui"}
           prune_root = os.environ.get("ORCA_PY_ROOT_PRUNE") == "1"
-          test_files = []
+          cwd_abs = os.path.abspath(".")
+          dir_to_files = {}
           for root, dirs, files in os.walk("."):
               rel_root = os.path.normpath(root)
               dirs[:] = sorted(
@@ -144,41 +145,57 @@ jobs:
                   and not d.startswith(".")
                   and not (prune_root and rel_root == "." and d in ROOT_SUBPROJECTS)
               )
-              for f in sorted(files):
-                  if (f.startswith("test_") and f.endswith(".py")) or f.endswith("_test.py"):
-                      test_files.append(os.path.abspath(os.path.join(root, f)))
-          if not test_files:
+              matched = sorted({
+                  f for f in files
+                  if (f.startswith("test_") and f.endswith(".py")) or f.endswith("_test.py")
+              })
+              if matched:
+                  dir_to_files[os.path.abspath(root)] = matched
+          if not dir_to_files:
               sys.stderr.write("ERROR: Expected Python test files, but none were found during walk!\n")
               sys.exit(1)
-          cwd_abs = os.path.abspath(".")
+          def compute_top_dir(tdir):
+              if not os.path.isfile(os.path.join(tdir, "__init__.py")):
+                  return tdir
+              cur = tdir
+              while os.path.isfile(os.path.join(cur, "__init__.py")) and os.path.basename(cur).isidentifier():
+                  parent = os.path.dirname(cur)
+                  if parent == cur:
+                      break
+                  if cur == cwd_abs:
+                      return parent
+                  cur = parent
+              return cur
+          CHILD_CODE = r"""
+          import json, os, sys, unittest
+          tdir, top_dir, cwd_abs, files_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          files = json.loads(files_json)
+          for p in (top_dir, cwd_abs):
+              if p and p not in sys.path:
+                  sys.path.insert(0, p)
           loader = unittest.TestLoader()
           suite = unittest.TestSuite()
-          for idx, fpath in enumerate(test_files):
-              fdir = os.path.dirname(fpath)
-              stem = os.path.splitext(os.path.basename(fpath))[0]
-              mod_name = f"_orca_ut_{idx}_{stem}"
-              added_paths = []
-              for p in (fdir, cwd_abs):
-                  if p not in sys.path:
-                      sys.path.insert(0, p)
-                      added_paths.append(p)
-              try:
-                  spec = importlib.util.spec_from_file_location(mod_name, fpath)
-                  if spec is None or spec.loader is None:
-                      raise ImportError(f"Could not create module spec for {fpath}")
-                  mod = importlib.util.module_from_spec(spec)
-                  sys.modules[mod_name] = mod
-                  spec.loader.exec_module(mod)
-                  suite.addTests(loader.loadTestsFromModule(mod))
-              finally:
-                  for p in added_paths:
-                      if p in sys.path:
-                          sys.path.remove(p)
+          for fname in files:
+              stem = os.path.splitext(fname)[0]
+              if tdir == top_dir:
+                  mod_name = stem
+              else:
+                  rel = os.path.relpath(os.path.join(tdir, stem), top_dir)
+                  mod_name = rel.replace(os.sep, ".")
+              suite.addTests(loader.loadTestsFromName(mod_name))
           if suite.countTestCases() == 0:
-              sys.stderr.write("ERROR: Python test files matched on disk, but unittest discovered 0 test cases!\n")
+              sys.stderr.write(f"ERROR: Python test files matched in {tdir}, but unittest discovered 0 test cases!\n")
               sys.exit(1)
           res = unittest.TextTestRunner(verbosity=1).run(suite)
           sys.exit(0 if res.wasSuccessful() else 1)
+          """
+          overall_rc = 0
+          for tdir in sorted(dir_to_files.keys()):
+              top_dir = compute_top_dir(tdir)
+              proc = subprocess.run([sys.executable, "-c", CHILD_CODE, tdir, top_dir, cwd_abs, json.dumps(dir_to_files[tdir])])
+              if proc.returncode != 0:
+                  overall_rc = 1
+          sys.exit(overall_rc)
           PY
                   fi
                 else
@@ -251,10 +268,17 @@ jobs:
           const baseUrl = process.env.TOKENHUB_BASE_URL.replace(/\/+$/, "");
           const model = process.env.TOKENHUB_MODEL;
           const secretKeys = "api[_-]?key|apikey|tokenhub[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|client[_-]?secret|webhook[_-]?secret|private[_-]?key|secret|password|passwd|pwd|token|gh[_-]?token|gitea[_-]?token|github[_-]?token|cookie|set-cookie|authorization";
-          const rawDiff = execSync(
-            `git diff "${process.env.BASE_SHA}...${process.env.HEAD_SHA}" -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)*.pem' ':(exclude)*.key' ':(exclude).env*'`,
-            { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }
-          );
+          let rawDiff = "";
+          try {
+            rawDiff = execSync(
+              `git diff "${process.env.BASE_SHA}...${process.env.HEAD_SHA}" -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)*.pem' ':(exclude)*.key' ':(exclude).env*'`,
+              { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }
+            );
+          } catch (diffErr) {
+            const exitCode = (diffErr && typeof diffErr.status === "number") ? diffErr.status : "unknown";
+            console.error(`[tokenhub] git diff failed (exit=${exitCode}); raw diff output suppressed to protect secrets.`);
+            process.exit(0);
+          }
           const redactedFull = rawDiff
             .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, "[REDACTED_PRIVATE_KEY]")
             .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)([^\/\s:@]+:[^\/\s@]+)@/gi, "$1[REDACTED]:[REDACTED]@")

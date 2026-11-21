@@ -451,34 +451,39 @@ statusMgr.initStatus();
 const resumedLedgerRunKey = statusMgr.getResumedLedgerRunKey();
 const resumedLineageId = statusMgr.getResumedLineageId();
 const resumedLineageRunKeys = statusMgr.getResumedLineageRunKeys();
-if ((opt.from || opt.only) && resumedLineageRunKeys.length > 0) {
+if ((opt.from || opt.only) && resumedLedgerRunKey) {
   try {
     const canonDir = (p) => { try { return realpathSync(p); } catch { return resolve(p); } };
     const resolvedWt = canonDir(WT_DIR || ".");
     const priorSummaries = listLedgerSummaries({ ledgerHome: LEDGER_HOME_CFG, repoDir: WT_DIR || "." });
     const byKey = new Map(priorSummaries.filter((s) => s && s.runKey).map((s) => [s.runKey, s]));
-    const mergedSteps = {};
-    let anyMatched = false;
-    // Merge verified steps chronologically across the run lineage so consecutive `--from` resumes
-    // retain verified author/review provenance from earlier runs in the exact same lineage!
-    for (const rk of resumedLineageRunKeys) {
-      const s = byKey.get(rk);
-      if (!s) continue;
-      if (!s.objective || !objective || s.objective !== objective) continue;
-      if (s.worktreeDir && canonDir(s.worktreeDir) !== resolvedWt) continue;
-      anyMatched = true;
-      for (const [sid, stepRec] of Object.entries(s.steps || {})) {
-        mergedSteps[sid] = stepRec;
-        if (stepRec?.outcome === "succeeded") {
-          statusMgr.statusSet(sid, { provenanceVerified: true });
+    const isMatchingRunSummary = (s) => Boolean(
+      s &&
+      s.objective && objective && s.objective === objective &&
+      s.configFile && CONFIG_FILE && s.configFile === CONFIG_FILE &&
+      (!s.worktreeDir || canonDir(s.worktreeDir) === resolvedWt)
+    );
+    // P0-03: Primary `resumedLedgerRunKey` MUST exist and match objective + configFile + worktreeDir!
+    const primarySummary = byKey.get(resumedLedgerRunKey);
+    if (isMatchingRunSummary(primarySummary)) {
+      const mergedSteps = {};
+      const verifiedChainKeys = [];
+      for (const rk of resumedLineageRunKeys) {
+        const s = byKey.get(rk);
+        if (!isMatchingRunSummary(s)) continue;
+        verifiedChainKeys.push(rk);
+        for (const [sid, stepRec] of Object.entries(s.steps || {})) {
+          mergedSteps[sid] = stepRec;
+          if (stepRec?.outcome === "succeeded") {
+            statusMgr.statusSet(sid, { provenanceVerified: true });
+          }
         }
       }
-    }
-    if (anyMatched) {
       BOUND_PREV_LEDGER = {
         runKey: resumedLedgerRunKey,
-        lineageId: resumedLineageId || resumedLineageRunKeys[0],
-        lineageRunKeys: resumedLineageRunKeys,
+        configFile: CONFIG_FILE,
+        lineageId: resumedLineageId || verifiedChainKeys[0] || resumedLedgerRunKey,
+        lineageRunKeys: verifiedChainKeys,
         steps: mergedSteps,
       };
     }

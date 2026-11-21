@@ -10,7 +10,8 @@ module.exports = {
       c.state.dispatches[id] = { id, task: c.flags.task, worktree: c.flags.worktree || null, wtDir, status: "dispatching", created: Date.now() };
       const artDir = join(wtDir, ".orca", "artifacts");
       fs.mkdirSync(artDir, { recursive: true });
-      const body = process.env.ORCA_FAKE_RELEASE_BODY || "# Release\nDoor: two-way\nMerge-Status: MERGED\n" + "ok ".repeat(100) + "\nVERDICT: PASS\n";
+      const rawBody = process.env.ORCA_FAKE_RELEASE_BODY || "# Release\nDoor: two-way\nMerge-Status: MERGED\n" + "ok ".repeat(100) + "\nVERDICT: PASS\n";
+      const body = `<!-- orca-dispatch: ${id} -->\n${rawBody}`;
       fs.writeFileSync(join(artDir, "RELEASE.md"), body);
       if (process.env.ORCA_FAKE_FORCE_MERGE_DEV === "1") {
         // Simulate a rogue worker merging HEAD into dev despite one-way door

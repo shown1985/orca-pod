@@ -190,18 +190,29 @@ export function createStatusManager({
   function loadPreviousStatus(dir = statusDir()) {
     try {
       const prev = parseStatusJs(join(dir, "status.js"));
-      if (!prev || !Array.isArray(prev.steps) || prev.meta?.config !== STATUS.meta.config) return;
+      if (!prev || !Array.isArray(prev.steps)) return;
+      if (!prev.meta?.config || !STATUS.meta.config || prev.meta.config !== STATUS.meta.config) return;
       const isPreviewResume = Boolean(process.env.ORCA_STATUS_PREVIEW_RESUME);
       // P0-03: Require BOTH previous and current objective to exist and match exactly (never adopt objective-less status)
       if (!isPreviewResume) {
         if (!prev.meta?.objective || !STATUS.meta.objective || prev.meta.objective !== STATUS.meta.objective) return;
       }
-      if (prev.meta?.ledgerRunKey) resumedLedgerRunKey = prev.meta.ledgerRunKey;
-      resumedLineageId = prev.meta?.lineageId || prev.meta?.ledgerRunKey || null;
-      if (Array.isArray(prev.meta?.lineageRunKeys) && prev.meta.lineageRunKeys.length) {
-        resumedLineageRunKeys = [...new Set(prev.meta.lineageRunKeys.filter((x) => typeof x === "string" && x.trim()))];
-      } else if (resumedLedgerRunKey) {
-        resumedLineageRunKeys = [resumedLedgerRunKey];
+      // P0-03: Require a non-empty primary `meta.ledgerRunKey` before adopting any lineageRunKeys!
+      const primaryKey = typeof prev.meta?.ledgerRunKey === "string" && prev.meta.ledgerRunKey.trim()
+        ? prev.meta.ledgerRunKey.trim()
+        : null;
+      if (primaryKey) {
+        resumedLedgerRunKey = primaryKey;
+        resumedLineageId = (typeof prev.meta?.lineageId === "string" && prev.meta.lineageId.trim())
+          ? prev.meta.lineageId.trim()
+          : primaryKey;
+        const rawChain = Array.isArray(prev.meta?.lineageRunKeys) ? prev.meta.lineageRunKeys : [];
+        const cleanChain = rawChain.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim());
+        resumedLineageRunKeys = [...new Set([...cleanChain, primaryKey])];
+      } else {
+        resumedLedgerRunKey = null;
+        resumedLineageId = null;
+        resumedLineageRunKeys = [];
       }
       for (const ps of prev.steps) {
         const cur = statusOf(ps.id);

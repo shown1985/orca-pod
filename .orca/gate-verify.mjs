@@ -15,9 +15,9 @@
 //
 // Zero external dependencies (Node builtins only).
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, copyFileSync, utimesSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { verifyMergeDangerGate } from "./merge-danger.mjs";
 
@@ -306,12 +306,56 @@ export function verifyArtifactContent(text, verify, { gitDir = null, artDir = nu
   return { ok: true, reason: null, verdict: foundVerdict, contractCommit: foundCommit, expectedCommit, mergeDanger, mergeDangerResult, pendingHumanMerge };
 }
 
+function extractWriterAttestedDispatchIds(text) {
+  const ids = new Set();
+  const commentRe = /<!--\s*orca-dispatch:\s*([^\s>]+)\s*-->/gi;
+  let cm = null;
+  while ((cm = commentRe.exec(text)) !== null) {
+    if (cm[1]) ids.add(cm[1].trim());
+  }
+  let inFence = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const trimmed = raw.trim();
+    if (/^(`{3,}|~{3,})/.test(trimmed)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    const cleaned = normalizeMarkerLine(raw);
+    const dm = /^(?:\*\*|__)?Dispatch-ID(?:\*\*|__)?\s*:\s*`?([^`\s*]+)`?$/i.exec(cleaned);
+    if (dm && dm[1]) ids.add(dm[1].trim());
+  }
+  return [...ids];
+}
+
 /**
- * Full artifact check for a pipeline step: existence, minBytes, and verify rules.
+ * Full artifact check for a pipeline step: existence, minBytes, writer-attested
+ * per-dispatch provenance, and verify rules.
  */
 export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = {}) {
   if (!step || !step.writes) return { ok: true, reason: null };
-  const filePath = join(artDir, step.writes);
+  const isSettlement = (opts.mode || "settlement") === "settlement";
+  const safeDisp = opts.dispatchId ? String(opts.dispatchId).replace(/[^A-Za-z0-9._-]+/g, "_") : null;
+  const dispatchScopedPath = safeDisp ? join(artDir, `.dispatch-${safeDisp}`, step.writes) : null;
+  const canonicalPath = join(artDir, step.writes);
+
+  const thresholdMs = (opts.fsEpochMtimeMs != null && Number.isFinite(opts.fsEpochMtimeMs))
+    ? opts.fsEpochMtimeMs
+    : ((opts.minMtimeMs != null && Number.isFinite(opts.minMtimeMs)) ? opts.minMtimeMs : null);
+
+  let usedDispatchScopedTarget = false;
+  if (isSettlement && dispatchScopedPath && existsSync(dispatchScopedPath)) {
+    let dst = null;
+    try { dst = statSync(dispatchScopedPath); } catch { dst = null; }
+    if (dst && dst.size >= minBytes && (thresholdMs == null || dst.mtimeMs >= thresholdMs)) {
+      mkdirSync(dirname(canonicalPath), { recursive: true });
+      copyFileSync(dispatchScopedPath, canonicalPath);
+      try { utimesSync(canonicalPath, dst.atime, dst.mtime); } catch {}
+      usedDispatchScopedTarget = true;
+    }
+  }
+
+  const filePath = canonicalPath;
   if (!existsSync(filePath)) {
     return { ok: false, reason: "missing" };
   }
@@ -320,13 +364,10 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
   if (st.size < minBytes) {
     return { ok: false, reason: `too small (${st.size} bytes < ${minBytes} min)` };
   }
-  if ((opts.mode || "settlement") === "settlement") {
+  if (isSettlement) {
     if (opts.clearedBeforeDispatch === false) {
       return { ok: false, reason: `stale artifact guard: ${step.writes} was not cleared prior to dispatch` };
     }
-    const thresholdMs = (opts.fsEpochMtimeMs != null && Number.isFinite(opts.fsEpochMtimeMs))
-      ? opts.fsEpochMtimeMs
-      : ((opts.minMtimeMs != null && Number.isFinite(opts.minMtimeMs)) ? opts.minMtimeMs : null);
     if (thresholdMs != null && st.mtimeMs < thresholdMs) {
       return {
         ok: false,
@@ -367,16 +408,23 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
   }
   let text = "";
   try { text = readFileSync(filePath, "utf8"); } catch (e) { return { ok: false, reason: `read failed: ${e.message}` }; }
-  if ((opts.mode || "settlement") === "settlement" && opts.dispatchId) {
-    for (const raw of text.split(/\r?\n/)) {
-      const cleaned = normalizeMarkerLine(raw);
-      const dm = /^(?:\*\*|__)?Dispatch-ID(?:\*\*|__)?\s*:\s*`?([^`\s*]+)`?$/i.exec(cleaned);
-      if (dm && dm[1] !== opts.dispatchId) {
-        return {
-          ok: false,
-          reason: `mismatched Dispatch-ID header in ${step.writes}: found "${dm[1]}", expected "${opts.dispatchId}"`,
-        };
-      }
+  if (isSettlement && opts.dispatchId) {
+    const writerIds = extractWriterAttestedDispatchIds(text);
+    if (writerIds.some((id) => id !== opts.dispatchId)) {
+      const bad = writerIds.find((id) => id !== opts.dispatchId);
+      return {
+        ok: false,
+        reason: `mismatched Dispatch-ID in ${step.writes}: found "${bad}", expected "${opts.dispatchId}"`,
+      };
+    }
+    // P0-01: Require POSITIVE writer-attested provenance on every gate artifact at settlement:
+    // either written into the dispatch-isolated target `.dispatch-<dispatchId>/<writes>` OR
+    // explicitly carrying the matching `Dispatch-ID: <dispatchId>` / `<!-- orca-dispatch: <dispatchId> -->`!
+    if (!usedDispatchScopedTarget && !writerIds.includes(opts.dispatchId)) {
+      return {
+        ok: false,
+        reason: `unattested gate artifact: ${step.writes} lacks writer-attested provenance for active dispatch ${opts.dispatchId} (missing Dispatch-ID marker and not written via .dispatch-${safeDisp}/${step.writes})`,
+      };
     }
   }
   return verifyArtifactContent(text, step.verify, { gitDir, artDir, mode: opts.mode || "settlement", targetBranch: opts.targetBranch || "dev", allowOneWayMerge: Boolean(opts.allowOneWayMerge), preStepTargetSha: opts.preStepTargetSha || null, preStepOriginTargetSha: opts.preStepOriginTargetSha || null, preStepRemoteTargetSha: opts.preStepRemoteTargetSha || null, preStepRemoteError: opts.preStepRemoteError || null, preStepHasOrigin: Boolean(opts.preStepHasOrigin), preStepHeadSha: opts.preStepHeadSha || null, mergeDangerThresholds: opts.mergeDangerThresholds || null });

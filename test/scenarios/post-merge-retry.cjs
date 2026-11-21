@@ -16,7 +16,7 @@ module.exports = {
         fs.mkdirSync(dir, { recursive: true });
         const sha = process.env.ORCA_VERIFY_HEAD_SHA || "a".repeat(40);
         fs.writeFileSync(join(dir, "CONTRACT_REVIEW.md"),
-          `# Contract Review\n\n**Contract-Commit:** \`${sha}\`\n\n` +
+          `# Contract Review\n\nDispatch-ID: ${id}\n**Contract-Commit:** \`${sha}\`\n\n` +
           "All contracts audited cleanly.\n".repeat(8) + "\nVERDICT: PASS\n"
         );
         c.pushDone(c.flags.task, "succeeded");
@@ -31,7 +31,7 @@ module.exports = {
         fs.mkdirSync(dir, { recursive: true });
         const verdict = c.state.extra.intRuns === 1 ? "FAIL" : "PASS";
         fs.writeFileSync(join(dir, "INTEGRATION_REPORT.md"),
-          `# Integration attempt ${c.state.extra.intRuns}\n\n` +
+          `# Integration attempt ${c.state.extra.intRuns}\n\nDispatch-ID: ${id}\n\n` +
           "Integration logs.\n".repeat(12) + `\nVERDICT: ${verdict}\n`
         );
         c.pushDone(c.flags.task, c.state.extra.intRuns === 1 ? "failed" : "succeeded");

@@ -218,30 +218,254 @@ export function resolveOpencodeConfig({ projectDir = process.cwd(), configPaths 
   };
 }
 
+const SHELL_VALUE_FLAGS = new Set([
+  "--settings", "--config", "-c", "--permission-mode", "--mode", "--worktree", "-w",
+  "--cwd", "--dir", "--prompt", "-p", "--system-prompt", "--append-system-prompt",
+  "--mcp-config", "--add-dir", "--allowedtools", "--disallowedtools", "--allowed-tools",
+  "--disallowed-tools", "--output-format", "--input-format", "--max-turns", "--session-id",
+  "--resume", "--thinking", "--profile", "--provider", "--api-key", "--base-url",
+  "--environment", "--pairing-code", "--agent", "--title", "--name",
+]);
+
 /**
- * Parse an agent CLI command string (e.g. `agy --model claude-sonnet-4-5 --effort high`)
- * to extract `baseAgent`, any embedded `--model`/`-m`, and any embedded `--effort` flag.
- * Because `buildAgentCommand` preserves embedded flags over step-level `model`/`effort`,
- * embedded flags are authoritative for actual runtime argv and cross-family classification!
+ * Real POSIX-like shell tokenizer for single-command agent launch strings.
+ * Handles single quotes, double quotes, and backslash escapes cleanly.
+ * Fails closed (`ok: false, parseable: false`) on unclosed quotes, trailing escapes,
+ * newlines, command substitutions (`$(` / backticks), or shell control operators
+ * (`;`, `|`, `&`, `<`, `>`, `(`, `)`) so ambiguous strings never pass cross-family checks!
+ */
+export function tokenizeShellCommand(cmdStr) {
+  const src = String(cmdStr ?? "");
+  if (/[\r\n]/.test(src)) {
+    return { ok: false, parseable: false, tokens: [], reason: "newline_in_command" };
+  }
+  const tokens = [];
+  let cur = "";
+  let inToken = false;
+  let quote = null; // "'" | '"' | null
+
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = null;
+        continue;
+      }
+      if (ch === "`" || (ch === "$" && src[i + 1] === "(")) {
+        return { ok: false, parseable: false, tokens: [], reason: "command_substitution" };
+      }
+      if (ch === "\\") {
+        if (i + 1 >= src.length) {
+          return { ok: false, parseable: false, tokens: [], reason: "trailing_escape" };
+        }
+        const nxt = src[++i];
+        if (nxt === '"' || nxt === "\\" || nxt === "$" || nxt === "`") cur += nxt;
+        else cur += "\\" + nxt;
+        continue;
+      }
+      cur += ch;
+      continue;
+    }
+
+    // Unquoted state
+    if (/\s/.test(ch)) {
+      if (inToken) {
+        tokens.push(cur);
+        cur = "";
+        inToken = false;
+      }
+      continue;
+    }
+    if (ch === ";" || ch === "|" || ch === "&" || ch === "`" || ch === "<" || ch === ">" || ch === "(" || ch === ")") {
+      return { ok: false, parseable: false, tokens: [], reason: "shell_control_operator" };
+    }
+    if (ch === "$" && src[i + 1] === "(") {
+      return { ok: false, parseable: false, tokens: [], reason: "command_substitution" };
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      inToken = true;
+      continue;
+    }
+    if (ch === "\\") {
+      if (i + 1 >= src.length) {
+        return { ok: false, parseable: false, tokens: [], reason: "trailing_escape" };
+      }
+      cur += src[++i];
+      inToken = true;
+      continue;
+    }
+    cur += ch;
+    inToken = true;
+  }
+
+  if (quote !== null) {
+    return { ok: false, parseable: false, tokens: [], reason: "unclosed_quote" };
+  }
+  if (inToken) tokens.push(cur);
+  return { ok: tokens.length > 0, parseable: tokens.length > 0, tokens, reason: tokens.length > 0 ? null : "empty_command" };
+}
+
+/**
+ * Parse an agent CLI command string into structured `argv[]` via `tokenizeShellCommand`
+ * and walk top-level flags ONLY (skipping option values like `--settings '{...}'`)
+ * to extract `baseAgent`, `embeddedModel`, and `embeddedEffort`.
  */
 export function parseAgentCommandSpec(agentCmd) {
   const raw = String(agentCmd || "").trim();
-  const baseAgent = (raw.split(/\s+/)[0] || "").trim();
+  const tokRes = tokenizeShellCommand(raw);
+  if (!tokRes.parseable) {
+    return {
+      raw,
+      parseable: false,
+      parseReason: tokRes.reason,
+      argv: [],
+      baseAgent: "",
+      lowerBase: "",
+      isKiro: false,
+      embeddedModel: null,
+      embeddedEffort: null,
+      hasModelFlag: false,
+      hasEffortFlag: false,
+      hasSettingsFlag: false,
+      hasModeFlag: false,
+      hasPermissionModeFlag: false,
+      hasDangerouslySkipFlag: false,
+    };
+  }
+
+  const tokens = tokRes.tokens;
+  let cmdIdx = 0;
+  // Skip leading `env` and `KEY=VALUE` assignments (e.g. `env CLAUDE_AFK_TIMEOUT_MS=60000 claude ...`)
+  if (tokens[cmdIdx] === "env") {
+    cmdIdx++;
+    while (cmdIdx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[cmdIdx])) {
+      cmdIdx++;
+    }
+  } else {
+    while (cmdIdx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[cmdIdx])) {
+      cmdIdx++;
+    }
+  }
+
+  if (cmdIdx >= tokens.length) {
+    return {
+      raw,
+      parseable: false,
+      parseReason: "missing_executable",
+      argv: [],
+      baseAgent: "",
+      lowerBase: "",
+      isKiro: false,
+      embeddedModel: null,
+      embeddedEffort: null,
+      hasModelFlag: false,
+      hasEffortFlag: false,
+      hasSettingsFlag: false,
+      hasModeFlag: false,
+      hasPermissionModeFlag: false,
+      hasDangerouslySkipFlag: false,
+    };
+  }
+
+  const argv = tokens.slice(cmdIdx);
+  const baseAgent = argv[0];
   const lowerBase = baseAgent.toLowerCase();
   const isKiro = lowerBase === "kiro-cli" || lowerBase === "kiro";
+
   let embeddedModel = null;
   let embeddedEffort = null;
-  const modelMatch = raw.match(/(?:^|\s)(?:--model|-m)(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))/);
-  if (modelMatch) {
-    const mv = (modelMatch[1] || modelMatch[2] || modelMatch[3] || "").trim();
-    if (mv && mv.toLowerCase() !== "default") embeddedModel = mv;
+  let hasModelFlag = false;
+  let hasEffortFlag = false;
+  let hasSettingsFlag = false;
+  let hasModeFlag = false;
+  let hasPermissionModeFlag = false;
+  let hasDangerouslySkipFlag = false;
+
+  for (let i = 1; i < argv.length; i++) {
+    const t = argv[i];
+    if (t === "--") break;
+
+    if (t === "--model" || t === "-m") {
+      hasModelFlag = true;
+      if (i + 1 >= argv.length) {
+        return { raw, parseable: false, parseReason: "dangling_model_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel: null, embeddedEffort: null, hasModelFlag: true, hasEffortFlag, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag };
+      }
+      const mv = String(argv[++i] || "").trim();
+      if (mv && mv.toLowerCase() !== "default") embeddedModel = mv;
+      continue;
+    }
+    if (t.startsWith("--model=") || t.startsWith("-m=")) {
+      hasModelFlag = true;
+      const mv = t.slice(t.indexOf("=") + 1).trim();
+      if (mv && mv.toLowerCase() !== "default") embeddedModel = mv;
+      continue;
+    }
+
+    if (t === "--effort" || t === "--reasoning-effort") {
+      hasEffortFlag = true;
+      if (i + 1 >= argv.length) {
+        return { raw, parseable: false, parseReason: "dangling_effort_flag", argv, baseAgent, lowerBase, isKiro, embeddedModel, embeddedEffort: null, hasModelFlag, hasEffortFlag: true, hasSettingsFlag, hasModeFlag, hasPermissionModeFlag, hasDangerouslySkipFlag };
+      }
+      const ev = String(argv[++i] || "").trim();
+      if (ev) embeddedEffort = ev;
+      continue;
+    }
+    if (t.startsWith("--effort=") || t.startsWith("--reasoning-effort=")) {
+      hasEffortFlag = true;
+      const ev = t.slice(t.indexOf("=") + 1).trim();
+      if (ev) embeddedEffort = ev;
+      continue;
+    }
+
+    if (t === "--dangerously-skip-permissions") {
+      hasDangerouslySkipFlag = true;
+      continue;
+    }
+    if (t === "--settings" || t.startsWith("--settings=")) {
+      hasSettingsFlag = true;
+      if (t === "--settings" && i + 1 < argv.length) i++;
+      continue;
+    }
+    if (t === "--mode" || t.startsWith("--mode=")) {
+      hasModeFlag = true;
+      if (t === "--mode" && i + 1 < argv.length) i++;
+      continue;
+    }
+    if (t === "--permission-mode" || t.startsWith("--permission-mode=")) {
+      hasPermissionModeFlag = true;
+      if (t === "--permission-mode" && i + 1 < argv.length) i++;
+      continue;
+    }
+
+    if (SHELL_VALUE_FLAGS.has(t.toLowerCase())) {
+      if (i + 1 < argv.length) i++;
+      continue;
+    }
   }
-  const effortMatch = raw.match(/(?:^|\s)--effort(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))/);
-  if (effortMatch) {
-    const ev = (effortMatch[1] || effortMatch[2] || effortMatch[3] || "").trim();
-    if (ev) embeddedEffort = ev;
-  }
-  return { raw, baseAgent, lowerBase, isKiro, embeddedModel, embeddedEffort };
+
+  return {
+    raw,
+    parseable: true,
+    parseReason: null,
+    argv,
+    baseAgent,
+    lowerBase,
+    isKiro,
+    embeddedModel,
+    embeddedEffort,
+    hasModelFlag,
+    hasEffortFlag,
+    hasSettingsFlag,
+    hasModeFlag,
+    hasPermissionModeFlag,
+    hasDangerouslySkipFlag,
+  };
 }
 
 export function resolveEffectiveLaunchSpec(agent, model = null, effort = null, { projectDir = null, configPaths = null } = {}) {
@@ -250,6 +474,20 @@ export function resolveEffectiveLaunchSpec(agent, model = null, effort = null, {
     ? String(model).trim()
     : null;
   const reqEffort = (effort != null && String(effort).trim()) ? String(effort).trim() : null;
+
+  if (!parsed.parseable) {
+    return {
+      agent: parsed.raw,
+      parseable: false,
+      parseReason: parsed.parseReason,
+      baseAgent: "",
+      embeddedModel: null,
+      embeddedEffort: null,
+      passedModel: null,
+      effectiveModel: null,
+      effectiveEffort: null,
+    };
+  }
 
   let passedModel = null;
   if (!parsed.isKiro) {
@@ -264,6 +502,8 @@ export function resolveEffectiveLaunchSpec(agent, model = null, effort = null, {
   const effectiveEffort = parsed.embeddedEffort || reqEffort || null;
   return {
     agent: parsed.raw,
+    parseable: true,
+    parseReason: null,
     baseAgent: parsed.baseAgent,
     embeddedModel: parsed.embeddedModel,
     embeddedEffort: parsed.embeddedEffort,
@@ -306,6 +546,7 @@ function matchModelIdFamily(modelStr) {
  */
 export function classifyModelFamily(agent, model = null, { projectDir = null, configPaths = null } = {}) {
   const launch = resolveEffectiveLaunchSpec(agent, model, null, { projectDir, configPaths });
+  if (!launch.parseable) return "unknown";
   const baseAgent = launch.baseAgent.toLowerCase();
 
   if (!baseAgent) return "unknown";
@@ -524,11 +765,12 @@ export async function probeHttp(url, timeoutMs = 2000) {
   }
 }
 
-export function probeBinary(agentCmd) {
-  const bin = String(agentCmd || "").trim().split(/\s+/)[0];
-  if (!bin) return { ok: false, bin: "", reason: "empty agent command" };
+export function probeBinary(agentCmd, timeoutMs = 2000) {
+  const parsed = parseAgentCommandSpec(agentCmd);
+  const bin = parsed.parseable ? parsed.baseAgent : "";
+  if (!bin) return { ok: false, bin: "", reason: parsed.parseReason ? `unparseable agent command (${parsed.parseReason})` : "empty agent command" };
   const cmd = process.platform === "win32" ? "where" : "which";
-  const r = spawnSync(cmd, [bin], { encoding: "utf8", timeout: 2000 });
+  const r = spawnSync(cmd, [bin], { encoding: "utf8", timeout: Math.max(1, Math.floor(timeoutMs)) });
   if (!r.error && r.status === 0) return { ok: true, bin, path: (r.stdout || "").trim().split(/\r?\n/)[0] };
   return { ok: false, bin, reason: `binary "${bin}" not found on PATH` };
 }
@@ -772,6 +1014,7 @@ export function filterCrossFamilyCandidates(
 export async function checkCandidateHealth(candidate, {
   cfg = {},
   projectDir = process.cwd(),
+  deadlineAt = null,
   probeTcpFn = probeTcp,
   probeHttpFn = probeHttp,
   probeBinaryFn = probeBinary,
@@ -782,19 +1025,31 @@ export async function checkCandidateHealth(candidate, {
   const enabled = candPf.enabled ?? globalPf.enabled ?? true;
   if (!enabled) return { ok: true, checks: [], reason: null };
 
-  const timeoutMs = candPf.timeoutMs ?? globalPf.timeoutMs ?? 1500;
+  const baseTimeoutMs = candPf.timeoutMs ?? globalPf.timeoutMs ?? 1500;
+  const nextBudgetMs = () => {
+    if (deadlineAt == null || !Number.isFinite(deadlineAt)) return baseTimeoutMs;
+    const rem = deadlineAt - Date.now();
+    if (rem <= 0) return 0;
+    return Math.max(1, Math.floor(Math.min(baseTimeoutMs, rem)));
+  };
+  if (nextBudgetMs() <= 0) {
+    return { ok: false, deadlineExceeded: true, checks: [], reason: "step deadline reached before preflight", code: "DEADLINE_EXCEEDED" };
+  }
   const checks = [];
 
   const shouldCheckBin = Boolean(candPf.checkBin ?? globalPf.checkBin ?? false);
   if (shouldCheckBin) {
-    const b = probeBinaryFn(candidate.agent);
+    const bgt = nextBudgetMs();
+    if (bgt <= 0) return { ok: false, deadlineExceeded: true, checks, reason: "step deadline reached before binary preflight", code: "DEADLINE_EXCEEDED" };
+    const b = probeBinaryFn(candidate.agent, bgt);
     checks.push({ type: "binary", ...b });
     if (!b.ok) return { ok: false, checks, reason: b.reason, code: "BIN_NOT_FOUND" };
   }
 
   const tcpList = [];
   if (candPf.tcp) tcpList.push(...(Array.isArray(candPf.tcp) ? candPf.tcp : [candPf.tcp]));
-  const baseAgent = String(candidate.agent || "").trim().split(/\s+/)[0];
+  const parsedAgent = parseAgentCommandSpec(candidate.agent);
+  const baseAgent = parsedAgent.parseable ? parsedAgent.baseAgent : String(candidate.agent || "").trim().split(/\s+/)[0];
   const agentPf = globalPf.agents?.[candidate.agent] || globalPf.agents?.[baseAgent] || null;
   if (agentPf?.tcp) tcpList.push(...(Array.isArray(agentPf.tcp) ? agentPf.tcp : [agentPf.tcp]));
 
@@ -804,7 +1059,9 @@ export async function checkCandidateHealth(candidate, {
       checks.push({ type: "tcp", ok: false, spec: sanitizeText(String(spec), { maxLen: 120 }), reason: valid.reason, code: valid.code });
       return { ok: false, configError: true, checks, reason: valid.reason, code: valid.code };
     }
-    const r = await probeTcpFn(valid.host, valid.port, timeoutMs);
+    const bgt = nextBudgetMs();
+    if (bgt <= 0) return { ok: false, deadlineExceeded: true, checks, reason: "step deadline reached before TCP preflight", code: "DEADLINE_EXCEEDED" };
+    const r = await probeTcpFn(valid.host, valid.port, bgt);
     checks.push({ type: "tcp", ...r });
     if (!r.ok) return { ok: false, checks, reason: r.reason, code: r.code || "TCP_ERROR" };
   }
@@ -818,7 +1075,9 @@ export async function checkCandidateHealth(candidate, {
       checks.push({ type: "http", ok: false, url: sanitizeText(String(url), { maxLen: 160 }), reason: valid.reason, code: valid.code });
       return { ok: false, configError: true, checks, reason: valid.reason, code: valid.code };
     }
-    const r = await probeHttpFn(url, timeoutMs);
+    const bgt = nextBudgetMs();
+    if (bgt <= 0) return { ok: false, deadlineExceeded: true, checks, reason: "step deadline reached before HTTP preflight", code: "DEADLINE_EXCEEDED" };
+    const r = await probeHttpFn(url, bgt);
     checks.push({ type: "http", ...r });
     if (!r.ok) return { ok: false, checks, reason: r.reason, code: r.code || "HTTP_ERROR" };
   }
@@ -837,7 +1096,9 @@ export async function checkCandidateHealth(candidate, {
           code: "INVALID_ENDPOINT",
         };
       }
-      const r = await probeTcpFn(ep.host, ep.port, timeoutMs);
+      const bgt = nextBudgetMs();
+      if (bgt <= 0) return { ok: false, deadlineExceeded: true, checks, reason: "step deadline reached before OpenCode local preflight", code: "DEADLINE_EXCEEDED" };
+      const r = await probeTcpFn(ep.host, ep.port, bgt);
       checks.push({ type: "opencode_local_tcp", provider: ep.provider, source: ep.source, ...r });
       if (!r.ok) {
         return {
@@ -859,8 +1120,26 @@ export async function selectHealthyCandidate(chain, opts = {}) {
   }
   const failures = [];
   for (let i = 0; i < chain.length; i++) {
+    if (opts.deadlineAt != null && Number.isFinite(opts.deadlineAt) && Date.now() >= opts.deadlineAt) {
+      return {
+        candidate: chain[0],
+        index: 0,
+        downgraded: false,
+        deadlineExceeded: true,
+        failures,
+      };
+    }
     const cand = chain[i];
     const health = await checkCandidateHealth(cand, opts);
+    if (health.deadlineExceeded) {
+      return {
+        candidate: cand,
+        index: i,
+        downgraded: false,
+        deadlineExceeded: true,
+        failures,
+      };
+    }
     if (health.ok) {
       return {
         candidate: cand,

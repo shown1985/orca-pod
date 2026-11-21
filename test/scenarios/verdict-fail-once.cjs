@@ -17,6 +17,7 @@ module.exports = {
         const verdict = c.state.extra.reviewRuns === 1 ? "FAIL" : "PASS";
         fs.writeFileSync(join(dir, "CONTRACT_REVIEW.md"),
           `# Contract Review (attempt ${c.state.extra.reviewRuns})\n\n` +
+          `Dispatch-ID: ${id}\n` +
           `Contract-Commit: ${sha}\n\n` +
           "Detailed review findings clearing minimum byte threshold easily.\n".repeat(4) +
           `\nVERDICT: ${verdict}\n`

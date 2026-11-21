@@ -55,7 +55,7 @@ function main(argv) {
       const effDisp = dispatchId || (ds.length ? ds[ds.length - 1].id : null);
       state.pendingDone.push({ task, outcome, dispatchId: effDisp });
     },
-    materialize: (task, outcome, wtDirOverride = null) => {
+    materialize: (task, outcome, wtDirOverride = null, dispatchIdOverride = null) => {
       // Shared with scenario handlers that override worker-start wholesale:
       // leave the step's artifact behind on success, like a real worker.
       if (outcome !== "succeeded" || !env.ORCA_FAKE_WRITES || !task.spec) return;
@@ -67,7 +67,12 @@ function main(argv) {
       fs.mkdirSync(dir, { recursive: true });
       const verifyMap = env.ORCA_FAKE_VERIFY ? JSON.parse(env.ORCA_FAKE_VERIFY) : {};
       const v = title ? verifyMap[title] : null;
+      const ds = task.id ? Object.values(state.dispatches).filter((d) => d.task === task.id) : [];
+      const effDisp = dispatchIdOverride || (ds.length ? ds[ds.length - 1].id : null);
       let body = `# ${title}\n\n`;
+      if (effDisp) {
+        body += `<!-- orca-dispatch: ${effDisp} -->\nDispatch-ID: ${effDisp}\n\n`;
+      }
       if (v && v.requireContractCommit) {
         const sha = v.requireContractCommit === "HEAD"
           ? (env.ORCA_VERIFY_HEAD_SHA || "a".repeat(40))
@@ -191,7 +196,12 @@ function main(argv) {
     "terminal create": () => c.fail("terminal create unavailable (default forces the cold-start path)"),
     "terminal show": () => c.ok({ terminal: ((state.terminals[flags.terminal] || {}).info) || {} }),
     "terminal send": () => c.ok({}),
-    "terminal close": () => c.ok({}),
+    "terminal close": () => {
+      if (flags.terminal && state.terminals && state.terminals[flags.terminal]) {
+        delete state.terminals[flags.terminal];
+      }
+      c.ok({ status: "closed" });
+    },
   };
 
   const h = (scenario.handlers || {})[key] || DEFAULTS[key];

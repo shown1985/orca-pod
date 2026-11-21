@@ -300,17 +300,49 @@ export function detectIssueProvider({
   };
 }
 
+function normalizeMarkdownRefKey(k) {
+  return String(k || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+export function parseMarkdownRefDefinitions(markdown) {
+  const defs = new Map();
+  if (typeof markdown !== "string" || !markdown) return defs;
+  let inFence = false;
+  let fenceChar = "";
+  let fenceLen = 0;
+  for (const rawLine of markdown.split(/\r?\n/)) {
+    const tf = rawLine.trimStart();
+    const fm = tf.match(/^(`{3,}|~{3,})/);
+    if (fm) {
+      const ch = fm[1][0];
+      const len = fm[1].length;
+      if (!inFence) { inFence = true; fenceChar = ch; fenceLen = len; continue; }
+      if (ch === fenceChar && len >= fenceLen && tf.slice(len).trim() === "") { inFence = false; fenceChar = ""; fenceLen = 0; continue; }
+    }
+    if (inFence) continue;
+    const m = rawLine.match(/^\s{0,3}\[([^\]]+)\]:\s*<?([^\s>]+)>?(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*$/);
+    if (m) {
+      const key = normalizeMarkdownRefKey(m[1]);
+      if (key && !defs.has(key)) defs.set(key, m[2].trim());
+    }
+  }
+  return defs;
+}
+
 /**
  * Extract an explicit current-repo issue linkage marker from a task title.
- * Plain prose numbers like `"Retry step #2"`, cross-repo `"owner/repo#17"`, or Markdown links
- * pointing to external repositories like `[Issue #42](https://github.com/other/repo/issues/42)`
- * are NEVER treated as local issues!
+ * Plain prose numbers like `"Retry step #2"`, cross-repo `"owner/repo#17"`, inline Markdown links
+ * `[Issue #42](https://github.com/other/repo/issues/42)`, or reference-style Markdown links
+ * `[Issue #42][upstream]` pointing to external repositories are NEVER treated as local issues!
  */
-export function extractExplicitLocalIssueNumber(text, { currentHost = null, currentRepo = null } = {}) {
+export function extractExplicitLocalIssueNumber(text, { currentHost = null, currentRepo = null, refDefs = null } = {}) {
+  const srcText = String(text || "");
+  const effectiveRefs = refDefs instanceof Map ? refDefs : parseMarkdownRefDefinitions(srcText);
   let linkedSameRepoNum = null;
-  const sanitizedForScan = String(text || "").replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_full, label, rawUrl) => {
-    const u = String(rawUrl || "").trim();
-    const issueUrlMatch = u.match(/^https?:\/\/([^/\s]+)\/([^/\s]+\/[^/\s]+)\/issues\/(\d+)(?:[/?#].*)?$/i);
+
+  const inspectResolvedLink = (label, rawUrl) => {
+    const cleanUrl = String(rawUrl || "").trim().replace(/^<|>$/g, "").split(/\s+/)[0] || "";
+    const issueUrlMatch = cleanUrl.match(/^https?:\/\/([^/\s]+)\/([^/\s]+\/[^/\s]+)\/issues\/(\d+)(?:[/?#].*)?$/i);
     if (issueUrlMatch && currentRepo) {
       const linkHost = issueUrlMatch[1].replace(/^\[|\]$/g, "").toLowerCase();
       const linkRepo = issueUrlMatch[2].replace(/\.git$/i, "").toLowerCase();
@@ -324,7 +356,30 @@ export function extractExplicitLocalIssueNumber(text, { currentHost = null, curr
     }
     // External or non-issue URL: strip `#<digits>` inside the link label so external `#42` never leaks!
     return String(label || "").replace(/#\d+\b/g, "");
+  };
+
+  // Remove reference definition lines themselves before scanning
+  let sanitizedForScan = srcText.replace(/^\s{0,3}\[([^\]]+)\]:\s*<?([^\s>]+)>?.*$/gm, "");
+  // 1) Inline Markdown links `[label](url)`
+  sanitizedForScan = sanitizedForScan.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_full, label, rawUrl) => inspectResolvedLink(label, rawUrl));
+  // 2) Full & collapsed reference-style Markdown links `[label][ref]` / `[label][]`
+  sanitizedForScan = sanitizedForScan.replace(/\[([^\]]+)\]\[([^\]]*)\]/g, (full, label, ref) => {
+    const key = normalizeMarkdownRefKey(ref || label);
+    if (!effectiveRefs.has(key)) {
+      // Unresolved reference link: strip `#<digits>` from bracketed reference label to fail closed
+      return String(label || "").replace(/#\d+\b/g, "");
+    }
+    return inspectResolvedLink(label, effectiveRefs.get(key));
   });
+  // 3) Shortcut reference links `[label]` when `label` matches a defined reference key
+  if (effectiveRefs.size > 0) {
+    sanitizedForScan = sanitizedForScan.replace(/\[([^\]]+)\](?![(\[])/g, (full, label) => {
+      const key = normalizeMarkdownRefKey(label);
+      if (!effectiveRefs.has(key)) return full;
+      return inspectResolvedLink(label, effectiveRefs.get(key));
+    });
+  }
+
   if (linkedSameRepoNum != null) return linkedSameRepoNum;
 
   const m = sanitizedForScan.match(/(?:^|[\s(\[])(?:\[#(\d+)\]|(?:issue|gh|gitea)\s*[:#]?\s*#(\d+)|(?:refs?|closes|fixes|resolves)\s+#(\d+))(?=$|[\s)\],.;:])/i);
@@ -336,16 +391,18 @@ export function extractExplicitLocalIssueNumber(text, { currentHost = null, curr
 /**
  * Parse sub-tasks from BACKLOG_DAG.md, MICRO_PLAN.md, or ROOT_CAUSE.md.
  * Hardened against code fences, checked-off `[x]` items, arbitrary `[bracket]` headings,
- * cross-repo `owner/repo#N` references, external Markdown links `[Issue #42](https://.../other/repo/issues/42)`,
+ * cross-repo `owner/repo#N` references, inline & reference-style external Markdown links,
  * prose `#N` false links, auto/explicit `T<n>` ID collisions, and short CJK titles.
  */
 export function parseBacklogTasks(markdown, { maxTasks = 20, currentHost = null, currentRepo = null } = {}) {
   if (typeof markdown !== "string" || !markdown.trim()) return [];
+  const docRefDefs = parseMarkdownRefDefinitions(markdown);
   const rawCandidates = [];
 
   const collectCandidate = ({ id = null, title, owner = null, existingNumber = null }) => {
     const cleanTitle = String(title || "")
       .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+      .replace(/\[([^\]]+)\]\[[^\]]*\]/g, "$1")
       .replace(/[*_`~]/g, "")
       .replace(/\s+/g, " ")
       .trim();
@@ -356,7 +413,7 @@ export function parseBacklogTasks(markdown, { maxTasks = 20, currentHost = null,
     const normId = id ? String(id).trim().replace(/\s+/g, "") : null;
     const num = (Number.isInteger(existingNumber) && existingNumber > 0)
       ? existingNumber
-      : extractExplicitLocalIssueNumber(title, { currentHost, currentRepo });
+      : extractExplicitLocalIssueNumber(title, { currentHost, currentRepo, refDefs: docRefDefs });
 
     const inferredOwner = owner || (/\b(backend|server|api|db|mysql|sql|python)\b|(?:后端|数据库|建表|迁移|接口)/i.test(cleanTitle)
       ? "backend"
@@ -497,11 +554,12 @@ export function parseIssueNumberFromOutput(text) {
  * Extract an already-created issue URL ONLY from trusted `stdout` (NEVER `stderr` diagnostics!),
  * requiring exact `host` and `owner/repo` match when known.
  */
-export function parseTrustedCreatedIssueUrl(stdout = "", { host = null, repo = null } = {}) {
+export function parseTrustedCreatedIssueUrl(stdout = "", { host = null, repo = null, requireRepo = false } = {}) {
   if (!stdout) return { number: null, url: null };
+  if (requireRepo && !repo) return { number: null, url: null };
   for (const rawLine of String(stdout).split(/\r?\n/)) {
     const line = rawLine.trim();
-    const m = line.match(/^(https?:\/\/[^\s"'<>]+\/issues\/(\d+))$/i);
+    const m = line.match(/^(https?:\/\/[^\s"'<>]+\/issues\/(\d+))\/?$/i);
     if (!m) continue;
     const urlStr = m[1];
     const num = Number(m[2]);
@@ -514,9 +572,12 @@ export function parseTrustedCreatedIssueUrl(stdout = "", { host = null, repo = n
       if (gotHost !== wantHost) continue;
     }
     if (repo) {
-      const wantSuffix = `/${String(repo).replace(/^\/+|\/+$/g, "").toLowerCase()}/issues/${num}`;
+      const wantPath = `/${String(repo).replace(/^\/+|\/+$/g, "").toLowerCase()}/issues/${num}`;
       const gotPath = parsedUrl.pathname.replace(/\/+$/, "").toLowerCase();
-      if (!gotPath.endsWith(wantSuffix)) continue;
+      if (gotPath !== wantPath && !gotPath.endsWith(wantPath)) continue;
+      // Reject extra leading path segments on standard github.com
+      const gotHost = parsedUrl.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+      if (gotHost === "github.com" && gotPath !== wantPath) continue;
     }
     return { number: num, url: urlStr };
   }
@@ -576,7 +637,8 @@ export function createIssueViaCli({
   let res = runCreate(true);
   // P1-07: Reconcile ALREADY-CREATED issue URL ONLY from trusted `stdout` matching exact host + owner/repo!
   // Never trust an external issue URL mentioned inside `stderr` error diagnostics!
-  const firstCreated = parseTrustedCreatedIssueUrl(res.stdout, { host, repo });
+  const mustHaveRepo = Boolean(repo) || (provider === "gh" && process.env.ORCA_ISSUE_ALLOW_LOCAL !== "1");
+  const firstCreated = parseTrustedCreatedIssueUrl(res.stdout, { host, repo, requireRepo: mustHaveRepo });
   if (firstCreated.url && firstCreated.number != null) {
     return {
       ok: true,
@@ -596,14 +658,43 @@ export function createIssueViaCli({
     const rawErr = res.stderr || res.stdout || res.error || "issue create failed";
     return { ok: false, number: null, url: null, error: sanitizeText(rawErr, { maxLen: 240 }) };
   }
-  const trustedUrl = parseTrustedCreatedIssueUrl(res.stdout, { host, repo });
-  const parsed = trustedUrl.number != null ? trustedUrl : parseIssueNumberFromOutput(res.stdout);
+  // P1-07: If stdout contains ANY HTTP(S) URL, it MUST pass strict host + owner/repo + /issues/<id>
+  // verification (NEVER fall back to a loose regex that accepts external repo URLs!).
+  const stdoutStr = String(res.stdout || "");
+  if (/https?:\/\/[^\s"'<>]+/i.test(stdoutStr)) {
+    const trustedUrl = parseTrustedCreatedIssueUrl(stdoutStr, { host, repo, requireRepo: mustHaveRepo });
+    if (!trustedUrl.url || trustedUrl.number == null) {
+      return {
+        ok: false,
+        number: null,
+        url: null,
+        raw: sanitizeText(stdoutStr, { maxLen: 240 }),
+        error: "created issue URL failed host/repository ownership verification",
+      };
+    }
+    return {
+      ok: true,
+      number: trustedUrl.number,
+      url: trustedUrl.url,
+      raw: sanitizeText(stdoutStr, { maxLen: 240 }),
+      error: null,
+    };
+  }
+  // Bare issue number output is ONLY accepted from `tea` (e.g. `#42` / `Index: 42`) when no URL is emitted
+  let bareNum = null;
+  if (provider === "tea") {
+    const tm = stdoutStr.match(/(?:^|\s|\|)#(\d+)\b|(?:^|\n)\s*Index\s*:\s*(\d+)\b/i);
+    if (tm) {
+      const n = Number(tm[1] || tm[2]);
+      if (Number.isInteger(n) && n > 0) bareNum = n;
+    }
+  }
   return {
-    ok: parsed.number != null,
-    number: parsed.number,
-    url: parsed.url,
-    raw: sanitizeText(res.stdout, { maxLen: 240 }),
-    error: parsed.number == null ? "could not parse issue number" : null,
+    ok: bareNum != null,
+    number: bareNum,
+    url: null,
+    raw: sanitizeText(stdoutStr, { maxLen: 240 }),
+    error: bareNum == null ? "could not parse verified issue URL/number" : null,
   };
 }
 

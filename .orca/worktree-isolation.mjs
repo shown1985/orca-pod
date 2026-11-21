@@ -209,14 +209,23 @@ function sampleFsEpochMtimeMs(dir) {
  * Bind the active `dispatchId` to `step.writes` in `.dispatch-gate-claims.json` immediately
  * upon worker launch so settlement verification can prove per-dispatch artifact ownership!
  */
+export function dispatchIsolatedArtifactRel(dispatchId, writes) {
+  const safeId = String(dispatchId || "").replace(/[^A-Za-z0-9._-]+/g, "_");
+  return `.dispatch-${safeId}/${writes}`;
+}
+
 export function bindStepArtifactDispatchClaim(wtDir, artDirRel, step, { dispatchId, taskId = null, fsEpochMtimeMs = null, clearedAtMs = null } = {}) {
   if (!step || !step.writes) return;
   const artDir = join(wtDir, artDirRel);
+  if (dispatchId) {
+    mkdirSync(join(artDir, `.dispatch-${String(dispatchId).replace(/[^A-Za-z0-9._-]+/g, "_")}`), { recursive: true });
+  }
   const claims = readGateClaims(artDir);
   claims[step.writes] = {
     stepId: step.id,
     writes: step.writes,
     activeDispatchId: dispatchId || null,
+    dispatchRelPath: dispatchId ? dispatchIsolatedArtifactRel(dispatchId, step.writes) : null,
     taskId: taskId || null,
     cleared: true,
     fsEpochMtimeMs: fsEpochMtimeMs ?? clearedAtMs ?? Date.now(),
@@ -260,6 +269,7 @@ export function clearStaleStepArtifact(step, wtDir, stepWtDir, artDirRel) {
     stepId: step.id,
     writes: step.writes,
     activeDispatchId: null,
+    dispatchRelPath: null,
     taskId: null,
     cleared: true,
     fsEpochMtimeMs,
@@ -311,20 +321,26 @@ export function syncInputsToIsolatedWorktree({ step, wtDir, stepWtDir, artDirRel
  * integration worktree's artifacts dir, preserving the source file's exact `mtime`
  * (never laundering a stale pre-dispatch file with a fresh copy timestamp!).
  */
-export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDirRel, minSourceMtimeMs = null }) {
+export function syncOutputsFromIsolatedWorktree({ step, stepWtDir, wtDir, artDirRel, minSourceMtimeMs = null, dispatchId = null }) {
   if (!stepWtDir || samePath(stepWtDir, wtDir)) return;
   const srcArt = join(stepWtDir, artDirRel);
   const dstArt = join(wtDir, artDirRel);
   mkdirSync(dstArt, { recursive: true });
-  for (const fname of [step.writes, step.progress].filter(Boolean)) {
+  const relCandidates = [step.writes, step.progress].filter(Boolean);
+  if (dispatchId && step.writes) {
+    relCandidates.push(dispatchIsolatedArtifactRel(dispatchId, step.writes));
+  }
+  for (const fname of relCandidates) {
     const src = join(srcArt, fname);
     if (!existsSync(src)) continue;
     try {
       const st = statSync(src);
-      if (fname === step.writes && minSourceMtimeMs != null && Number.isFinite(minSourceMtimeMs) && st.mtimeMs < minSourceMtimeMs) {
+      const isMainWrite = fname === step.writes || fname.endsWith(`/${step.writes}`);
+      if (isMainWrite && minSourceMtimeMs != null && Number.isFinite(minSourceMtimeMs) && st.mtimeMs < minSourceMtimeMs) {
         continue;
       }
       const dst = join(dstArt, fname);
+      mkdirSync(join(dst, ".."), { recursive: true });
       copyFileSync(src, dst);
       try { utimesSync(dst, st.atime, st.mtime); } catch {}
     } catch { /* best-effort */ }
@@ -484,9 +500,9 @@ export function prepareStepWorktree({
  * Record final commit SHA / dirty status and sync artifacts back to the
  * integration worktree AFTER agent config has been restored.
  */
-export function finalizeStepWorktree({ step, stepCtx, outcome, wtDir, artDirRel, isolatedState, minSourceMtimeMs = null }) {
+export function finalizeStepWorktree({ step, stepCtx, outcome, wtDir, artDirRel, isolatedState, minSourceMtimeMs = null, dispatchId = null }) {
   if (!stepCtx || !stepCtx.isolated) return;
-  syncOutputsFromIsolatedWorktree({ step, stepWtDir: stepCtx.dir, wtDir, artDirRel, minSourceMtimeMs });
+  syncOutputsFromIsolatedWorktree({ step, stepWtDir: stepCtx.dir, wtDir, artDirRel, minSourceMtimeMs, dispatchId });
   const artDir = join(wtDir, artDirRel);
   const manifest = readWorktreesManifest(artDir);
   const entry = isolatedState[step.id] || manifest.tasks[step.id] || {

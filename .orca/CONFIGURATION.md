@@ -1,758 +1,101 @@
-# Full configuration reference — Orca SDLC Flow Kit
+# Orca-Pod Configuration & CLI Reference
 
-All pipeline behavior lives in **`.orca/flow.config.json`**. `flow.mjs` just reads
-this file and executes it — you never edit the script. This document describes every
-config field, with examples for common situations.
-
-> You don't have to write this JSON by hand: `node .orca/designer.mjs` opens a
-> local visual editor for these files (create, edit, dry-run, scaffold new
-> projects). Comment (`"//"`) keys in existing files are preserved on edit.
+All pipeline behavior lives in `.orca/flow.config.json` (or any `--config <file>` such as `flow-hotfix.json`, `flow-feature.json`, `flow-epic.json`).
 
 ---
 
-## 1. Top-level structure
+## 1. Top-Level Fields
 
-```jsonc
-{
-  "artifactsDir": ".orca/artifacts",   // where step outputs are stored
-  "maxRetries": 2,                      // default retry budget per onFailGoto loop (a step's own "maxRetries" overrides)
-  "autoRun": true,                      // fully automatic (default): no questions, no gates
-  "defaults": { "timeoutMs": 900000 },  // default per-step timeout (ms)
-  "pipeline": [ /* list of steps, run in array order */ ]
-}
-```
-
-| Field | Type | Required | Meaning |
-|-------|------|----------|---------|
-| `artifactsDir` | string | no (default `.orca/artifacts`) | Folder holding the artifact files steps write |
-| `maxRetries` | number | no (default 2) | Default cap on how many times a `fail -> onFailGoto` pair may loop before stopping; a step's own `maxRetries` overrides it for that step's loop |
-| `autoRun` | boolean | no (default `true`) | `true` = fully automatic: every step's spec carries an autonomy directive (never ask the user, decide and record assumptions in the artifact) and `gate` flags are ignored. `false` = manual mode: agents may ask questions and steps with `gate:true` block on an approval gate. In auto-run, claude agents also start with permission bypass (`--permission-mode bypassPermissions`) so their terminal never waits for an approval — Claude Code asks you to accept bypass mode once per machine on first use (see the README's troubleshooting); manual mode keeps default prompting. |
-| `defaults.gateTimeoutMs` | number | no (default 3600000 = 60 min) | Manual mode only: how long to wait for a decision gate to be resolved before continuing anyway |
-| `defaults.timeoutMs` | number | no (default 900000 = 15 min) | Max worker **silence** (no terminal output, no heartbeat). Silence is NOT a failure verdict: a worker deep in one long tool call can look quiet for most of an hour. A quiet-but-alive dispatch is waited on (with a warning) until it settles or the hard cap hits; only a positive failure (dispatch failed / worker report) fails the step |
-| `defaults.hardTimeoutMs` | number | no (default 4x `timeoutMs`) | Absolute per-step cap; on hit the worker's terminal is left open and the flow stops with a `--from` resume hint |
-| `defaults.warmupTimeoutMs` | number | no (default 240000 = 4 min) | How long to wait for a freshly created agent TUI to become idle before dispatching into it (prevents `agent_prompt_stalled` on slow boots) |
-| `defaults.startGraceMs` | number | no (default 90000) | After delivering a prompt, how long to watch the TUI for proof it was consumed before re-sending (some TUIs drop input pasted during boot) |
-| `defaults.sendAttempts` | number | no (default 3) | Max prompt deliveries into a warmed terminal before falling back to a cold `worker-start` |
-| `defaults.readinessRetries` | number | no (default 3) | How many times the readiness gate may re-run a producing step whose artifact is missing or undersized before stopping the run |
-| `defaults.readinessMinBytes` | number | no (default 200) | Minimum artifact file size for a step's `writes` to count as ready input for its consumers |
-| `defaults.nudgeRetries` | number | no (default 0 = off) | Nudge budget per step per dispatch (per-step `nudgeRetries` overrides); nudging is opt-in — set > 0 to enable (see "Nudge" section) |
-| `defaults.nudgeTimeoutMs` | number | no (default 120000) | Idle threshold / post-nudge wait in ms (per-step `nudgeTimeoutMs` overrides; see "Nudge" section) |
-| `defaults.worktree` | string | no (default: auto-detect from the invoking directory) | Worktree selector where agents run. Leave unset for auto-detect (recommended — works whenever the flow is launched from inside an Orca-managed worktree). Pin (`name:lab2`, `path:C:\\...`) only when launching from OUTSIDE the target worktree. Per-run override: `--worktree <selector>`; per-machine: `ORCA_FLOW_WORKTREE` env. Precedence: flag > env > config > auto-detect. A pinned selector is validated before the run starts — a wrong pin fails fast with the available worktrees listed. |
-| `defaults.autoCreateWorktree` | boolean | no (default `false`) | When worktree auto-detect fails: `true` = create a new worktree (`flow-<slug>-<timestamp>`, based on current HEAD, uncommitted changes do not follow) and run there without asking; `false` = ask `[y/N]` at the terminal when interactive, fail with a hint otherwise. Never creates during `--dry-run` / `--status-preview`. Per-run opt-in: `--create-worktree` |
-| `defaults.model` | string | no (default `"default"`) | Pipeline-wide model for every step; a step's own `model` overrides it. `"default"`/missing = keep each agent's own default model (no flag passed). See `model` under Step structure |
-| `defaults.openStatus` | boolean | no (default `true`) | Auto-open the run's live status page (`status.html` in the worktree's artifacts dir) in your browser when a real run starts. Dry-runs never write or open it. Per-run off-switch: `--no-open-status` (flag wins over config) |
-| `pipeline` | array | **yes** | The steps; **array order = run order** |
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `artifactsDir` | string | `".orca/artifacts"` | Relative artifact directory inside the active worktree |
+| `maxRetries` | int >= 0 | `2` | Global `onFailGoto` retry cap (overridable per step) |
+| `autoRun` | boolean | `true` | `true`: unattended autonomy & ignore `gate`; `false`: allow `interactive` & `gate` |
+| `defaults` | object | `{}` | Shared defaults for timeout, worktree, branch policy, health, nudge, mergeDanger |
+| `skills` | object | `{}` | Named skill registry (`{ path }` or `{ description, prompt }`) |
+| `mcp` | object | `{}` | Named MCP server registry (`{ command, args, env }` or `{ url, headers }`) |
+| `pipeline` | array | required | Ordered list of step objects |
 
 ---
 
-### Readiness gate (missing/incomplete inputs)
+## 2. `defaults` Knobs
 
-Before a step launches, the flow checks every one of its **declared** `reads`:
-the artifact file must exist in `artifactsDir` and be at least
-`defaults.readinessMinBytes` (200 bytes) — this catches both "the earlier run
-never produced it" (`--from`/`--only` resumes) and "the step reported success
-but wrote an empty file". If an input is unready, the flow asks at the
-terminal — even in auto-run, because this is input safety, not agent autonomy
-(piped/CI stdin with EOF counts as "no"). Answer `y` to re-run each missing
-producing step now (up to `defaults.readinessRetries` attempts, then the run
-stops); answer `n` (or just Enter) to stop immediately with the exact
-`--from <step>` command that regenerates the missing input. Repair is
-transitive: if a missing producer itself has missing inputs, the whole chain
-is re-generated in pipeline order first.
-Reads of `enabled: false` steps are exempt — a disabled step's output is an
-optional input that the config contract auto-removes (see section 2).
-
-### Nudge (auto-retry for missing artifacts)
-
-When a worker finishes — or stalls — without writing its declared artifact,
-the flow nudges that worker's own terminal to write it, reusing the warm
-session instead of paying a full re-dispatch. Nudging ships DISABLED
-(`nudgeRetries: 0` everywhere by default, all shipped pipelines included) —
-enable per step or via `defaults` by setting `nudgeRetries` > 0.
-
-| Field | Default | Meaning |
-|---|---|---|
-| `nudgeRetries` | `0` (off) | total nudge budget per step per dispatch (both triggers share it); nudging ships DISABLED — set > 0 at `defaults` or on a step to enable |
-| `nudgeTimeoutMs` | `120000` | mid-run: how frozen + heartbeat-stale before a nudge; post-done: how long to wait for the file after each nudge |
-
-Both accept per-step overrides (`step.nudgeRetries`, `step.nudgeTimeoutMs`),
-validated at load (non-negative integers; the timeout must be positive).
-
-Two triggers:
-- **Mid-run** — preview frozen >= `nudgeTimeoutMs` AND dispatch heartbeat stale >= `nudgeTimeoutMs` (fallback: frozen preview alone when the host reports no heartbeat), artifact missing, no `worker_done` yet. Sends "your response appears truncated — write your complete output to <path> now".
-- **Post-settlement** — `worker_done` arrived but the artifact is missing. Sends "your session completed but the output file was not written — write it to <path> now" and keeps the terminal open.
-
-"Missing" reuses the readiness definition: file absent or `< readinessMinBytes`.
-
-Outcome rules: file recovered -> the step settles with the worker's original
-outcome (note `artifact recovered via nudge (N sent)`); budget exhausted
-during the post-done wait -> `failed` (`artifact missing after N nudge(s)`);
-hard cap during the post-done wait -> `failed` (`artifact still missing after
-hard cap`), flowing into `onFailGoto` fix loops or the `--from` resume hint.
-Structurally-remedyless paths keep the original outcome with an
-`artifact missing (...)` note — `(nudge disabled)`, `(nudge undeliverable)`
-(the budget closed with zero nudges delivered — a mid-run send failure),
-`(nudge send failed)` (the post-done send itself failed), `(no terminal to
-nudge)`, or `(terminal parked on <label>)` — the consumer-side readiness
-gate remains the safety net there.
-Mid-run nudges never fail a step by themselves; an exhausted mid-run budget
-just resumes legacy wait semantics.
-
-Safety: a terminal parked on a permission / folder-trust / update dialog is
-NEVER nudged — on either trigger the flow checks the rendered preview first
-and never types into a dialog only a human may answer.
-
-Manual-mode `interactive` steps (interviews) sit quiet for minutes by design;
-the double idle-evidence gate usually excludes them, but for such steps
-consider a per-step `nudgeTimeoutMs` raise or `nudgeRetries: 0`.
-
-### Run history (per-run snapshots)
-
-Every NEW run snapshots the previous run's flat artifacts into
-`<worktree>/<artifactsDir>/runs/<seq>-<timestamp>/` before its own steps write
-anything — a **copy**, not a move: the flat files stay in place, so readiness
-checks and `--from` resumes see exactly what they always did. Each folder holds
-that run's artifact files plus its `status.js`, which records the objective,
-the per-step outcomes and the token usage — two runs can therefore be compared
-side by side, long after the second one overwrote the first. The snapshots sit
-under `artifactsDir`, so the usual `.gitignore` entry (`.orca/artifacts/`)
-already covers them; nothing is pruned automatically — delete folders you no
-longer need. Snapshot (copy) failures warn and never block a run.
-
-## 2. Step structure
-
-```jsonc
-{
-  "id": "coding",                // unique identifier, used for references
-  "title": "Coding",             // display name in logs
-  "enabled": true,               // false = SKIP this step
-  "agent": "codex",              // agent that runs the step
-  "writes": "CHANGES.md",        // artifact filename this step writes (in artifactsDir)
-  "progress": "TASKS.md",        // (optional) task-checklist file this step keeps updated
-  "reads": ["detailed-design"],  // ids of steps whose output this step needs
-  "spec": "...{reads}...{out}...",// prompt given to the agent
-  "onFailGoto": "coding",        // (optional) loop back here on outcome=failed
-  "maxRetries": 20,              // (optional) retry budget for THIS step's onFailGoto loop (overrides global)
-  "parallelWith": "",            // (optional) id of an EARLIER step to run concurrently with
-  "gate": false,                 // (optional) true = wait for approval after the step
-  "model": "default",            // (optional) "default"/missing = agent's own model; else passed as --model
-  "effort": "",                  // (optional) cold-start fallback only; requires model
-  "timeoutMs": 1800000,           // (optional) override max-silence for this step
-  "hardTimeoutMs": 7200000,      // (optional) absolute cap for this step (default 4x timeoutMs)
-  "skills": ["commit-style"],     // (optional) skill registry names this step may use
-  "mcp": ["github"]               // (optional) mcpServers registry names this step connects to
-}
-```
-
-### Field details
-
-**`id`** — unique across the whole pipeline. Other steps reference this step by its
-`id` (in `reads` and `onFailGoto`). Rename the `id` and you must update everything
-that points to it.
-
-**`title`** — display only, appears in `[orca-flow]` logs. Anything goes.
-
-**`enabled`** — `true` to run, `false` to **skip**. A skipped step is automatically
-removed from later steps' `reads`, so the chain doesn't break (see section 4).
-
-**`agent`** — any CLI agent from Orca's catalog — Orca supports any agent
-that runs in a terminal. Tested values:
-`claude`, `codex`, `opencode`, `gemini`, `cursor`, `grok`, plus `kiro-cli`
-(Kiro's terminal chat — verified end-to-end through the flow's terminal
-dispatch path; needs `kiro-cli` on PATH and logged in via `kiro-cli login`.
-Unlike the catalog agents it cannot use the cold-start `worker-start` fallback,
-and flags may be appended, e.g. `"kiro-cli --trust-all-tools"` for unattended runs).
-(Confirm the catalog for your Orca build with `orca skills get orchestration --full`.)
-
-A `"claude ..."` value with extra CLI flags (e.g. `"claude --model haiku"`) is supported: the flow keeps your flags and adds its own wrap — in auto-run it also appends the permission bypass unless you already set a permission flag yourself, and a model flag in the string wins over the config's `model` (the flow never appends its own). Keep flag values free of quotes and `%` signs; the string is passed through the Windows command wrap verbatim.
-
-**`writes`** — filename (no path) the step writes its output to. The full path is
-`artifactsDir + "/" + writes`. This is what later steps read back.
-
-**`progress`** — (optional) filename (no path) of a Markdown task checklist the
-step's agent maintains inside `artifactsDir` (e.g. `TASKS.md`). While the step
-runs, the orchestrator polls the file and renders every checkbox line on the
-live status page: `- [ ]` not started, `- [~]` in progress, `- [x]` done
-(a 2+ space indent marks a sub-task). **Display only** — it never affects step
-outcomes, retries or liveness. The step's `spec` must tell the agent to write
-the file and keep it current; use the `{tasks}` placeholder in the spec to
-reference the path (substituted like `{out}`). The shipped configs' coding
-steps (`TASKS.md` / `FIX_TASKS.md` / `CR_TASKS.md`) contain ready-to-copy wording. A missing
-or malformed checklist is ignored silently — the run is never affected.
-
-**`reads`** — array of step `id`s this step depends on. The orchestrator turns it
-into a list of input files and injects it into `{reads}` in the spec. A step with
-`reads: []` is a starting step (relies only on the objective you pass in).
-
-**`spec`** — the prompt given to the agent. Three placeholders are substituted:
-- `{out}` -> the path this step must write (from `writes`).
-- `{reads}` -> a list of "Step title (file-path)" for the enabled inputs.
-- `{tasks}` -> the path of the step's task-checklist file (from `progress`; only
-  substituted when the step declares one).
-
-The orchestrator also prepends `OVERALL OBJECTIVE: <objective>` to every spec, so
-the agent always knows the overall goal regardless of where the step sits.
-
-**`onFailGoto`** — (optional) the `id` of an earlier step. When the current step
-returns `outcome=failed`, the orchestrator loops back to that step to fix things,
-then resumes. Set to `null` or omit to disable. Loop count is bounded by this
-step's `maxRetries` when set — declare it here, on the failing step, not on the
-step it jumps back to — else the global `maxRetries` (default 2). A budget
-of `0` means the first failure stops the run (fail fast, never loop). With a
-per-step budget declared, `--dry-run` shows the loop as `onFail-><id> xN`.
-
-**`parallelWith`** — (optional) id of an **earlier** step this step runs **concurrently**
-with. Both start together as one group; the first step *after* the group waits for
-every member (join barrier) — typically a step that `reads` both, like `coding`
-reading the two design docs. Rules (validated at startup and by `--dry-run`):
-
-- The target must exist, be enabled, and appear earlier in the `pipeline` array.
-- The group must be **contiguous**: every step declaring `parallelWith` against the
-  target sits immediately after it. No chains (the target itself must not declare
-  `parallelWith`). A group may hold more than two members.
-- Members must be **independent**: no member may `reads` another member.
-- `interactive` steps cannot join a group in manual mode (two simultaneous
-  terminal interviews would interleave).
-- If `--only`/`--from` drops the target from the run, the member runs sequentially
-  (warning, not an error) — the resume story is unchanged: `--from uiux-design`
-  picks up an existing `DETAILED_DESIGN.md` via section 4's artifact-exists rule.
-
-Failure semantics: outcomes are handled after the whole group settles, in array
-order. A hard-capped member settles as still-running (terminal left open) and the
-flow stops with the usual `--from` resume hint; a `failed` member follows the
-normal `onFailGoto` rules — note a retry re-runs the target's **whole group**.
-Settlement is per-task (`dispatch-show --task`), so concurrent workers cannot be
-confused for each other. The status page marks group members with a `∥ parallel`
-chip.
-
-**`gate`** — (optional) `true` means that after the step finishes, the orchestrator
-creates a **decision gate** and prints a `gate-resolve` command; the pipeline waits
-until you approve "yes" before continuing. Use for milestones needing human sign-off.
-**Effective only in manual mode** (`"autoRun": false`) — with the default
-`autoRun: true` gates are ignored so the pipeline runs unattended.
-
-**`interactive`** — (optional) `true` makes the step an **interview** in manual
-mode (`autoRun: false`): the agent asks you questions in its terminal — one at a
-time, mostly multiple choice — to align on decisions before writing its artifact,
-then confirms a numbered DECISIONS list with you. The shipped config marks
-Architecture Design this way; the interview covers functional and non-functional
-requirements, performance, security, scalability, database/persistence, technology
-constraints, and deployment. Timeouts are raised automatically (60 min silence /
-4 h hard) because the terminal idles while waiting for your answers. Like `gate`,
-it is **ignored when `autoRun: true`** — the step then runs fully autonomously
-and records its assumptions in the artifact instead.
-
-**`model`** — (optional) model for this step's agent, as a string. Resolution:
-`step.model` if set, else `defaults.model` (pipeline-wide). The value
-`"default"` — also missing or empty — means **use the agent's own default
-model: nothing is passed to the CLI** (this is the default configuration).
-Any other value is passed as `--model <value>` when the TUI is launched (the
-manual dispatch path) and as `--model` to Orca's `worker-start` on the
-cold-start fallback. A model flag already inside the `agent` string (e.g.
-`"claude --model haiku"`) always wins — the config never duplicates or
-overrides it. `kiro-cli` has no model selection: a non-default model there is
-ignored with a warning. The dry-run plan shows the effective model as
-`model=<name>` on each step line.
-
-**`effort`** — (optional) passed as `--effort` on the cold-start fallback
-(`worker-start`) only; requires `model`.
-
-**`timeoutMs`** — (optional) override `defaults.timeoutMs` for this step. This is the
-**max-silence** budget: the orchestrator waits in slices and keeps waiting as long as
-the worker shows activity (terminal output or heartbeats). A coding run that stays
-busy for an hour is waited on; a worker that goes quiet for `timeoutMs` is reported
-as hung.
-
-**`hardTimeoutMs`** — (optional) absolute cap for a busy-but-endless worker (default
-`4 x timeoutMs`). On hit, the step's terminal is **left open** so it can finish, and
-the flow stops with the exact `--from` command to resume once the artifact is written.
-
-**Parked prompts.** `bypassPermissions` does not bypass the machine's own
-`permissions.ask` rules, and folder-trust / CLI-update dialogs stop a worker the same
-way. The orchestrator recognizes the known dialog texts on a frozen agent screen, logs
-it once per step and shows a "parked" note on the status page — it never answers the
-prompt itself (the note survives into the final status when the hard cap stops the run).
-Accept the folder-trust dialog once per repo before unattended runs.
+| Field | Default | Description |
+| --- | --- | --- |
+| `timeoutMs` | `900000` | Silence warning threshold per step (ms) |
+| `hardTimeoutMs` | `4 * timeoutMs` | Absolute per-step runtime cap before stopping cleanly (`still-running`) |
+| `worktree` | `null` | Pin an Orca worktree selector (`name:...` or `path:...`); `null` = auto-detect |
+| `autoCreateWorktree` | `false` | Automatically create `flow-<slug>-<stamp>` when auto-detect fails |
+| `model` | `"default"` | Default model (`"default"` lets each CLI use its own default model) |
+| `targetBranch` | `"dev"` | Release target branch (must NOT be in `protectedBranches`) |
+| `protectedBranches` | `["main","master"]` | Protected branches verified untouched by closeout & merge guard |
+| `readinessRetries` | `3` | Max producer repair attempts when a declared input artifact is missing |
+| `readinessMinBytes` | `200` | Minimum byte size for a valid artifact |
+| `nudgeRetries` | `0` | Automated nudge attempts for missing artifacts (`0` = disabled) |
+| `nudgeTimeoutMs` | `120000` | Idle/post-done wait before sending a nudge (ms) |
+| `openStatus` | `true` | Auto-open `status.html` in default browser on run start |
+| `turnStartWindowMs` | `120000` | Window before warning on `turnStart=unobserved` |
+| `turnStartEscalateMs` | `600000` | Window before cleanly stopping an unobserved dispatch |
+| `ledgerHome` | OS data dir | Custom out-of-repo ledger root (must be outside any git repo) |
+| `mergeDanger` | built-in | Threshold overrides (`maxFiles`, `maxLines`, `extraOneWayPatterns`) |
 
 ---
 
-## Skills & MCP servers
+## 3. Step Fields
 
-Give a step's agent extra capabilities without hard-coding them in the spec:
-
-```jsonc
-{
-  "skills": {
-    "commit-style": { "path": "skills/commit-style" },                  // OR inline:
-    "review-checklist": { "description": "...", "prompt": "..." }
-  },
-  "mcpServers": {
-    "github": { "command": "npx", "args": ["-y", "@mcp/github"],
-                "env": { "GITHUB_TOKEN": "${env:GITHUB_TOKEN}" } },     // stdio
-    "docs":   { "url": "https://mcp.example.com/sse",
-                "headers": { "Authorization": "Bearer ${env:MCP_TOKEN}" } }  // remote
-  },
-  "pipeline": [
-    { "id": "coding", "agent": "claude", "skills": ["commit-style"], "mcp": ["github"], "...": "..." }
-  ]
-}
-```
-
-**How it reaches the agent.** Before each run-order group launches, the flow
-writes harness-standard files into the WORKTREE (and removes them afterwards —
-a crashed run is cleaned up by the next one):
-
-| agent    | MCP                                | skills                                  |
-|----------|------------------------------------|-----------------------------------------|
-| claude   | `.mcp.json`                        | `.claude/skills/<name>/SKILL.md`        |
-| cursor   | `.cursor/mcp.json`                 | `.cursor/rules/<name>.mdc`              |
-| gemini   | `.gemini/settings.json` (merged)   | `GEMINI.md` (marked section)            |
-| opencode | `opencode.json` (merged, `mcp` key)| `AGENTS.md` (marked section)            |
-| codex    | not supported (warn + skip)        | `AGENTS.md` (marked section)            |
-
-Rules:
-
-- A skill entry has either `path` (relative to `.orca/`, a SKILL.md folder or a
-  single `.md`) or inline `description` + `prompt` — never both.
-- An mcp server has either `command` (stdio) or `url` (remote) — never both.
-- `${env:NAME}` inside mcp `command`/`args`/`env`/`url`/`headers` is expanded
-  when the file is written; an unset variable warns and becomes `""`.
-- Parallel steps share the worktree, so their refs are UNIONED into one file.
-- Files that already exist in the worktree are merged (JSON) or appended to
-  (markdown, between `<!-- orca-agent-config BEGIN/END -->` markers) and restored
-  verbatim afterwards. A pre-existing `.claude/skills/<name>/` folder is kept,
-  never overwritten.
-- Unknown agents (anything not in the table) get a warn and no files — the run
-  is never killed for it.
-- Refs are validated for the steps in THIS run (`--only`/`--from`/disabled
-  steps are checked whenever they actually run).
+| Field | Description |
+| --- | --- |
+| `id` / `title` / `enabled` | Unique identifier, display label, and toggle |
+| `agent` / `model` / `effort` | Agent CLI ID (`agy`, `codex`, `claude`, `opencode2`, `zcode`, etc.), optional model & effort |
+| `writes` / `reads` / `progress` | Output artifact filename, upstream step IDs, optional checklist filename (`TASKS.md`) |
+| `parallelWith` | Run concurrently with an earlier contiguous step ID (flat groups only) |
+| `isolatedWorktree` | `true`: provision an isolated git worktree & branch per parallel worker |
+| `onFailGoto` / `maxRetries` | Target step ID to loop back to on definite `failed` outcome |
+| `gate` / `interactive` | Manual-mode approval gate / interview protocol (when `autoRun: false`) |
+| `skills` / `mcp` | Arrays of registry names materialized into the step's worktree and restored afterward |
+| `verify` | Hard gate checks: `{ requireVerdict: "PASS", requireContractCommit: true, requireMergedTasks: true, mergeDangerCheck: true }` |
+| `spec` | Prompt template supporting `{out}`, `{reads}`, `{tasks}`, `{targetBranch}`, `{protectedBranches}`, `{worktreesManifest}`, `{mergeDangerReport}` |
 
 ---
 
-## 3. Recipe catalog
+## 4. Pre-Development Scan & Strategy Setup
 
-### 3.1. Skip one or more steps
-Set `enabled: false`. Don't delete the step — leave it, disable it, re-enable later.
-
-```jsonc
-{ "id": "uiux-design",  "enabled": false, /* ... */ },
-{ "id": "documentation","enabled": false, /* ... */ }
-```
-
-### 3.2. Change a step's agent (permanent)
-```jsonc
-{ "id": "coding", "agent": "claude", /* ... */ }
-```
-Temporary override for one run, no file edit:
-```
-node .orca/flow.mjs --agent coding=claude "..."
-```
-
-### 3.3. Pin project tools WITHOUT hard-coding the kit
-The kit is stack-agnostic by default. If this project needs specifics, just add a
-sentence to the `spec`:
-```jsonc
-{
-  "id": "testing",
-  "spec": "You are a testing agent. Based on {reads}, write and run tests for the changes. This project uses <your test framework>. Write {out}: ... If any test fails, report outcome=failed."
-}
-```
-Because you edit config, not the script, each project keeps its own config while the
-kit stays reusable.
-
-### 3.4. Add a new step (e.g. Performance Test)
-Insert an entry into `pipeline` at the right position, and update the `reads` of any
-step that should read it:
-```jsonc
-{
-  "id": "performance",
-  "title": "Performance Test",
-  "enabled": true,
-  "agent": "opencode",
-  "writes": "PERF_REPORT.md",
-  "reads": ["coding", "testing"],
-  "onFailGoto": "coding",
-  "spec": "You are a performance testing agent. Based on {reads}, measure the main paths and find bottlenecks. Write {out}: method, metrics, bottlenecks, recommendations. If it exceeds the acceptable threshold, report outcome=failed to loop back to coding."
-}
-```
-
-### 3.5. Reorder steps
-Just move entries within the `pipeline` array. Remember the rule: a step should only
-`reads` steps that come **before** it. If reordering breaks that, the orchestrator
-still runs but an input may not exist yet.
-
-### 3.6. Insert an approval gate at a milestone
-```jsonc
-{ "id": "architecture", "gate": true, /* ... */ }
-```
-After Architecture finishes, the pipeline pauses for your approval before Detailed Design.
-
-### 3.7. Disable a step's fix loop
-Set `"onFailGoto": null`. When the step fails, the pipeline stops instead of looping back.
-
-### 3.8. Give the coding step more time
-`timeoutMs` is max silence, so a busy coder is already waited on indefinitely up to
-its hard cap. Raise the cap when a full implementation legitimately runs long:
-```jsonc
-{ "id": "coding", "hardTimeoutMs": 7200000 /* 2 h */ }
-```
-
-### 3.9. Run two steps at the same time
-Independent steps that both depend on the same input can run concurrently — the
-shipped config does this twice: the two design passes (both read Architecture;
-Coding waits for both) and the two reviews (both read Coding; Testing waits
-for both):
-```jsonc
-{ "id": "uiux-design",     "parallelWith": "detailed-design", /* ... */ }
-{ "id": "security-review", "parallelWith": "code-review",     /* ... */ }
-```
-Saves the length of the shorter step; verify the grouping with `--dry-run`.
-When one member of a parallel group FAILs, the `onFailGoto` retry re-runs the
-whole group — a fix can disturb either review, so both look again.
-To skip one member of a parallel pair (`enabled:false`), also remove the pair's
-`parallelWith` line — the loader dies if the line points at the disabled
-member; skipping the member that carries the line degrades to sequential.
-
----
-
-## 4. Skip auto-shrinks dependencies (important)
-
-When a step is `enabled:false` (or excluded by `--only`/`--from`), the orchestrator
-**automatically filters it out of every later step's `reads`** — **unless its artifact
-file already exists in the worktree**. That exception is what makes `--from <id>` a
-true resume: `--from coding` keeps pointing the coder at `DETAILED_DESIGN.md` /
-`UIUX_MOCKS.md` produced by an earlier run. Example — disabling `security-review`
-before it ever ran:
-
-- Before: `testing.reads = ["coding","code-review","security-review"]`
-- After: `testing.reads = ["coding","code-review"]`
-
-You do **not** need to edit other steps' `reads` when skipping — the orchestrator
-handles it. Always verify with `--dry-run` to see the effective `reads` after filtering.
-
----
-
-## 5. Command-line flags (complement the config)
-
-| Flag | Effect | Example |
-|------|--------|---------|
-| `--dry-run` | Print the pipeline, do NOT call agents | `node .orca/flow.mjs --dry-run "x"` |
-| `--config <file>` | Use another pipeline config (default `flow.config.json`) | `--config fixbug.config.json` |
-| `--worktree <selector>` | Pin the worktree for this run (default: auto-detect from the invoking directory) | `--worktree name:lab2` |
-| `--create-worktree` | If worktree auto-detect fails, create a new Orca-managed worktree (`flow-<objective-slug>-<timestamp>`, based on current HEAD) and run the pipeline in it — same as `defaults.autoCreateWorktree: true`, for this run only. No effect when a worktree is pinned or auto-detect succeeds; never fires during `--dry-run` | `--create-worktree "x"` |
-| `--from <id>` | Start from a step, drop earlier ones | `--from coding` |
-| `--only a,b,c` | Run only the listed steps | `--only planning,architecture` |
-| `--new` | Skip the startup run chooser, always start a NEW run (the run-history archive of the previous run still happens; see section 5.5) | `--new "x"` |
-| `--agent <id>=<agent>` | Override one step's agent, this run only | `--agent coding=claude` |
-| `--grill-me` | Enable the `grill` step for this run (see section 5.2) | `--grill-me --only grill` |
-| `--no-grill-me` | Disable the `grill` step for this run (see section 5.2) | `--no-grill-me` |
-| `--no-open-status` | Do not auto-open the live status page for this run (see section 5.3) | `--no-open-status` |
-| `--status-preview` | Write a fixture status page (`.orca/status-preview/`) showing every state — dev aid, no run, no agents. Refused when combined with an objective / `--only` / `--from` / `--agent` (before v1.0.1 that mix silently skipped the pipeline with no agent spawned) | `node .orca/flow.mjs --status-preview` |
-
-Flags affect only that run; they are not written to the config. `enabled:false` in
-config is always respected, even if that step is listed in `--only`. (Exception:
-`--grill-me` / `--no-grill-me` explicitly override the `grill` step — see section 5.2.)
-
-### 5.1. Multiple pipelines
-
-Any config file in `.orca/` can define a pipeline — same schema, selected with
-`--config`. The kit ships three:
-
-- `flow.config.json` — full SDLC (default, no flag needed).
-- `fixbug.config.json` — bug-fix flow: Root Cause Analysis (claude) -> Fix Plan
-  (claude) -> Bug Fix incl. regression test (codex) -> Fix Verification against
-  the original reproduction (opencode; fail loops back to the fix).
-- `cr.config.json` — change-request (maintenance) flow: Impact Analysis on the
-  existing code (claude) -> CR Plan with acceptance criteria (claude) -> CR
-  Coding (codex) -> Code Review (claude) -> Testing incl. regression (opencode)
-  -> Acceptance Verification against the criteria (opencode; review/test/verify
-  fail loops back to the coding step).
-
-```
-node .orca/flow.mjs --config fixbug.config.json "<bug: what happens, expected, how to reproduce>"
-node .orca/flow.mjs --config cr.config.json "<the change request: what changes and why>"
-```
-
-Pass the complete bug context as the objective — the RCA step reproduces from it.
-For a CR, pass the full request — the impact-analysis step reads the codebase
-against it.
-
-### 5.2. The `grill` step and `--grill-me` / `--no-grill-me`
-
-`--grill-me` enables the step whose `id` is exactly `grill` (the shipped
-requirements-interview step) for this run; `--no-grill-me` disables it. Both are
-shorthands for flipping that step's `enabled` field. Because the override is
-applied before `--only` / `--from` are processed:
-
-- `--grill-me --only grill,planning` works (the override lands before subsetting — argv order is irrelevant).
-- `--from planning` still skips the interview — a resume must not restart it.
-- When `grill` is skipped, section 4's artifact-exists exception still feeds Planning an existing `BRAINSTORM.md` — see the README's Grill-me section for when to refresh that file.
-- If the config has no step with id `grill`, the flag fails with a clear error.
-- The two flags are mutually exclusive.
-- Renaming the step's `id` breaks the flags — keep the id `grill`.
-
-The shipped `grill` step carries large `timeoutMs` (60 min = `3600000`) /
-`hardTimeoutMs` (4 h = `14400000`): the agent terminal is idle while it waits
-for a HUMAN to answer, and the 15-min default would report the step hung
-mid-interview. Tune them only upward for longer interviews. A single question
-left unanswered past `timeoutMs` stops the flow with the interview terminal
-left open — restart the interview with `--grill-me --from grill "<objective>"`.
-
-### 5.3. The live status page
-
-Every real run writes a self-updating dashboard next to the artifacts:
-
-- `<worktree>/<artifactsDir>/status.html` — open it in any browser; it refreshes itself every 2 seconds (works straight from disk — no server, no ports).
-- `<worktree>/<artifactsDir>/status.js` — the snapshot the page reads; rewritten by the orchestrator at every step event.
-- `<worktree>/<artifactsDir>/<writes>.js` — one JSONP snapshot per step artifact (`<writes>` + `.js`, e.g. `PLAN.md` → `PLAN.md.js`), written at run start for files that already exist, refreshed while the step runs, finalized when it settles.
-
-It shows the objective with an overall badge (RUNNING / DONE / FAILED / UNKNOWN / STILL RUNNING — "still running" means the flow stopped with a step's terminal left open; resume with `--from`) and a progress bar in a header card, then a two-pane body. **Left — the pipeline rail:** a vertical timeline with a dot per step (green done, amber pulsing running, red failed, gray pending, struck-through skipped) showing agent, duration and chips — `∥` marks parallel-group members (bracketed in purple), `attempt 2` retries, `NEXT` the upcoming step, `gate open` approval waits. **Right — detail cards:** the step(s) **running now** with big live elapsed timers and notes (quiet-but-alive warnings, fix-from-review), **up next**, the **Tasks card** for steps that declare a `progress` checklist — per-task `○` queued / `◐` in progress / `✓` done, read straight from the file the step's agent ticks as it works — and the **artifact list** (✓ once its step succeeded; a failed run names the failed step and the exact `--from` command to resume). Steps excluded by `enabled:false`, `--only` or `--from` render as SKIPPED, except when a previous run's history (same config) exists in the same worktree: the page then merges it, so a `--from` resume shows one continuous picture (durations of earlier steps included).
-
-**Artifact viewer:** every step row that declares a `writes` file (and every artifact chip) is clickable — the right pane switches to that Markdown file rendered as styled preformatted text (no Markdown rendering), with the file size, a freshness line and the owning step's status. The page lazy-loads the file through the same `file://` script trick as `status.js`, and keeps re-reading it every 2 seconds while the step is still running (live tail); once the step settles, the content is final. `Esc` or "← back to overview" returns to the normal pane. Like everything on the page this is display-only, and it fails open: if a snapshot cannot be written, the viewer is disabled for that run while the page and the pipeline continue untouched.
-
-The page opens automatically when the run starts (`explorer.exe` on Windows, `open` on macOS, `xdg-open` on Linux). Turn that off with `--no-open-status`, or per-project with `"defaults": { "openStatus": false }`. If writing the page fails (e.g. a read-only folder) the run continues untouched — the dashboard never affects pipeline execution. `node .orca/flow.mjs --status-preview` renders a fixture page showing every state without a run — it cannot be combined with an objective or `--only`/`--from`/`--agent`; real runs write and open the page automatically and need no flag.
-
-### 5.4. Token usage (USAGE.md + status fields)
-
-`flow.mjs` collects token usage automatically when a run ends (both the success
-path and any error exit): it reads Claude Code
-(`~/.claude/projects/<slug>/`) and Codex (`~/.codex/sessions/YYYY/MM/DD/`)
-session transcripts whose `cwd` is the run's worktree, attributes the tokens to
-steps by matching each step's spec text, and writes:
-
-- `<artifactsDir>/USAGE.md` — one appended section per run with a per-step
-  table of numeric columns (In / Out / Cache R / Cache W / Total / Duration;
-  plus Step, Agent and Note) and a run Total row. Note values include "no
-  adapter", "no session found", "+N extra attempts", and on the Total row "N
-  subagent file(s) unattributed".
-- `status.js` — `steps[].usage = { in, out, cacheRead, cacheWrite, total, note }`
-  and `meta.usage = { in, out, cacheRead, cacheWrite, total }` (`steps[].usage`
-  is `null` (never zeros) when a step counted no tokens); the page shows
-  per-step chips, a run total and a finished-run breakdown.
-
-Notes: `USAGE.md` is a reserved artifact filename (startup validation of
-`writes` collisions is a separate planned feature — avoid the name manually).
-Attribution is by the step's spec head (the text before the first
-`{out}`/`{reads}`/`{tasks}` placeholder) so parallel same-agent steps stay
-distinct; earlier retry attempts count as "+N extra attempts"; steps carried
-over from a previous run (`--from`) are not recounted. Token display is
-post-hoc: numbers appear when the run ends, never mid-run. Set
-`ORCA_FLOW_USAGE_HOME` to redirect the log-root lookup — `~/.claude` and
-`~/.codex` are then read under this directory instead of the OS home (testing).
-No config field enables/disables this — it is automatic and display-only.
-
-### 5.5. The startup run chooser (resume a previous run)
-
-When the worktree's artifacts dir holds previous runs — the current flat state
-and/or `runs/` snapshots (see "Run history") — and the command passed none of
-`--from` / `--only` / `--new`, the flow lists the 10 newest runs (newest first,
-the current flat state labeled `(current)`; each line shows the objective,
-steps succeeded and overall verdict) and asks before starting:
-
-- `<n>` — resume that run. For an archived entry the current flat state is
-  archived first, then the chosen run's artifacts are restored into the flat
-  dir (a copy-over, non-destructive restore — flat files that are not part
-  of the chosen run's snapshot are left in place; resuming the `(current)`
-  entry restores nothing — it just continues).
-  The resume point is the first enabled step not recorded as `succeeded` in
-  that run's `status.js` — an automatic `--from`.
-- `0`, plain Enter, or EOF — start a NEW run. Piped stdin (scripts, CI) closes
-  with EOF, so automated invocations never block on the prompt.
-- Picking a run that already completed starts a fresh run instead (noted in
-  the log).
-
-`--dry-run` never prompts — it prints the same list read-only above the plan.
-`--new` skips the chooser entirely (the run-history archive still happens).
-
-Note: with previous runs present, a config that fails load-time validation may
-show the chooser (and perform its restore) before the config error appears —
-nothing is lost, the pre-restore state is archived first.
-
----
-
-## 6. Environment variables
-
-| Variable | Effect |
-|----------|--------|
-| `ORCA_CLI_COMMAND` | Set the orca CLI path/executable name if it can't be auto-detected |
-| `ORCA_FLOW_USAGE_HOME` | Read agent session logs under this directory instead of the OS home (testing; see 5.4) |
-| `ORCA_FLOW_NOTIFY_FILE` | Read notification config from this file instead of `.orca/notify.json` (multi-project setups; used by the test suite) |
-
----
-
-## 7. Safe config-editing workflow
-
-1. Edit `.orca/flow.config.json`.
-2. Run `node .orca/flow.mjs --dry-run "test objective"` — check step order, agents,
-   and effective `reads` match your intent.
-3. If good, run for real. For a new project, try a small feature first.
-
-Common JSON errors: a missing comma between entries, or a trailing comma on the last
-entry. If `--dry-run` reports "Could not read flow.config.json", check those two spots.
-
----
-
-## 8. Quick reference of valid values
-
-- `agent`: `claude` · `codex` · `opencode` · `gemini` · `cursor` · `grok` · `kiro-cli`
-- `enabled`: `true` · `false`
-- `gate`: `true` · `false`
-- `onFailGoto`: any `id` earlier in the pipeline, or `null`
-- `maxRetries` (step): non-negative integer — this step's `onFailGoto` loop budget; overrides the global `maxRetries`
-- `model`: `"default"` (agent's own model, nothing passed — also when missing/empty) or any model name string (passed as `--model`)
-- `parallelWith`: an earlier step `id` (members run concurrently; the next step waits for all)
-- `reads`: array of `id`s (empty `[]` for a starting step)
-- time: milliseconds (15 min = `900000`, 30 min = `1800000`)
-
----
-
-## 9. Notifications (.orca/notify.json)
-
-Step and run events can be pushed to chat while the pipeline runs. Configured
-in a SEPARATE file next to `flow.mjs` — shipped with every credential field
-empty (= feature off: nothing is sent, nothing is warned). Override the path
-with `ORCA_FLOW_NOTIFY_FILE`.
-
-```jsonc
-{
-  "enabled": true,          // false = off (silent)
-  "provider": "slack",      // slack | telegram | teams | whatsapp | generic
-  "url": "",                // the webhook/API URL (see table)
-  "token": "",              // whatsapp: bearer token
-  "chatId": "",             // telegram: chat id
-  "to": "",                 // whatsapp: recipient number
-  "events": ["step", "run"] // which notifications to send (missing = both; [] = off)
-}
-```
-
-| Provider | `url` is | Extra fields | Body |
-|---|---|---|---|
-| slack | incoming webhook URL | — | `{"text"}` |
-| telegram | full `https://api.telegram.org/bot<TOKEN>/sendMessage` URL | `chatId` | `{"chat_id","text"}` |
-| teams | Teams Workflows incoming webhook URL | — | Adaptive Card with the text |
-| whatsapp | full Graph API `.../<PHONE_NUMBER_ID>/messages` URL | `token`, `to` | `{"messaging_product":"whatsapp","to","type":"text","text"}` + `Authorization: Bearer` header |
-| generic | any JSON-accepting endpoint | — | full structured payload — step events: `{event, run, objective, step, title, status, attempt, durationMs, note, artifact}`; run events: `{event, run, objective, status, durationMs}` |
-
-Semantics: one best-effort POST per event (no retries — the first hard failure
-warns once with a secrets-free reason and disables further attempts for the
-run, so a dead or slow endpoint can never stack timeouts against the run's
-budget) — a one-off 429/503 on the first event also latches; the next run
-starts fresh. Every settlement notifies — succeeded, failed, still-running,
-unknown; retries notify per attempt. The run-end message carries the overall
-status, objective (truncated to 80 chars), duration and, on failure, the
-stuck step plus the same safe resume hint the console prints (a FAILED step
-resumes from itself; a still-running worker resumes from the step AFTER it
-(or the stuck step itself if it is the last one), an unknown settle names
-the step itself (inspect before resuming) — re-dispatching a live
-worker is forbidden). Delivery is timeout-guarded (9s
-abort) via a child process, so it never blocks the pipeline indefinitely
-(9s inactivity abort, 12s hard cap per event) and the final message of a
-dying run is still attempted. Notifications never change exit
-codes or settlement semantics. `--dry-run` prints the resolved state
-(`Notifications: on (slack, events: step,run)`) and sends nothing. For a
-healthy-but-slow endpoint, set `"events": ["run"]` to pay the round-trip once
-per run instead of per step.
-
-**Secrets:** after filling the file in, add it to your project's `.gitignore` —
-webhook URLs and tokens are credentials. The empty template is safe to commit.
-
----
-
-## orca-pod Engine Extensions (v0.2.0)
-
-### 1. Per-Step Isolated Worktrees (`isolatedWorktree`)
-
-Upstream `parallelWith` shares a single worktree across parallel steps (suitable for read-only doc/review steps). For parallel **code-writing** workers, opt in per step:
-
-```json
-{
-  "id": "worker-backend",
-  "isolatedWorktree": true,
-  "branchPrefix": "task/"
-}
-```
-
-When enabled, `.orca/worktree-isolation.mjs`:
-- Creates a physically separate Orca/Git worktree and `task/<slug>-<step>` branch from the integration worktree's current `HEAD` (typically the frozen `Contract-Commit`).
-- Copies upstream `reads` artifacts into the isolated worktree and materializes/restores agent skills/MCP strictly inside that isolated worktree (zero cross-contamination).
-- Continuously syncs `progress` and `writes` artifacts back to the integration worktree and records all task worktrees in `.orca/artifacts/WORKTREES.json` (exposed as `{worktreesManifest}` for the downstream Reviewer merge step).
-- Reuses the isolated worktree across `onFailGoto` retries so the worker fixes findings directly on its branch.
-
-### 2. Hard Content-Aware Gate Verification (`verify`)
-
-To prevent failed or stale reviews from bypassing readiness checks (which otherwise only verify `size >= readinessMinBytes`), declare `verify` on any review/audit step:
-
-```json
-{
-  "id": "contract-review",
-  "verify": {
-    "requireVerdict": "PASS",
-    "requireContractCommit": "HEAD"
-  }
-}
-```
-
-Enforced by `.orca/gate-verify.mjs` at **both** live step settlement (overrides `outcome=succeeded` to `failed` so `onFailGoto` / `maxRetries` triggers) **and** `readinessOf` / `--from` resume (blocks downstream launch until repaired). Also runnable standalone:
+Before starting work on a fresh repository:
 
 ```bash
-node .orca/gate-verify.mjs --artifact .orca/artifacts/CONTRACT_REVIEW.md --require-verdict PASS --require-contract-commit HEAD
+# 1. Scan installed agent CLIs and Orca subscription readiness
+node .orca/flow.mjs --scan
+node .orca/flow.mjs --scan --json
+
+# 2. Confirm default track, cross-family agent routing, and target branches
+node .orca/flow.mjs --setup
+
+# Or auto-apply the recommended strategy non-interactively
+node .orca/flow.mjs --setup --yes
 ```
 
-### 3. Target Branch & Protected Branches
-
-Configure in `defaults`:
-- `defaults.targetBranch` (default `"dev"`): injected as `{targetBranch}` in step specs for Reviewer PR creation and merge.
-- `defaults.protectedBranches` (default `["main", "master"]`): injected as `{protectedBranches}` — pipelines never push directly to or auto-merge protected branches.
+This updates `.orca/flow-{hotfix,feature,epic}.json`, `.orca/flow.config.json`, and writes `.orca/STRATEGY.md`.
 
 ---
 
-## orca-pod Governance Extensions (v0.3.0)
+## 5. Governance & Operations CLI
 
-### 4. One-Way Door / Merge Danger Guard (`verify.mergeDangerCheck`)
-
-Release steps (`pr-release-dev` / `pr-submit`) declare `"verify": { "requireVerdict": "PASS", "mergeDangerCheck": true }`.
-`.orca/merge-danger.mjs` inspects the real `git diff` against `{targetBranch}` across 9 authoritative one-way-door trigger categories:
-1. `schema_migration` (migrations, `.sql`, `DROP/ALTER TABLE`, `DELETE FROM`)
-2. `breaking_api` (removed/altered public API routes/exports)
-3. `auth_secrets` (auth, RBAC, OAuth, credentials, `.env`, secrets)
-4. `billing_pricing` (billing, Stripe, payments, subscriptions)
-5. `deploy_infra` (CI workflows, Docker, Terraform, K8s, Nginx)
-6. `irreversible_side_effect` (purge/backfill/prod bulk-action scripts)
-7. `feature_removal` (large file/line deletions)
-8. `major_dependency_upgrade` (major semver jumps in manifests)
-9. `broad_blast_radius` (diff exceeding `defaults.mergeDanger.maxFiles` / `maxChangedLines`)
-
-- Fail-closed: unresolvable `baseRef` classifies as `one-way` (`uncertain_diff`).
-- When `one-way` is triggered (and `--allow-one-way-merge` was NOT passed), `{mergeDangerReport}` instructs the Release Reviewer to open the PR and **stop without merging** (`Door: one-way`, `Merge-Status: PENDING_HUMAN_MERGE`).
-- At settlement, `.orca/gate-verify.mjs` hard-blocks contradicting `Door: two-way` claims or unauthorized merges into `{targetBranch}`, and records `pending_type: human_merge` in the out-of-repo Run Ledger.
-
-Standalone CLI:
 ```bash
-node .orca/merge-danger.mjs --base dev --dir . --artifact .orca/artifacts/EPIC_RELEASE_GATE.md --json
-```
+# Inspect merge danger classification for current branch vs dev
+node .orca/merge-danger.mjs --repo . --base dev
 
-### 5. `turnStart: observed` Start Proof & 5-State Worker Health (`.orca/health.mjs`)
-
-- `worker-start` returning `state: ready` is **not** proof of a started turn (`turnStart: unobserved`).
-- `turnStart` upgrades to `observed` only on positive evidence: explicit receipt `turnStart: observed`, terminal preview redraw after initial render, fresh dispatch heartbeat newer than launch time, active dispatch status (`running`/`working`/`completed`), artifact creation/growth, or `worker_done`.
-- Evaluates 5 worst-of health states (`lost > blocked > unknown > degraded > healthy`):
-  - `turnStartWindowMs` (default `120000` ms): warns `health:unknown` if `turnStart` stays unobserved.
-  - `turnStartEscalateMs` (default `600000` ms): stops cleanly instead of burning `hardTimeoutMs` on a dead/proxy-refused CLI.
-  - `lost`: dispatch terminated without `worker_done` → stops cleanly without blind retry.
-  - `blocked`: parked permission/trust dialog or Orca `agentWait` object.
-
-### 6. Out-of-Repo Run Ledger, 4-Level Acceptance, 8-Row Closeout & Bot Dedup Lock (`.orca/ledger.mjs`)
-
-- Stored strictly **outside** every git repository (`ORCA_POD_LEDGER_HOME`, default `~/.orca/pod-ledger`; paths inside the target repo are rejected).
-- Records append-only JSONL events (`run_start`, `intent` before dispatch, `result` after dispatch, `health`, `acceptance`, `pending`, `closeout`) and an atomic `fsync`'d summary file.
-- Tracks **4 independent acceptance levels** (each requiring explicit `evidenceRef`): `implemented`, `integrated`, `merged`, `synced`.
-- Runs an **8-row authoritative Closeout** at completion (including verifying `protectedBranches` SHAs did NOT mutate during the run!).
-- Supports **Bot anti-collision dedup locks** via `--dedup-key <key>` (blocks duplicate live runners with exit code `2`; auto-reclaims stale dead-PID locks).
-
-Standalone CLI:
-```bash
-node .orca/ledger.mjs status --repo . --json
-node .orca/ledger.mjs pending --repo .
-node .orca/ledger.mjs check-lock --dedup-key gh:owner/repo#42
+# Reconcile 4-level closeout after a human merges a One-Way Door PR
 node .orca/ledger.mjs closeout --run <runKey> --repo . --target-branch dev
+
+# List unresolved pending-human-merge runs
+node .orca/ledger.mjs pending
+
+# Check or release a --dedup-key lock
+node .orca/ledger.mjs check-lock --dedup-key <key> --repo .
 ```
+
+---
+
+## 6. Notifications (`.orca/notify.json`)
+
+Optional per-step and run-end webhook notifications (`slack`, `telegram`, `teams`, `whatsapp`, `generic`). Shipped disabled by default; delivery errors warn once and never disrupt pipeline execution.

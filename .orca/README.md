@@ -1,28 +1,20 @@
-# `.orca/` — the SDLC Flow Kit engine
+# `.orca/` — Orca-Pod Orchestrator Workspace
 
-This folder is the whole kit. Copy it (together with `orca.yaml` from the repo
-root) into your project and run:
+Quick reference for files inside `.orca/`:
 
-```
-node .orca/flow.mjs "Your objective"
-```
+| File / Directory | Purpose |
+| --- | --- |
+| `flow.mjs` | Main CLI orchestrator entry point (`node .orca/flow.mjs ...`) |
+| `agent-scanner.mjs` | Scans local agent CLIs & Orca subscription readiness (`--scan`) |
+| `strategy-wizard.mjs` | Interactive pre-dev strategy confirmation (`--setup`) |
+| `flow.config.json` | Default pipeline configuration (Track 1 Feature by default) |
+| `flow-hotfix.json` | Track 0 — Hotfix pipeline |
+| `flow-feature.json` | Track 1 — Feature pipeline |
+| `flow-epic.json` | Track 2 — Epic / 0->1 parallel isolated-worktree pipeline |
+| `STRATEGY.md` | Project development strategy confirmed via `--setup` |
+| `notify.json` | Optional webhook notification configuration (disabled by default) |
+| `prompts/` | Reusable step prompts (`triage-po.md`, `frontend-worker.md`, `senior-auditor.md`) |
+| `lib/` | Internal runtime modules (`orca-cli`, `runner`, `status`, `usage`, `notify`, `nudge`) |
+| `agent-config.mjs` / `gate-verify.mjs` / `worktree-isolation.mjs` / `merge-danger.mjs` / `health.mjs` / `ledger.mjs` | Governance & isolation engine modules |
 
-Installed via `npx github:vankhangfet/orca-sdlc-kit`? You already have all of this.
-
-| File | What it is |
-|------|------------|
-| `flow.mjs` | The orchestrator — reads the config, drives the agents. You never edit it. |
-| `designer.mjs` | Workflow Designer — local UI server (`node .orca/designer.mjs`); builds/edits the config files visually. Opt-in, localhost-only. |
-| `designer.html` | The designer's page (served by `designer.mjs` — open the printed URL). |
-| `flow.config.json` | The full SDLC pipeline. **This is the file you edit**: steps, agents, `autoRun`, gates, interactive steps, timeouts. |
-| `fixbug.config.json` | The bug-fix pipeline (run with `--config fixbug.config.json "<bug + reproduction steps>"`). |
-| `cr.config.json` | The change-request pipeline (run with `--config cr.config.json "<what changes and why>"`). |
-| `workflow-template/` | Variants of the three pipelines that END with a Rebase & Push step (commit, rebase, push). Run with `--config workflow-template/<file>`. |
-| `notify.json` | Chat notifications (Slack/Telegram/Teams/WhatsApp/generic) — empty = off; see CONFIGURATION.md §9 |
-| `CONFIGURATION.md` | Field-by-field reference for all three config files. |
-| `artifacts/` | Runtime output — every step's Markdown artifact lands here, each with a `.md.js` viewer snapshot beside it, plus the live status page (gitignored). |
-
-- **Per-agent skills & MCP servers** — declare a `skills` / `mcpServers` registry in any pipeline config, reference them from steps, and each agent harness gets its standard config files in the worktree (`.mcp.json`, `.claude/skills/`, `AGENTS.md` sections, ...) — restored after every step group. See "Skills & MCP servers" in `CONFIGURATION.md`.
-
-For the full picture — concepts, quick start, automation modes, worktree
-handling, cheat sheet, troubleshooting — read the repo root **README.md**.
+See [CONFIGURATION.md](./CONFIGURATION.md) for full details.

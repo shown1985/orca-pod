@@ -825,13 +825,13 @@ scenario("E17 repair-hang (still-running repair keeps the resume hint)", async (
 // steps (grill) are optional inputs — the gate must not prompt or abort.
 // ---------------------------------------------------------------------------
 scenario("E18 readiness-skips-disabled (shipped config, fresh worktree, no prompt)", async () => {
-  const r = await runFlow({ name: "e18", config: "workflow-template/sdlc.config.json", budgetMs: 120000 });
+  const r = await runFlow({ name: "e18", config: "flow-epic.json", args: ["--only", "po-backlog"], budgetMs: 120000 });
   ok("E18 not hung", !r.hung);
   eq("E18 exit code", r.code, 0);
   ok("E18 never reported missing inputs", !/Missing or incomplete input artifact/.test(r.out + r.err));
   ok("E18 never prompted", !/Run the producing step/.test(r.out + r.err));
   eq("E18 grill stays skipped", r.status?.steps.find((s) => s.id === "grill")?.status, "skipped");
-  ok("E18 planning dispatched", r.calls.some((c) => c.cmd === "orchestration task-create" && String(c.flags.spec ?? "").includes("# Planning")));
+  ok("E18 po-backlog dispatched", r.calls.some((c) => c.cmd === "orchestration task-create" && String(c.flags.spec ?? "").includes("# PO Backlog")));
   ok("E18 pipeline complete", /Pipeline COMPLETE/.test(r.out));
 });
 
@@ -1168,8 +1168,7 @@ scenario("N5 notify mixed group (hint points past the live group)", async () => 
 // dry-run) before any agent work; budgets are tight.
 // ---------------------------------------------------------------------------
 scenario("F1 shipped configs dry-run cleanly", async () => {
-  for (const cfg of [null, "fixbug.config.json", "cr.config.json",
-    "workflow-template/sdlc.config.json", "workflow-template/fixbug.config.json", "workflow-template/cr.config.json"]) {
+  for (const cfg of [null, "flow-hotfix.json", "flow-feature.json", "flow-epic.json"]) {
     const label = cfg || "flow.config.json (default)";
     const r = await runFlow({ name: "f1", config: cfg, args: ["--dry-run"], objective: "suite smoke", budgetMs: 30000 });
     ok(`F1 ${label} not hung`, !r.hung);
@@ -1275,9 +1274,16 @@ scenario("I1 installer (empty project: every whitelisted file lands)", async () 
   ok("I1 not hung", !r.hung);
   eq("I1 exit code", r.code, 0);
   ok("I1 no copy failure", !/copy failed/.test(r.out + r.err), (r.out + r.err).trim());
-  for (const f of ["flow.mjs", "agent-config.mjs", "designer.mjs", "designer.html", "flow.config.json", "fixbug.config.json", "cr.config.json", "CONFIGURATION.md", "README.md", "notify.json",
-    "workflow-template/README.md", "workflow-template/sdlc.config.json", "workflow-template/fixbug.config.json", "workflow-template/cr.config.json"])
+  for (const f of [
+    "flow.mjs", "agent-config.mjs", "agent-scanner.mjs", "strategy-wizard.mjs",
+    "gate-verify.mjs", "worktree-isolation.mjs", "merge-danger.mjs", "health.mjs", "ledger.mjs",
+    "lib/orca-cli.mjs", "lib/status.mjs", "lib/status-template.html", "lib/usage.mjs", "lib/notify.mjs", "lib/nudge.mjs", "lib/runner.mjs",
+    "flow.config.json", "flow-hotfix.json", "flow-feature.json", "flow-epic.json",
+    "CONFIGURATION.md", "README.md", "notify.json",
+  ])
     ok(`I1 installed .orca/${f}`, existsSync(join(r.dir, ".orca", f)));
+  ok("I1 legacy designer.mjs NOT shipped", !existsSync(join(r.dir, ".orca", "designer.mjs")));
+  ok("I1 legacy designer.html NOT shipped", !existsSync(join(r.dir, ".orca", "designer.html")));
   ok("I1 installed orca.yaml", existsSync(join(r.dir, "orca.yaml")));
   ok("I1 .gitignore got the artifacts line", readFileSync(join(r.dir, ".gitignore"), "utf8").includes(".orca/artifacts/"));
 });
@@ -1292,196 +1298,94 @@ scenario("I2 FILES whitelist mirrors package.json files", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Designer — local UI server for creating/editing workflow configs (D*).
-// Each scenario boots the real designer.mjs (--port 0 = ephemeral) and talks
-// to its JSON API with fetch; the token is parsed from its stdout line.
+// W — Local Agent & Subscription Scanner + Pre-Dev Strategy Wizard (replaces
+// the legacy web designer with terminal-first scan + conversational confirm).
 // ---------------------------------------------------------------------------
-async function startDesigner() {
-  // Hermetic: dry-run children resolve the orca CLI via ORCA_CLI_COMMAND —
-  // node.exe stands in (version probe succeeds, worktree probe fails soft).
-  const env = { ...process.env };
-  for (const k of Object.keys(env)) if (k.startsWith("ORCA_")) delete env[k];
-  env.ORCA_CLI_COMMAND = NODE;
-  const child = spawn(NODE, [join(REPO, ".orca", "designer.mjs"), "--port", "0", "--no-open"],
-    { cwd: REPO, env, stdio: ["ignore", "pipe", "pipe"] });
-  let out = "";
-  const ready = new Promise((rOK, rNO) => {
-    const t = setTimeout(() => rNO(new Error("designer did not start")), 10000);
-    child.stdout.on("data", (d) => {
-      out += d;
-      const m = out.match(/listening (http:\/\/\S+)/);
-      if (m) { clearTimeout(t); rOK(m[1]); }
-    });
-    child.stderr.on("data", (d) => (out += d));
-    child.on("exit", (c) => { clearTimeout(t); rNO(new Error(`designer exited early (${c}): ${out}`)); });
+scenario("W1 agent-scanner recommends cross-family routing & never leaks secrets", async () => {
+  const { scanLocalAgents, recommendStrategy, formatScanReport } = await import(join(REPO, ".orca", "agent-scanner.mjs"));
+  const mockOrcaData = {
+    opencode: { accounts: [{ id: "acc-secret-1", label: "opencode" }] },
+    codex: { systemDefault: { hasAuth: true, email: "private-secret@example.com" } },
+    rateLimits: {
+      codex: { status: "ok", planType: "plus", session: { usedPercent: 5 }, weekly: { usedPercent: 12 } },
+      opencodeGo: { status: "ok", session: { usedPercent: 0 }, weekly: { usedPercent: 10 }, monthly: { usedPercent: 30 } },
+      antigravity: { status: "ok", session: { usedPercent: 40 }, weekly: { usedPercent: 20 } },
+      claude: { status: "unavailable", error: "No subscription plan — API key billing" },
+    },
+  };
+  const scan = scanLocalAgents({
+    mockOrcaData,
+    mockBins: { orca: "/bin/orca", agy: "/bin/agy", codex: "/bin/codex", claude: "/bin/claude", opencode2: "/bin/opencode2", opencode: "/bin/opencode", zcode: "/bin/zcode" },
+    mockConfigs: { agy: true, codex: true, claude: true, opencode2: true, opencode: true, zcode: true },
   });
-  const url = await ready.catch((e) => { child.kill(); throw e; }); // never leak a live child
-  const [base, token] = url.split("/?t=");
-  return { base, token, stop: () => child.kill() };
-}
-function hdr(d) { return { "x-designer-token": d.token }; }
+  const rec = recommendStrategy(scan);
+  const report = formatScanReport(scan, rec);
+  eq("W1 coder prefers opencode2 over opencode", rec.roles.coder, "opencode2");
+  eq("W1 coordinator prefers agy", rec.roles.coordinator, "agy");
+  eq("W1 visual gate prefers agy", rec.roles.visual, "agy");
+  eq("W1 reviewer is cross-family (codex)", rec.roles.reviewer, "codex");
+  ok("W1 crossFamily=true", rec.crossFamily);
+  ok("W1 report never leaks email", !report.includes("private-secret@example.com"));
+  ok("W1 report never leaks account id", !report.includes("acc-secret-1"));
+  ok("W1 serialized scan never leaks email", !JSON.stringify(scan).includes("private-secret@example.com"));
 
-scenario("D1 designer state lists configs + serves page", async () => {
-  const d = await startDesigner();
-  try {
-    const page = await fetch(`${d.base}/?t=${d.token}`);
-    eq("D1 page status", page.status, 200);
-    ok("D1 page is html", /text\/html/.test(page.headers.get("content-type") || ""));
-    ok("D1 page title", (await page.text()).includes("Orca Workflow Designer"));
-    const r = await fetch(`${d.base}/api/state`, { headers: hdr(d) });
-    eq("D1 state status", r.status, 200);
-    const j = await r.json();
-    const paths = j.configs.map((c) => c.path);
-    for (const p of ["flow.config.json", "fixbug.config.json", "cr.config.json",
-      "workflow-template/sdlc.config.json", "workflow-template/fixbug.config.json",
-      "workflow-template/cr.config.json"])
-      ok(`D1 lists ${p}`, paths.includes(p));
-    eq("D1 flow not template", j.configs.find((c) => c.path === "flow.config.json").template, false);
-    eq("D1 template flagged", j.configs.find((c) => c.path === "workflow-template/cr.config.json").template, true);
-  } finally { d.stop(); }
+  // Single-family degradation emits warning
+  const singleScan = scanLocalAgents({
+    mockOrcaData: null,
+    mockBins: { orca: "/bin/orca", opencode2: "/bin/opencode2" },
+    mockConfigs: { opencode2: true },
+  });
+  const singleRec = recommendStrategy(singleScan);
+  ok("W1 single-family sets crossFamily=false", !singleRec.crossFamily);
+  ok("W1 single-family warns user", singleRec.warnings.some((w) => /one model family/i.test(w)));
 });
 
-scenario("D4 designer token required", async () => {
-  const d = await startDesigner();
-  try {
-    eq("D4 no token -> 403", (await fetch(`${d.base}/api/state`)).status, 403);
-    eq("D4 bad token -> 403", (await fetch(`${d.base}/api/state`, { headers: { "x-designer-token": "nope" } })).status, 403);
-    eq("D4 page without token -> 403", (await fetch(d.base + "/")).status, 403);
-  } finally { d.stop(); }
+scenario("W2 strategy-wizard updates all 3 tracks, flow.config.json, and writes STRATEGY.md", async () => {
+  const { applyStrategyToProject } = await import(join(REPO, ".orca", "strategy-wizard.mjs"));
+  const r = await runInit({ name: "w2", args: ["--no-interactive"] });
+  eq("W2 init exit", r.code, 0);
+  const res = applyStrategyToProject(r.dir, {
+    defaultTrack: "flow-epic.json",
+    targetBranch: "staging",
+    protectedBranches: ["main", "master", "release"],
+    projectNote: "pnpm test && pnpm lint",
+    roles: { coordinator: "agy", visual: "agy", coder: "opencode2", coderAlt: "zcode", reviewer: "codex", release: "codex" },
+  });
+  ok("W2 updated STRATEGY.md", existsSync(res.strategyPath));
+  const stratMd = readFileSync(res.strategyPath, "utf8");
+  ok("W2 STRATEGY.md mentions flow-epic.json", stratMd.includes("flow-epic.json"));
+  ok("W2 STRATEGY.md mentions staging", stratMd.includes("staging"));
+  ok("W2 STRATEGY.md mentions pnpm test", stratMd.includes("pnpm test && pnpm lint"));
+  const epic = JSON.parse(readFileSync(join(r.dir, ".orca", "flow-epic.json"), "utf8"));
+  eq("W2 epic targetBranch updated", epic.defaults.targetBranch, "staging");
+  eq("W2 epic worker-backend agent", epic.pipeline.find((s) => s.id === "worker-backend").agent, "opencode2");
+  eq("W2 epic worker-frontend agent", epic.pipeline.find((s) => s.id === "worker-frontend").agent, "zcode");
+  eq("W2 epic senior-audit agent", epic.pipeline.find((s) => s.id === "senior-audit").agent, "codex");
+  eq("W2 epic visual-gate agent", epic.pipeline.find((s) => s.id === "visual-gate").agent, "agy");
+  ok("W2 epic preserves // metadata comments", typeof epic["//"] === "string" && typeof epic["//usage"] === "string");
+  const defCfg = JSON.parse(readFileSync(join(r.dir, ".orca", "flow.config.json"), "utf8"));
+  ok("W2 flow.config.json synced from chosen defaultTrack (epic)", defCfg.pipeline.some((s) => s.id === "worker-backend"));
 });
 
-scenario("D4b designer host header guard", async () => {
-  const d = await startDesigner();
-  try {
-    const u = new URL(d.base);
-    const code = await new Promise((rOK, rNO) => {
-      const req = request({ hostname: u.hostname, port: u.port, method: "GET", path: "/api/state",
-        headers: { host: "evil.example", "x-designer-token": d.token } },
-        (res) => { res.resume(); rOK(res.statusCode); });
-      req.on("error", rNO);
-      req.end();
-    });
-    eq("D4b evil Host with valid token -> 403", code, 403);
-  } finally { d.stop(); }
+scenario("W3 flow.mjs --scan --json --no-orca works offline without objective", async () => {
+  const r = await runFlow({ name: "w3", args: ["--scan", "--json", "--no-orca"], objective: "", budgetMs: 15000 });
+  ok("W3 not hung", !r.hung);
+  eq("W3 exit code", r.code, 0);
+  const parsed = JSON.parse(r.out);
+  ok("W3 returns scan object", Boolean(parsed.scan && Array.isArray(parsed.scan.agents)));
+  ok("W3 returns recommendation roles", Boolean(parsed.recommendation && parsed.recommendation.roles && parsed.recommendation.roles.coder));
 });
 
-scenario("D2 designer save round-trip preserves // keys", async () => {
-  const d = await startDesigner();
-  const probe = "designer-test.config.json";
-  try {
-    const g = await (await fetch(`${d.base}/api/config?path=flow.config.json`, { headers: hdr(d) })).json();
-    eq("D2 read ok", g.config != null && Array.isArray(g.config.pipeline), true);
-    ok("D2 has // key", typeof g.config["//"] === "string");
-    // Exactly like the UI: mutate the parsed raw object in place, post it whole.
-    g.config.maxRetries = 5;
-    g.config.pipeline[0].title = "Edited by test";
-    const sv = await fetch(`${d.base}/api/save`, { method: "POST",
-      headers: { ...hdr(d), "content-type": "application/json" },
-      body: JSON.stringify({ path: probe, config: g.config }) });
-    eq("D2 save status", sv.status, 200);
-    const onDisk = JSON.parse(readFileSync(join(REPO, ".orca", probe), "utf8"));
-    eq("D2 maxRetries saved", onDisk.maxRetries, 5);
-    eq("D2 title saved", onDisk.pipeline[0].title, "Edited by test");
-    ok("D2 // survived the round-trip", typeof onDisk["//"] === "string");
-    eq("D2 // identical after round-trip", onDisk["//"], g.config["//"]);
-  } finally { d.stop(); rmSync(join(REPO, ".orca", probe), { force: true }); }
-});
+scenario("W4 bin/init.mjs --scan and --apply-recommended --no-orca work end-to-end", async () => {
+  const s = await runInit({ name: "w4-scan", args: ["--scan", "--json", "--no-orca"] });
+  ok("W4 scan not hung", !s.hung);
+  eq("W4 scan exit code", s.code, 0);
+  ok("W4 scan valid JSON", Boolean(JSON.parse(s.out).recommendation));
 
-scenario("D3 designer path traversal + bad body refused", async () => {
-  const d = await startDesigner();
-  try {
-    const post = (body) => fetch(`${d.base}/api/save`, { method: "POST",
-      headers: { ...hdr(d), "content-type": "application/json" }, body });
-    eq("D3 escape ../ refused", (await post(JSON.stringify({ path: "../evil.config.json", config: { pipeline: [] } }))).status, 400);
-    eq("D3 zig-zag escape refused", (await post(JSON.stringify({ path: "workflow-template/../../evil.config.json", config: { pipeline: [] } }))).status, 400);
-    eq("D3 non-config suffix refused", (await post(JSON.stringify({ path: "package.json", config: { pipeline: [] } }))).status, 400);
-    eq("D3 non-array pipeline refused", (await post(JSON.stringify({ path: "x.config.json", config: { pipeline: "no" } }))).status, 400);
-    eq("D3 broken JSON body refused", (await post("{not json")).status, 400);
-    eq("D3 config read traversal refused", (await fetch(`${d.base}/api/config?path=${encodeURIComponent("../../package.json")}`, { headers: hdr(d) })).status, 400);
-    eq("D3 config read missing -> 404", (await fetch(`${d.base}/api/config?path=nope.config.json`, { headers: hdr(d) })).status, 404);
-  } finally { d.stop(); }
-});
-
-scenario("D5 designer dry-run validates a good config", async () => {
-  const d = await startDesigner();
-  try {
-    const r = await fetch(`${d.base}/api/dry-run`, { method: "POST",
-      headers: { ...hdr(d), "content-type": "application/json" },
-      body: JSON.stringify({ path: "flow.config.json" }) });
-    eq("D5 status", r.status, 200);
-    const j = await r.json();
-    eq("D5 exit code", j.code, 0);
-    ok("D5 not timed out", !j.timedOut);
-    ok("D5 prints config line", /Config: flow\.config\.json/.test(j.output));
-    ok("D5 prints pipeline", /Pipeline to run \(in order\):/.test(j.output));
-    ok("D5 says no agents called", /Dry-run — no agents called\./.test(j.output));
-  } finally { d.stop(); }
-});
-
-scenario("D6 designer dry-run surfaces flow.mjs validation errors", async () => {
-  const d = await startDesigner();
-  const probe = "designer-test-bad.config.json";
-  try {
-    const broken = { artifactsDir: ".orca/artifacts", maxRetries: 2, autoRun: true, defaults: { timeoutMs: 600000 },
-      pipeline: [
-        { id: "a", title: "A", enabled: true, agent: "claude", writes: "", reads: [], spec: "do A" },
-        { id: "b", title: "B", enabled: true, agent: "claude", writes: "B.md", reads: ["a"], spec: "do B" },
-      ] };
-    const sv = await fetch(`${d.base}/api/save`, { method: "POST",
-      headers: { ...hdr(d), "content-type": "application/json" },
-      body: JSON.stringify({ path: probe, config: broken }) });
-    eq("D6 probe saved", sv.status, 200);
-    const r = await fetch(`${d.base}/api/dry-run`, { method: "POST",
-      headers: { ...hdr(d), "content-type": "application/json" },
-      body: JSON.stringify({ path: probe }) });
-    eq("D6 status", r.status, 200);
-    const j = await r.json();
-    eq("D6 exit code", j.code, 1);
-    ok("D6 surfaces the reads error", /step "b" reads "a" which has no "writes"/.test(j.output));
-  } finally { d.stop(); rmSync(join(REPO, ".orca", probe), { force: true }); }
-});
-
-scenario("D7 designer scaffolds a fresh project workspace", async () => {
-  // Seed junk the copy-filter must exclude (dir rule + *.log/*.tmp rules).
-  mkdirSync(join(REPO, ".orca", "artifacts"), { recursive: true });
-  writeFileSync(join(REPO, ".orca", "artifacts", "designer-probe.log"), "junk\n");
-  writeFileSync(join(REPO, ".orca", "designer-filter-test.tmp"), "junk\n");
-  const d = await startDesigner();
-  const target = mkdtempSync(join(tmpdir(), "orca-designer-"));
-  dirsOfCurrentScenario.push(target);
-  try {
-    const pv = await (await fetch(`${d.base}/api/scaffold/preview?dir=${encodeURIComponent(target)}`, { headers: hdr(d) })).json();
-    eq("D7 preview exists+empty", [pv.exists, pv.empty, pv.hasOrca], [true, true, false]);
-    const r = await fetch(`${d.base}/api/scaffold`, { method: "POST",
-      headers: { ...hdr(d), "content-type": "application/json" },
-      body: JSON.stringify({ dir: target, template: "workflow-template/fixbug.config.json", configName: "myproj" }) });
-    eq("D7 scaffold status", r.status, 200);
-    const j = await r.json();
-    eq("D7 config name", j.config, "myproj.config.json");
-    for (const f of [".orca/flow.mjs", ".orca/designer.mjs", ".orca/designer.html",
-      ".orca/myproj.config.json", ".orca/workflow-template/README.md", "orca.yaml"])
-      ok(`D7 created ${f}`, existsSync(join(target, ...f.split("/"))));
-    ok("D7 artifacts/ NOT copied", !existsSync(join(target, ".orca", "artifacts")));
-    ok("D7 seeded junk log NOT copied", !existsSync(join(target, ".orca", "artifacts", "designer-probe.log")));
-    ok("D7 junk .tmp NOT copied", !existsSync(join(target, ".orca", "designer-filter-test.tmp")));
-    eq("D7 scaffold into same dir refused", (await fetch(`${d.base}/api/scaffold`, { method: "POST",
-      headers: { ...hdr(d), "content-type": "application/json" },
-      body: JSON.stringify({ dir: target, template: "flow.config.json", configName: "again" }) })).status, 400);
-    eq("D7 scaffold into repo root refused", (await fetch(`${d.base}/api/scaffold`, { method: "POST",
-      headers: { ...hdr(d), "content-type": "application/json" },
-      body: JSON.stringify({ dir: REPO, template: "flow.config.json", configName: "nope" }) })).status, 400);
-    eq("D7 case-mangled kit dir refused", (await fetch(`${d.base}/api/scaffold`, { method: "POST",
-      headers: { ...hdr(d), "content-type": "application/json" },
-      body: JSON.stringify({ dir: join(ROOT, ".ORCA"), template: "flow.config.json", configName: "nope2" }) })).status, 400);
-    eq("D7 bad configName refused", (await fetch(`${d.base}/api/scaffold`, { method: "POST",
-      headers: { ...hdr(d), "content-type": "application/json" },
-      body: JSON.stringify({ dir: target, template: "flow.config.json", configName: "bad name!" }) })).status, 400);
-  } finally {
-    d.stop();
-    rmSync(join(REPO, ".orca", "artifacts", "designer-probe.log"), { force: true });
-    try { rmdirSync(join(REPO, ".orca", "artifacts")); } catch {}
-    rmSync(join(REPO, ".orca", "designer-filter-test.tmp"), { force: true });
-  }
+  const a = await runInit({ name: "w4-apply", args: ["--apply-recommended", "--no-orca"] });
+  ok("W4 apply not hung", !a.hung);
+  eq("W4 apply exit code", a.code, 0);
+  ok("W4 STRATEGY.md generated", existsSync(join(a.dir, ".orca", "STRATEGY.md")));
 });
 
 // ---------------------------------------------------------------------------

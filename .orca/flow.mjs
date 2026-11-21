@@ -1,133 +1,107 @@
 #!/usr/bin/env node
-// .orca/flow.mjs — SDLC pipeline orchestrator for Orca ADE
-// Cross-platform (Windows/macOS/Linux). Needs only Node (already required by Orca).
-// =============================================================================
-// The pipeline is DEFINED IN flow.config.json, not hard-coded here.
-// Enable/disable steps via "enabled". A disabled step is auto-removed from
-// later steps' "reads".
+// Orca-Pod Flow Orchestrator — thin CLI entry point & pipeline controller.
+// Zero dependencies (Node >= 18 builtins only).
 //
 // Usage:
-//   node .orca/flow.mjs "Description of the feature / objective"
-//
-// Resume from a step (skip earlier steps):
-//   node .orca/flow.mjs --from coding "..."
-//
-// Run only a subset of steps:
-//   node .orca/flow.mjs --only planning,architecture "..."
-//
-// Preview the pipeline WITHOUT calling agents (dry-run):
-//   node .orca/flow.mjs --dry-run "..."
-//
-// Override one step's agent for this run:
-//   node .orca/flow.mjs --agent coding=claude "..."
-//
-// Run a DIFFERENT pipeline config (e.g. the bug-fix flow in fixbug.config.json):
-//   node .orca/flow.mjs --config fixbug.config.json "<bug description>"
-//
-// Pin the worktree for one run (only when launching from OUTSIDE the target):
-//   node .orca/flow.mjs --worktree name:lab2 "..."
-//
-// Auto-create a worktree when auto-detect fails (never when a worktree is
-// pinned, never during --dry-run; uncommitted changes do not follow):
-//   node .orca/flow.mjs --create-worktree "add login page"
-//
-// Opt-in requirements interview before planning (step id "grill" in config):
-//   node .orca/flow.mjs --grill-me "..."
-// Disable it for this run when it is enabled in config:
-//   node .orca/flow.mjs --no-grill-me "..."
-//
-// Live status page (auto-opens on real runs; see .orca/CONFIGURATION.md 5.3):
-//   node .orca/flow.mjs --no-open-status "..."   // don't auto-open the browser
-//   node .orca/flow.mjs --status-preview         // fixture page, no run
-//
-// Start a NEW run, skipping the startup chooser's resume prompt:
-//   node .orca/flow.mjs --new "..."
-//
-// Step timeouts: `timeoutMs` = max worker SILENCE (no terminal output, no
-// heartbeat). Silence is NOT a failure verdict — a worker deep in one long
-// tool call can render a static screen for most of an hour (verified). A
-// quiet-but-alive dispatch is waited on and a warning printed; the step only
-// settles on worker_done or a POSITIVE failure (dispatch failed). The fix
-// loop (onFailGoto) never triggers on "unknown". `hardTimeoutMs` (default
-// 4x timeoutMs) = absolute cap — on hit the worker's terminal is left open
-// and the flow stops with a --from resume hint (outcome=still-running).
-// =============================================================================
+//   node .orca/flow.mjs "Build feature X"
+//   node .orca/flow.mjs --config flow-epic.json "#epic ..."
+//   node .orca/flow.mjs --dry-run "Preview pipeline plan"
+//   node .orca/flow.mjs --scan [--json]          # scan local agents & recommend routing
+//   node .orca/flow.mjs --setup [--yes]          # interactive pre-dev strategy confirmation
+//   node .orca/flow.mjs --from coding "..."      # resume from step
+//   node .orca/flow.mjs --only a,b "..."         # run selected steps
+//   node .orca/flow.mjs --agent coding=claude "."# override step agent
+//   node .orca/flow.mjs --status-preview         # render fixture dashboard
 
-import { spawnSync } from "node:child_process";
-import { readFileSync, mkdirSync, existsSync, writeFileSync, readdirSync, copyFileSync, statSync, appendFileSync, rmdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import readline from "node:readline";
-import { validateAgentConfig, materializeAgentConfig, restoreAgentConfig } from "./agent-config.mjs";
-import { validateVerifyConfig, verifyStepArtifact, formatVerifySummary } from "./gate-verify.mjs";
+import { fileURLToPath } from "node:url";
+import { validateAgentConfig, restoreAgentConfig } from "./agent-config.mjs";
+import { validateVerifyConfig, verifyStepArtifact } from "./gate-verify.mjs";
 import {
-  WORKTREES_MANIFEST, validateIsolationConfig, prepareStepWorktree,
-  syncOutputsFromIsolatedWorktree, finalizeStepWorktree, renderIsolatedWorktreeNote,
-  clearStaleStepArtifact, recordVerifiedContractCommit, recordMergedAfterContract,
+  validateIsolationConfig,
+  recordVerifiedContractCommit,
+  recordMergedAfterContract,
   knownIsolatedWorktreePaths,
 } from "./worktree-isolation.mjs";
-import { classifyMergeDanger, formatMergeDangerPromptBlock, snapshotTargetRefs, validateMergeDangerConfig, verifyMergeDangerGate } from "./merge-danger.mjs";
-import { initMemberHealth, evaluateMemberHealth } from "./health.mjs";
-import { createRunLedger, acquireRunLock, releaseRunLock, snapshotBranchShas } from "./ledger.mjs";
+import { validateMergeDangerConfig, verifyMergeDangerGate } from "./merge-danger.mjs";
+import {
+  snapshotBranchShas,
+  createRunLedger,
+  acquireRunLock,
+  releaseRunLock,
+} from "./ledger.mjs";
+import { scanLocalAgents, recommendStrategy, formatScanReport } from "./agent-scanner.mjs";
+import { runStrategyWizard } from "./strategy-wizard.mjs";
+import { createOrcaClient, pick, res, wtStamp, slugify, headSha, MODEL_FLAG_RE, isKiroCmd } from "./lib/orca-cli.mjs";
+import { createStatusManager, writeStatusTo } from "./lib/status.mjs";
+import { createNotifier } from "./lib/notify.mjs";
+import { reportUsage } from "./lib/usage.mjs";
+import { createRunner, runEarlyChooser } from "./lib/runner.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-// Live-page accumulator: null until the status section assigns it (before any
-// run starts). `die` uses it to leave a final state on the status page.
-let STATUS = null;
+const PROJECT_ROOT = join(HERE, "..");
+
+let statusMgr = null;
+let notifier = null;
+let orcaClient = null;
 let LEDGER = null;
 let LOCK_CTX = null;
 let LAST_MERGE_DANGER = null;
 let PENDING_HUMAN_MERGE = false;
-let ATTEMPT_SEQ = 0;
-const PRE_STEP_TARGET_REFS = {};
-// Run-history latch: set when the startup chooser already archived/restored
-// the previous run's artifacts — the archive call site must then skip, or a
-// resumed run would snapshot the very state it just restored.
 let HISTORY_ARCHIVE_DONE = false;
+const PRE_STEP_TARGET_REFS = {};
+const isolatedState = {};
+
 const log = (...a) => console.log("[orca-flow]", ...a);
 const warn = (...a) => console.warn("[orca-flow]", ...a);
+
+let ART_DIR = ".orca/artifacts";
+let allSteps = [];
+let outPath = (file) => `${ART_DIR}/${file}`;
+
 const die = (m) => {
   console.error("[orca-flow] ERROR:", m);
-  // Final status write for the live page — only once a run has actually
-  // started (runId set by initStatus). Never let this mask the real error.
-  if (STATUS?.meta?.runId) {
-    // A die from inside a step's support code (task-create, cold-start, gate)
-    // never runs statusEnd — downgrade the in-flight step so the page does not
-    // show a pulsing RUNNING row under a terminal badge.
-    for (const st of STATUS.steps)
+  if (statusMgr?.STATUS?.meta?.runId) {
+    const S = statusMgr.STATUS;
+    for (const st of S.steps)
       if ((st.status === "running" || st.status === "waiting-approval") && !st.endedAt) st.status = "unknown";
-    if (STATUS.overall === "running") STATUS.overall = "failed";
-    // Deliberately bypasses the STATUS_FAILED latch: a transient mid-run write
-    // failure (e.g. AV file lock) may have healed by exit — last-chance write.
-    try { writeStatusTo(statusDir(), STATUS); } catch { }
-    // Usage report is best-effort: never mask the real error, never change the
-    // exit code. It re-writes status.js with usage fields on success.
-    try { reportUsage(); } catch (e) { warn(`[usage] report skipped (${e.message})`); }
-    // Notifications are best-effort too — attempted before exit(1) because
-    // delivery is synchronous; never masks the real error.
-    try { notifyRun(STATUS.overall); } catch { }
+    if (S.overall === "running") S.overall = "failed";
+    try { writeStatusTo(statusMgr.statusDir(), S); } catch {}
+    try {
+      reportUsage({
+        STATUS: S, wt: orcaClient?.getWt(), wtPath: orcaClient?.getWtPath(),
+        allSteps, outPath, statusDir: statusMgr.statusDir, writeStatusTo, log, warn,
+      });
+    } catch (e) { warn(`[usage] report skipped (${e.message})`); }
+    try { notifier?.notifyRun(S.overall); } catch {}
   }
   if (LEDGER) {
     try {
       LEDGER.reconcileCloseout({
-        wtDir: WT_PATH || ".",
+        wtDir: orcaClient?.getWtPath() || ".",
         artDirRel: ART_DIR,
-        overall: STATUS?.overall || "failed",
+        overall: statusMgr?.STATUS?.overall || "failed",
         mergeDanger: LAST_MERGE_DANGER,
       });
-    } catch { }
+    } catch {}
   }
   if (LOCK_CTX) {
-    try { releaseRunLock(LOCK_CTX); } catch { }
+    try { releaseRunLock(LOCK_CTX); } catch {}
     LOCK_CTX = null;
   }
   process.exit(1);
 };
 
-// --- Parse argv: flags + objective ---
+// --- Parse CLI flags ---
 const argv = process.argv.slice(2);
-const opt = { from: null, only: null, dryRun: false, config: null, agentOverrides: {}, grillMe: undefined, worktree: null, createWorktree: false, noOpenStatus: false, statusPreview: false, newRun: false, allowOneWayMerge: false, dedupKey: null, ledgerHome: null };
+const opt = {
+  from: null, only: null, dryRun: false, config: null, agentOverrides: {},
+  grillMe: undefined, worktree: null, createWorktree: false,
+  noOpenStatus: false, statusPreview: false, newRun: false,
+  allowOneWayMerge: false, dedupKey: null, ledgerHome: null,
+  scan: false, setup: false, json: false, yes: false, noOrca: false,
+};
 const rest = [];
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -138,8 +112,7 @@ for (let i = 0; i < argv.length; i++) {
     const v = a === "--grill-me";
     if (opt.grillMe !== undefined && opt.grillMe !== v) die("--grill-me and --no-grill-me are mutually exclusive.");
     opt.grillMe = v;
-  }
-  else if (a === "--config") opt.config = argv[++i];
+  } else if (a === "--config") opt.config = argv[++i];
   else if (a === "--worktree") opt.worktree = argv[++i];
   else if (a === "--create-worktree") opt.createWorktree = true;
   else if (a === "--no-open-status") opt.noOpenStatus = true;
@@ -148,11 +121,38 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--allow-one-way-merge") opt.allowOneWayMerge = true;
   else if (a === "--dedup-key") opt.dedupKey = argv[++i];
   else if (a === "--ledger-home") opt.ledgerHome = argv[++i];
+  else if (a === "--scan") opt.scan = true;
+  else if (a === "--setup") opt.setup = true;
+  else if (a === "--json") opt.json = true;
+  else if (a === "--yes" || a === "--apply-recommended") opt.yes = true;
+  else if (a === "--no-orca") opt.noOrca = true;
   else if (a === "--agent") {
     const [step, ag] = argv[++i].split("=");
     if (step && ag) opt.agentOverrides[step] = ag;
   } else rest.push(a);
 }
+
+// --- Pre-development strategy scan / interactive setup commands ---
+if (opt.scan) {
+  const scan = scanLocalAgents({ queryOrca: !opt.noOrca });
+  const recommendation = recommendStrategy(scan);
+  if (opt.json) console.log(JSON.stringify({ scan, recommendation }, null, 2));
+  else console.log(formatScanReport(scan, recommendation));
+  process.exit(0);
+}
+if (opt.setup) {
+  const scan = scanLocalAgents({ queryOrca: !opt.noOrca });
+  const recommendation = recommendStrategy(scan);
+  await runStrategyWizard({
+    projectDir: PROJECT_ROOT,
+    scan,
+    recommendation,
+    interactive: !opt.yes && Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    applyRecommended: opt.yes,
+  });
+  process.exit(0);
+}
+
 const objective = rest.join(" ").trim();
 if (!objective && !opt.dryRun && !opt.statusPreview)
   die('An objective is required, e.g.: node .orca/flow.mjs "Build a login page"');
@@ -163,183 +163,107 @@ let cfg;
 try { cfg = JSON.parse(readFileSync(join(HERE, CONFIG_FILE), "utf8")); }
 catch (e) { die(`Could not read ${CONFIG_FILE}: ${e.message}`); }
 
-// --grill-me / --no-grill-me: one-shot override of the interview step's enabled
-// state (id convention: "grill"). Applied BEFORE normalization so --only/--from
-// and read-shrinking all see the final state.
 if (opt.grillMe !== undefined) {
   const grill = (cfg.pipeline || []).find((s) => s && s.id === "grill");
   if (!grill) die(`--grill-me/--no-grill-me: ${CONFIG_FILE} has no step with id "grill".`);
   grill.enabled = opt.grillMe;
 }
 
-const ART_DIR = cfg.artifactsDir || ".orca/artifacts";
-// Fully automatic by default: every spec gets an AUTONOMY directive (never ask
-// the user, decide and record assumptions) and per-step "gate" flags are
-// ignored — the pipeline runs end-to-end unattended. Set "autoRun": false for
-// manual mode: agents may ask questions and steps with "gate": true block on
-// an approval gate.
+ART_DIR = cfg.artifactsDir || ".orca/artifacts";
+outPath = (file) => `${ART_DIR}/${file}`;
 const AUTO_RUN = cfg.autoRun ?? true;
 const DEFAULT_TIMEOUT = cfg.defaults?.timeoutMs ?? 900000;
-// Readiness gate: a step never launches while a DECLARED read is missing or
-// undersized on disk (the --from/--only blind-start hole: effectiveReads()
-// silently drops such reads). The gate asks the user, then re-runs each
-// missing producer up to readinessRetries times before stopping.
 const READINESS_RETRIES = cfg.defaults?.readinessRetries ?? 3;
 const READINESS_MIN_BYTES = cfg.defaults?.readinessMinBytes ?? 200;
+const agentOf = (step) => opt.agentOverrides[step.id] || step.agent;
+const modelOf = (step) => {
+  const m = step.model !== undefined ? step.model : cfg.defaults?.model;
+  const t = m == null ? "" : String(m).trim();
+  return t && t !== "default" ? t : null;
+};
+const effectiveModel = (step) => {
+  const m = modelOf(step);
+  if (!m) return null;
+  const a = agentOf(step);
+  return (isKiroCmd(a) || MODEL_FLAG_RE.test(a)) ? null : m;
+};
+const timeoutOf = (step) => step.timeoutMs || DEFAULT_TIMEOUT;
 const nudgeRetriesOf = (step) => step.nudgeRetries ?? cfg.defaults?.nudgeRetries ?? 0;
 const nudgeTimeoutOf = (step) => step.nudgeTimeoutMs ?? cfg.defaults?.nudgeTimeoutMs ?? 120000;
 const maxRetriesOf = (step) => step.maxRetries ?? cfg.maxRetries ?? 2;
-const outPath = (file) => `${ART_DIR}/${file}`;
 
-// --- Early bindings (TDZ): the Orca/worktree resolution + startup chooser
-// right below run BEFORE the pipeline is sliced, so every const/let they
-// touch at runtime must already be initialized HERE — earlier than the
-// function declarations that use them (those hoist). ---
-const IS_WIN = process.platform === "win32";
-let ORCA = null;
-// (pick/res were hoisted up from their old spot beside `let RUN_ID` below:
-//  their first consumers are the hoisted resolveWorktree()/resolveWorktreePath()
-//  invoked by the early worktree-resolution block right below this.)
-const pick = (o, keys) => { for (const k of keys) if (o && o[k] != null) return o[k]; };
-// This Orca build wraps payloads in result.{run,task,...}. Unwrap first.
-const res = (j) => (j && j.result) ? j.result : (j || {});
-const WT_PIN = opt.worktree || process.env.ORCA_FLOW_WORKTREE || cfg.defaults?.worktree || null;
-const wtSource = () => opt.worktree ? "--worktree flag"
-  : process.env.ORCA_FLOW_WORKTREE ? "ORCA_FLOW_WORKTREE env"
-  : cfg.defaults?.worktree ? "config defaults.worktree"
-  : CREATED_WORKTREE ? "created this run" : "auto-detect";
-let WT = null;
-let WT_WARNED = false;   // soft mode: report an unresolvable worktree only once
-// Filesystem path of the worktree (agents run THERE, so artifacts live there —
-// not necessarily next to this config). Null until resolvable.
-let WT_PATH = null;
-// Name of the worktree THIS run created (null = none). Set only by
-// ensureWorktree(); the final summary prints the cleanup hint from it.
-let CREATED_WORKTREE = null;
-const wtFixHint = () =>
-  "Fix one of:\n" +
-  "  - run the flow from inside the target Orca worktree (auto-detect), or\n" +
-  '  - let the flow create one (only when no worktree is pinned): re-run with --create-worktree (or set "defaults": { "autoCreateWorktree": true }), or\n' +
-  "  - pass --worktree <selector> for this run, or\n" +
-  "  - set ORCA_FLOW_WORKTREE for this machine/shell, or\n" +
-  '  - set "defaults": { "worktree": "name:<displayName>" } in the config.';
-
-// Resolve the CLI + concrete worktree BEFORE slicing the pipeline: the startup
-// chooser lists/restores PREVIOUS runs from the worktree's artifacts dir, and
-// a chosen resume must set opt.from BEFORE the --from/--only slicing below
-// (read lists must also see artifacts already on disk from earlier runs).
-// Soft mode (dry-run) degrades to run-scope reads if the runtime is down.
-// --status-preview stays CLI-free: it renders its fixture and exits below,
-// before this block — exactly the pre-hoist ordering.
+// --- Early dedup lock + Orca/worktree resolution + startup chooser ---
 const EARLY_RUN_KEY = `${wtStamp()}-${slugify(objective || CONFIG_FILE).slice(0, 24)}-${process.pid}`;
-const EARLY_LEDGER_HOME = opt.ledgerHome || cfg.defaults?.ledgerHome || null;
+const LEDGER_HOME_CFG = opt.ledgerHome || cfg.defaults?.ledgerHome || null;
 if (!opt.statusPreview && !opt.dryRun && opt.dedupKey) {
   let lockRes;
   try {
-    lockRes = acquireRunLock({
-      dedupKey: opt.dedupKey,
-      runKey: EARLY_RUN_KEY,
-      repoDir: process.cwd(),
-      objective,
-      ledgerHome: EARLY_LEDGER_HOME,
-    });
-  } catch (e) {
-    die(`[ledger] lock init failed: ${e.message}`);
-  }
+    lockRes = acquireRunLock({ dedupKey: opt.dedupKey, runKey: EARLY_RUN_KEY, repoDir: process.cwd(), objective, ledgerHome: LEDGER_HOME_CFG });
+  } catch (e) { die(`[ledger] lock init failed: ${e.message}`); }
   if (!lockRes.acquired) {
-    console.error(
-      `[orca-flow] DUPLICATE RUN BLOCKED: dedup-key "${opt.dedupKey}" is already held by live PID ${lockRes.holder?.pid} (run=${lockRes.holder?.runKey}).`
-    );
+    console.error(`[orca-flow] DUPLICATE RUN BLOCKED: dedup-key "${opt.dedupKey}" is already held by live PID ${lockRes.holder?.pid} (run=${lockRes.holder?.runKey}).`);
     process.exit(2);
   }
-  LOCK_CTX = { dedupKey: opt.dedupKey, runKey: EARLY_RUN_KEY, repoDir: process.cwd(), ledgerHome: EARLY_LEDGER_HOME };
-  if (lockRes.reclaimedStale) {
-    warn(`[ledger] reclaimed stale lock for dedup-key "${opt.dedupKey}" (previous PID ${lockRes.holder?.reclaimedStaleFromPid} is no longer running).`);
-  }
-  process.on("exit", () => {
-    if (LOCK_CTX) {
-      try { releaseRunLock(LOCK_CTX); } catch { }
-      LOCK_CTX = null;
-    }
+  LOCK_CTX = { dedupKey: opt.dedupKey, runKey: EARLY_RUN_KEY, repoDir: process.cwd(), ledgerHome: LEDGER_HOME_CFG };
+  if (lockRes.reclaimedStale) warn(`[ledger] reclaimed stale lock for dedup-key "${opt.dedupKey}" (previous PID ${lockRes.holder?.reclaimedStaleFromPid} is no longer running).`);
+  process.on("exit", () => { if (LOCK_CTX) { try { releaseRunLock(LOCK_CTX); } catch {} LOCK_CTX = null; } });
+}
+
+orcaClient = createOrcaClient({
+  cfg, opt, objective, autoRun: AUTO_RUN, agentOf, modelOf,
+  writeStatus: () => statusMgr?.writeStatus(),
+  log, warn, die,
+});
+
+// Early temporary status helpers for startup chooser (before pipeline slicing)
+const earlyStatus = createStatusManager({
+  artDir: ART_DIR, objective, configFile: CONFIG_FILE, cfg, opt,
+  allSteps: [], getSteps: () => [], enabledIds: new Set(), isParallel: new Set(), agentOf,
+  getWt: orcaClient.getWt, getWtPin: orcaClient.getWtPin, getWtPath: orcaClient.getWtPath,
+  getRunId: orcaClient.getRunId, outPath, notifyRun: () => {}, log, warn,
+});
+
+if (!opt.statusPreview) {
+  orcaClient.resolveOrca();
+  await orcaClient.ensureWorktree();
+  orcaClient.resolveWorktree(opt.dryRun);
+  orcaClient.resolveWorktreePath(opt.dryRun);
+  HISTORY_ARCHIVE_DONE = await runEarlyChooser({
+    opt, cfg, artDir: ART_DIR, getWtPath: orcaClient.getWtPath,
+    archiveCurrentRun: earlyStatus.archiveCurrentRun, copyRunFiles: earlyStatus.copyRunFiles,
+    listRuns: earlyStatus.listRuns, printRunList: earlyStatus.printRunList, log,
   });
 }
-if (!opt.statusPreview) {
-  ORCA = resolveOrca();
-  await ensureWorktree();   // may create + pin a worktree when auto-detect fails
-  resolveWorktree(opt.dryRun);
-  resolveWorktreePath(opt.dryRun);
-  // Startup chooser (may restore a previous run and set opt.from BEFORE the
-  // pipeline is sliced — that is why Orca/worktree resolution runs up here).
-  await runChooser();
-}
 
-// --- Normalize pipeline: keep enabled steps, build id->step map ---
-const allSteps = (cfg.pipeline || []).filter((s) => s && s.id);
+// --- Pipeline normalization & strict fail-fast validation ---
+allSteps = (cfg.pipeline || []).filter((s) => s && s.id);
 const byId = Object.fromEntries(allSteps.map((s) => [s.id, s]));
-
-// enabled=false => skip. --only limits the set. --from drops steps before the mark.
-function isEnabled(step) {
-  if (step.enabled === false) return false;
-  if (opt.only) return opt.only.includes(step.id);
-  return true;
-}
-let steps = allSteps.filter(isEnabled);
+let steps = allSteps.filter((s) => s.enabled !== false && (!opt.only || opt.only.includes(s.id)));
 if (opt.from) {
   const idx = steps.findIndex((s) => s.id === opt.from);
   if (idx < 0) die(`--from "${opt.from}" is not among the enabled steps.`);
   steps = steps.slice(idx);
 }
 if (steps.length === 0) die("No steps to run (all skipped?).");
-
 const enabledIds = new Set(steps.map((s) => s.id));
 
-// --- Parallel groups: "parallelWith": "<id>" on a step runs it concurrently
-// with the named EARLIER step. Flat groups only (the target must not carry
-// parallelWith itself); members must sit contiguously after the target in
-// run order; the first step AFTER the group is the join barrier (it waits
-// for every member). Computed after --from/--only slicing: a member whose
-// target fell out of the run set degrades to sequential (warn, not die).
 for (const s of steps) {
   if (!s.parallelWith) continue;
-  const id = s.parallelWith;
-  const t = byId[id];
+  const id = s.parallelWith, t = byId[id];
   if (!t) die(`step "${s.id}": parallelWith "${id}" is not a known step id.`);
   if (t.enabled === false) die(`step "${s.id}": parallelWith "${id}" is disabled in the config.`);
-  if (!enabledIds.has(id)) {
-    warn(`step "${s.id}": parallelWith "${id}" is not part of this run — running it sequentially.`);
-    delete s.parallelWith;
-    continue;
-  }
-  if (steps.indexOf(t) > steps.indexOf(s))
-    die(`step "${s.id}": parallelWith "${id}" must appear EARLIER in the pipeline array.`);
-  if (t.parallelWith)
-    die(`step "${s.id}": parallelWith chains are not allowed — "${id}" itself declares parallelWith.`);
-  if (!AUTO_RUN && s.interactive)
-    die(`step "${s.id}": interactive steps cannot join a parallel group in manual mode.`);
-  // Declared reads only — NOT effectiveReads(). The worktree/ORCA bindings
-  // now live ABOVE this loop (early-bindings block), so the old temporal-
-  // dead-zone reason is gone; the split stays deliberate: these are pure
-  // config-shape checks over ids that are all IN this run (the target passed
-  // the enabledIds guard above; every member is in `steps`), for which
-  // effectiveReads() returns the declared set unchanged — going through it
-  // would only add its soft worktree resolve + filesystem probe, machinery
-  // that exists solely for out-of-run ids these checks never query.
-  const reads = new Set((s.reads || []).filter((id) => byId[id]));
-  if (reads.has(id))
-    die(`step "${s.id}" reads "${id}" — dependent steps cannot run in parallel with what they read.`);
-  for (const m of steps)
-    if (m.parallelWith === id && m !== s && reads.has(m.id))
-      die(`step "${s.id}" reads "${m.id}" — dependent steps cannot run in parallel.`);
+  if (!enabledIds.has(id)) { warn(`step "${s.id}": parallelWith "${id}" is not part of this run — running it sequentially.`); delete s.parallelWith; continue; }
+  if (steps.indexOf(t) > steps.indexOf(s)) die(`step "${s.id}": parallelWith "${id}" must appear EARLIER in the pipeline array.`);
+  if (t.parallelWith) die(`step "${s.id}": parallelWith chains are not allowed — "${id}" itself declares parallelWith.`);
+  if (!AUTO_RUN && s.interactive) die(`step "${s.id}": interactive steps cannot join a parallel group in manual mode.`);
+  const reads = new Set((s.reads || []).filter((rid) => byId[rid]));
+  if (reads.has(id)) die(`step "${s.id}" reads "${id}" — dependent steps cannot run in parallel with what they read.`);
+  for (const m of steps) if (m.parallelWith === id && m !== s && reads.has(m.id)) die(`step "${s.id}" reads "${m.id}" — dependent steps cannot run in parallel.`);
 }
 
-// Run-order groups: [target, ...members] contiguously, singletons otherwise.
 const groups = (() => {
   const membersOf = new Map();
-  for (const s of steps)
-    if (s.parallelWith) {
-      if (!membersOf.has(s.parallelWith)) membersOf.set(s.parallelWith, []);
-      membersOf.get(s.parallelWith).push(s);
-    }
+  for (const s of steps) if (s.parallelWith) { if (!membersOf.has(s.parallelWith)) membersOf.set(s.parallelWith, []); membersOf.get(s.parallelWith).push(s); }
   const out = [];
   for (let i = 0; i < steps.length;) {
     const members = membersOf.get(steps[i].id);
@@ -352,2666 +276,145 @@ const groups = (() => {
   }
   return out;
 })();
-// Members of a >1 group (drives the status page's ∥ chip and the dry-run plan).
 const isParallel = new Set();
 for (const g of groups) if (g.length > 1) for (const m of g) isParallel.add(m.id);
 
-// Forward reads: a read pointing at an in-run step at the same or a later
-// group would make the readiness gate "repair" it by running the producer out
-// of semantic order — reject it at load time instead. Out-of-run reads are
-// exempt (the --from/--only resume case): they are gated at runtime by the
-// readiness check instead. A read of a step with no "writes" can never be
-// satisfied — fail fast rather than burn repair dispatches on it.
 {
   const groupIdx = new Map();
   groups.forEach((g, i) => g.forEach((m) => groupIdx.set(m.id, i)));
-  for (const s of steps)
-    for (const id of (s.reads || [])) {
-      if (!byId[id]) continue;
-      if (!byId[id].writes)
-        die(`step "${s.id}" reads "${id}" which has no "writes" — nothing to read.`);
-      if (enabledIds.has(id) && groupIdx.get(id) >= groupIdx.get(s.id))
-        die(`step "${s.id}" reads "${id}" which has not run yet — reorder the pipeline (reads must point at EARLIER steps).`);
-    }
-}
-
-// Nudge fields: sane non-negative integers; the timeout must be positive.
-// Validated at load so a typo cannot silently disable/monkey-wrench nudging.
-{
-  const nudgeFields = (o, where) => {
-    if (o.nudgeRetries != null && (!Number.isInteger(o.nudgeRetries) || o.nudgeRetries < 0))
-      die(`${where} nudgeRetries must be a non-negative integer (got ${JSON.stringify(o.nudgeRetries)}).`);
-    if (o.nudgeTimeoutMs != null && (!Number.isInteger(o.nudgeTimeoutMs) || o.nudgeTimeoutMs <= 0))
-      die(`${where} nudgeTimeoutMs must be a positive integer of milliseconds (got ${JSON.stringify(o.nudgeTimeoutMs)}).`);
-  };
-  nudgeFields(cfg.defaults || {}, "defaults:");
-  for (const s of steps) nudgeFields(s, `step "${s.id}":`);
-}
-
-// Retry budgets: non-negative integers wherever declared — per step or at the
-// top level. Validated at load so a typo cannot silently change a fix loop's
-// budget (a non-numeric string disables the exhaust check entirely; a
-// fraction dies mid-budget with a fractional attempt count).
-{
-  if (cfg.maxRetries != null && (!Number.isInteger(cfg.maxRetries) || cfg.maxRetries < 0))
-    die(`config: maxRetries must be a non-negative integer (got ${JSON.stringify(cfg.maxRetries)}).`);
-  for (const s of steps)
-    if (s.maxRetries != null && (!Number.isInteger(s.maxRetries) || s.maxRetries < 0))
-      die(`step "${s.id}": maxRetries must be a non-negative integer (got ${JSON.stringify(s.maxRetries)}).`);
-}
-
-// Skills + MCP registries: schema and refs validated at load so a typo dies
-// in --dry-run instead of mid-pipeline. Materialization happens per group.
-validateAgentConfig({ cfg, configDir: HERE, steps, die });
-
-// Gate verification & per-step worktree isolation rules: fail fast at load.
-{
-  for (const s of allSteps) {
-    validateVerifyConfig(s, die);
-    validateIsolationConfig(s, die);
+  for (const s of steps) for (const id of (s.reads || [])) {
+    if (!byId[id]) continue;
+    if (!byId[id].writes) die(`step "${s.id}" reads "${id}" which has no "writes" — nothing to read.`);
+    if (enabledIds.has(id) && groupIdx.get(id) >= groupIdx.get(s.id)) die(`step "${s.id}" reads "${id}" which has not run yet — reorder the pipeline (reads must point at EARLIER steps).`);
   }
-  const tb = cfg.defaults?.targetBranch;
-  if (tb != null && (typeof tb !== "string" || !tb.trim() || /\s/.test(tb)))
-    die(`defaults: targetBranch must be a non-empty branch name with no whitespace (got ${JSON.stringify(tb)}).`);
-  const pb = cfg.defaults?.protectedBranches;
-  if (pb != null && (!Array.isArray(pb) || pb.some((x) => typeof x !== "string" || !x.trim())))
-    die(`defaults: protectedBranches must be an array of non-empty branch names.`);
+  const checkNudge = (o, where) => {
+    if (o.nudgeRetries != null && (!Number.isInteger(o.nudgeRetries) || o.nudgeRetries < 0)) die(`${where} nudgeRetries must be a non-negative integer (got ${JSON.stringify(o.nudgeRetries)}).`);
+    if (o.nudgeTimeoutMs != null && (!Number.isInteger(o.nudgeTimeoutMs) || o.nudgeTimeoutMs <= 0)) die(`${where} nudgeTimeoutMs must be a positive integer of milliseconds (got ${JSON.stringify(o.nudgeTimeoutMs)}).`);
+  };
+  checkNudge(cfg.defaults || {}, "defaults:");
+  for (const s of steps) checkNudge(s, `step "${s.id}":`);
+  if (cfg.maxRetries != null && (!Number.isInteger(cfg.maxRetries) || cfg.maxRetries < 0)) die(`config: maxRetries must be a non-negative integer (got ${JSON.stringify(cfg.maxRetries)}).`);
+  for (const s of steps) if (s.maxRetries != null && (!Number.isInteger(s.maxRetries) || s.maxRetries < 0)) die(`step "${s.id}": maxRetries must be a non-negative integer (got ${JSON.stringify(s.maxRetries)}).`);
 }
+
+validateAgentConfig({ cfg, configDir: HERE, steps, die });
+for (const s of allSteps) { validateVerifyConfig(s, die); validateIsolationConfig(s, die); }
+const tb = cfg.defaults?.targetBranch;
+if (tb != null && (typeof tb !== "string" || !tb.trim() || /\s/.test(tb))) die(`defaults: targetBranch must be a non-empty branch name with no whitespace (got ${JSON.stringify(tb)}).`);
+const pb = cfg.defaults?.protectedBranches;
+if (pb != null && (!Array.isArray(pb) || pb.some((x) => typeof x !== "string" || !x.trim()))) die(`defaults: protectedBranches must be an array of non-empty branch names.`);
 const TARGET_BRANCH = cfg.defaults?.targetBranch || "dev";
 const PROTECTED_BRANCHES = cfg.defaults?.protectedBranches || ["main", "master"];
-if (PROTECTED_BRANCHES.includes(TARGET_BRANCH))
-  die(`defaults: targetBranch "${TARGET_BRANCH}" is listed in protectedBranches (${PROTECTED_BRANCHES.join(", ")}) — refusing to target a protected branch.`);
+if (PROTECTED_BRANCHES.includes(TARGET_BRANCH)) die(`defaults: targetBranch "${TARGET_BRANCH}" is listed in protectedBranches (${PROTECTED_BRANCHES.join(", ")}) — refusing to target a protected branch.`);
 const TURN_START_WINDOW_MS = cfg.defaults?.turnStartWindowMs ?? 120000;
 const TURN_START_ESCALATE_MS = cfg.defaults?.turnStartEscalateMs ?? 600000;
-if (!Number.isInteger(TURN_START_WINDOW_MS) || TURN_START_WINDOW_MS <= 0)
-  die(`defaults: turnStartWindowMs must be a positive integer (got ${JSON.stringify(TURN_START_WINDOW_MS)}).`);
-if (!Number.isInteger(TURN_START_ESCALATE_MS) || TURN_START_ESCALATE_MS < TURN_START_WINDOW_MS)
-  die(`defaults: turnStartEscalateMs must be an integer >= turnStartWindowMs (got ${JSON.stringify(TURN_START_ESCALATE_MS)}).`);
+if (!Number.isInteger(TURN_START_WINDOW_MS) || TURN_START_WINDOW_MS <= 0) die(`defaults: turnStartWindowMs must be a positive integer (got ${JSON.stringify(TURN_START_WINDOW_MS)}).`);
+if (!Number.isInteger(TURN_START_ESCALATE_MS) || TURN_START_ESCALATE_MS < TURN_START_WINDOW_MS) die(`defaults: turnStartEscalateMs must be an integer >= turnStartWindowMs (got ${JSON.stringify(TURN_START_ESCALATE_MS)}).`);
 for (const s of allSteps) {
-  const sw = s.turnStartWindowMs ?? TURN_START_WINDOW_MS;
-  const se = s.turnStartEscalateMs ?? TURN_START_ESCALATE_MS;
-  if (!Number.isInteger(sw) || sw <= 0)
-    die(`step "${s.id}": turnStartWindowMs must be a positive integer (got ${JSON.stringify(s.turnStartWindowMs)}).`);
-  if (!Number.isInteger(se) || se < sw)
-    die(`step "${s.id}": turnStartEscalateMs must be an integer >= turnStartWindowMs (got ${JSON.stringify(s.turnStartEscalateMs)}).`);
+  const sw = s.turnStartWindowMs ?? TURN_START_WINDOW_MS, se = s.turnStartEscalateMs ?? TURN_START_ESCALATE_MS;
+  if (!Number.isInteger(sw) || sw <= 0) die(`step "${s.id}": turnStartWindowMs must be a positive integer (got ${JSON.stringify(s.turnStartWindowMs)}).`);
+  if (!Number.isInteger(se) || se < sw) die(`step "${s.id}": turnStartEscalateMs must be an integer >= turnStartWindowMs (got ${JSON.stringify(s.turnStartEscalateMs)}).`);
 }
 validateMergeDangerConfig(cfg.defaults?.mergeDanger, die);
 const MERGE_DANGER_THRESHOLDS = cfg.defaults?.mergeDanger || null;
-const LEDGER_HOME_CFG = opt.ledgerHome || cfg.defaults?.ledgerHome || null;
-const isolatedState = {};
 
-// A step's reads. Steps in this run always count. Steps NOT part of this run
-// (dropped by --from/--only, or disabled) still count when their artifact file
-// already exists in the worktree — that is the RESUME case: `--from coding`
-// must still point the coder at the design docs produced by an earlier run.
-function effectiveReads(step) {
-  return (step.reads || []).filter((id) => {
-    if (!byId[id]) return false;
-    if (enabledIds.has(id)) return true;
-    // Soft resolve: during dry-run the worktree may be unresolvable (running
-    // from a non-worktree folder) — the plan should still print in full.
-    const p = resolveWorktreePath(true);
-    return p ? existsSync(join(p, ART_DIR, byId[id].writes)) : false;
-  });
-}
+// --- Wire status, notifier, runner ---
+notifier = createNotifier({
+  here: HERE, objective, outPath,
+  statusOf: (id) => statusMgr.statusOf(id),
+  statusDir: () => statusMgr.statusDir(),
+  getStatus: () => statusMgr.STATUS,
+  getRunId: orcaClient.getRunId,
+  getGroups: () => groups,
+  warn,
+});
 
-// Substitute {out} and {reads} in the spec. Mode directives:
-// - auto-run: every spec (except the grill interview) gets an AUTONOMY
-//   directive so agents do not stall waiting for a human.
-// - manual mode: steps flagged "interactive": true get an INTERVIEW protocol
-//   (align with the user before finalizing). Ignored in auto-run mode.
-function renderSpec(step, stepCtx = null) {
-  const reads = effectiveReads(step);
-  const readList = reads.length
-    ? reads.map((id) => `${byId[id].title} (${outPath(byId[id].writes)})`).join(", ")
-    : "(no prior input — start from the objective)";
-  const objectiveLine = `OVERALL OBJECTIVE: ${objective}\n\n`;
-  const autonomy = (AUTO_RUN && step.id !== "grill")
-    ? "\n\nAUTONOMY: this pipeline runs unattended — do NOT ask the user questions and do NOT wait for confirmation. When something is ambiguous, decide with your best judgment and record it in {out} under an 'Assumptions & decisions' section."
-    : "";
-  const interview = (!AUTO_RUN && step.interactive)
-    ? "\n\nINTERACTIVE SESSION (manual mode): this pipeline runs with user oversight — ALIGN WITH THE USER before finalizing. Interview protocol, follow exactly: (1) Ask ONE question at a time in this terminal and WAIT for the answer; never batch questions. (2) Cover, roughly in order: alignment with the functional requirements and scope; non-functional requirements; performance targets and expected load; security and compliance constraints; scalability and growth expectations; database and persistence choices; technology constraints and team preferences; deployment and operations. (3) Prefer multiple choice; open-ended only when options would bias the answer. (4) After each answer, restate your understanding in one short line so the user can correct you early. (5) Finish with a numbered DECISIONS list (decision + rationale) and get the user's confirmation on each before writing {out}. Include the confirmed decisions and any remaining open points in {out}."
-    : "";
-  const wtNote = renderIsolatedWorktreeNote(stepCtx, outPath(step.writes));
-  let mergeDangerBlock = "";
-  if (step.verify?.mergeDangerCheck) {
-    const mdDir = stepCtx?.isolated ? stepCtx.dir : (resolveWorktreePath(true) || ".");
-    const pinnedBase = PRE_STEP_TARGET_REFS[step.id]?.localSha || PRE_STEP_TARGET_REFS[step.id]?.originSha || TARGET_BRANCH;
-    const cls = classifyMergeDanger(mdDir, pinnedBase, { thresholds: MERGE_DANGER_THRESHOLDS });
-    if (!opt.dryRun) LAST_MERGE_DANGER = cls;
-    mergeDangerBlock = formatMergeDangerPromptBlock(cls, TARGET_BRANCH, opt.allowOneWayMerge);
-  }
-  const hasPlaceholder = (step.spec || "").includes("{mergeDangerReport}");
-  const mdSuffix = (!hasPlaceholder && mergeDangerBlock) ? `\n\nMERGE DANGER PRE-CHECK:\n${mergeDangerBlock}` : "";
-  const rep = (str, tok, val) => str.replaceAll(tok, () => val);
-  let rendered = objectiveLine + (step.spec || "") + autonomy + interview + wtNote + mdSuffix;
-  rendered = rep(rendered, "{mergeDangerReport}", mergeDangerBlock || "(no merge-danger check configured)");
-  rendered = rep(rendered, "{out}", outPath(step.writes));
-  rendered = rep(rendered, "{tasks}", step.progress ? outPath(step.progress) : "{tasks}");
-  rendered = rep(rendered, "{reads}", readList);
-  rendered = rep(rendered, "{targetBranch}", TARGET_BRANCH);
-  rendered = rep(rendered, "{protectedBranches}", PROTECTED_BRANCHES.join(", "));
-  rendered = rep(rendered, "{worktreesManifest}", outPath(WORKTREES_MANIFEST));
-  return rendered;
-}
+statusMgr = createStatusManager({
+  artDir: ART_DIR, objective, configFile: CONFIG_FILE, cfg, opt,
+  allSteps, getSteps: () => steps, enabledIds, isParallel, agentOf,
+  getWt: orcaClient.getWt, getWtPin: orcaClient.getWtPin, getWtPath: orcaClient.getWtPath,
+  getRunId: orcaClient.getRunId, outPath, notifyRun: notifier.notifyRun, log, warn,
+});
 
-// --- Orca CLI (argv-safe, no shell to avoid mangling special characters) ---
-// (IS_WIN / ORCA are declared in the early-bindings block near the top.)
-function resolveOrca() {
-  const bases = process.env.ORCA_CLI_COMMAND
-    ? [process.env.ORCA_CLI_COMMAND] : ["orca", "orca-dev", "orca-ide"];
-  const cands = IS_WIN
-    ? bases.flatMap((b) => (b.includes(".") ? [b] : [`${b}.cmd`, `${b}.exe`, b])) : bases;
-  for (const c of cands) {
-    const p = spawnSync(c, ["--version"], { encoding: "utf8" });
-    if (!p.error) return c;
-  }
-  die("Could not find the orca CLI. Set ORCA_CLI_COMMAND.");
-}
-function orca(args, { timeoutMs } = {}) {
-  const full = args.includes("--json") ? args : [...args, "--json"];
-  const r = spawnSync(ORCA, full, {
-    encoding: "utf8", timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
-  const raw = (r.stdout || "").trim();
-  let json = null;
-  for (const line of raw.split(/\r?\n/).reverse()) {
-    const s = line.trim();
-    if (s.startsWith("{") || s.startsWith("[")) { try { json = JSON.parse(s); break; } catch {} }
-  }
-  if (!json && raw) { try { json = JSON.parse(raw); } catch {} }
-  return { ok: r.status === 0, json, raw, stderr: (r.stderr || "").trim() };
-}
-let RUN_ID = null;               // result.run.id from run-create; passed as --run everywhere
-const agentOf = (step) => opt.agentOverrides[step.id] || step.agent;
-// Effective model for a step: step.model overrides defaults.model. "default"
-// (or missing/empty) = leave the agent on its own default model — no flag.
-const modelOf = (step) => {
-  const m = step.model !== undefined ? step.model : cfg.defaults?.model;
-  const t = m == null ? "" : String(m).trim();
-  return t && t !== "default" ? t : null;
-};
-// A model flag inside the agent string wins over the config's model (user
-// flags are respected, never duplicated); kiro-cli has no model selection.
-const MODEL_FLAG_RE = /(^|\s)(--model|-m)(\s|=|$)/;
-const isKiroCmd = (a) => a === "kiro-cli" || a.startsWith("kiro-cli ");
-// The model that will actually reach the CLI for this step (null = agent default).
-const effectiveModel = (step) => {
-  const m = modelOf(step);
-  if (!m) return null;
-  const a = agentOf(step);
-  if (isKiroCmd(a) || MODEL_FLAG_RE.test(a)) return null;
-  return m;
-};
-const timeoutOf = (step) => step.timeoutMs || DEFAULT_TIMEOUT;
-
-// Blocking sleep (Node allows Atomics.wait on the main thread).
-function sleepMs(ms) {
-  const sab = new SharedArrayBuffer(4);
-  Atomics.wait(new Int32Array(sab), 0, 0, ms);
-}
-
-// WHY THE MANUAL DISPATCH PATH: every Orca injection path (worker-start
-// --agent / --terminal, dispatch --inject) waits ~15s at the dispatch_input
-// stage for an ACCEPTANCE signal that only agents LAUNCHED BY ORCA can send —
-// the agent-hook chain (UserPromptSubmit hook -> claude-hook.cmd -> local HTTP
-// POST with a per-dispatch launchToken). A TUI we start via `terminal create`
-// receives and processes the prompt fine, but can never produce that signal,
-// so the dispatch is failed with agent_prompt_stalled and its capability
-// revoked (verified: the agent finishes the work, then its worker_done is
-// rejected). Therefore we use the documented low-level recipe:
-//   1. warm the agent TUI ourselves (terminal create + quiet-detect),
-//   2. create a TRACKING dispatch WITHOUT --inject (no acceptance window),
-//   3. fetch the exact worker preamble via --dry-run --return-preamble,
-//   4. substitute the real dispatch id (dry-run text uses "ctx_dryrun"),
-//   5. deliver with `terminal send --text ... --enter`.
-// Verified end-to-end: prompt delivered, worker_done accepted, task completed.
-// Orca's own cold launch (worker-start --agent) stays as a fallback for
-// machines where the TUI boots inside Orca's acceptance window.
-const START_RETRIES = cfg.defaults?.startRetries ?? 2;
-const START_RETRY_DELAY_MS = cfg.defaults?.startRetryDelayMs ?? 4000;
-const WARMUP_TIMEOUT_MS = cfg.defaults?.warmupTimeoutMs ?? 240000;
-// Where agents run. Precedence:
-//   1. --worktree <selector>         (one-off run)
-//   2. ORCA_FLOW_WORKTREE env        (per machine / shell)
-//   3. defaults.worktree in config   (explicit pin)
-//   4. auto-detect: the Orca worktree containing the invoking directory
-// Auto-detect is the DEFAULT on purpose: a hardcoded pin ships badly (users
-// forget to change it, then the flow targets a foreign worktree or dies with
-// selector_not_found mid-run). Pin only when launching from OUTSIDE the
-// target worktree. A pinned selector is validated BEFORE anything is created,
-// and on failure we list the available worktrees.
-// (WT_PIN / wtSource / WT / WT_WARNED / WT_PATH are declared in the
-// early-bindings block near the top — the startup chooser resolves the
-// worktree before this point in module order.)
-// Human-readable worktree list for error messages. `worktree list` is GLOBAL
-// across repos, so prefer worktrees under the git root of the CWD; fall back
-// to all when none match.
-function worktreeCandidates() {
-  const l = orca(["worktree", "list"]);
-  const ws = (pick(res(l.json), ["worktrees"]) || [])
-    .map((w) => ({ name: pick(w, ["displayName"]) || "", path: pick(w, ["path"]) || "" }))
-    .filter((w) => w.name && w.path);
-  let root = null;
-  const g = spawnSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" });
-  if (!g.error && g.status === 0) root = (g.stdout || "").trim().toLowerCase();
-  const same = root ? ws.filter((w) => {
-    const p = w.path.toLowerCase();
-    return p === root || p.startsWith(root + "\\") || p.startsWith(root + "/");
-  }) : [];
-  return (same.length ? same : ws).slice(0, 8)
-    .map((w) => `  name:${w.name}  ->  ${w.path}`).join("\n");
-}
-// --- Worktree auto-create (defaults.worktree: null + auto-detect failed) ---
-function wtStamp(d = new Date()) {
-  const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-}
-function slugify(text) {
-  return String(text || "")
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "").normalize("NFC")  // objectives may be Vietnamese
-    .toLowerCase()
-    .replace(/đ/g, "d")                  // đ has no NFD decomposition — map before the ASCII filter
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 24)
-    .replace(/-+$/g, "") || "run";
-}
-function gitRoot() {
-  const g = spawnSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" });
-  return !g.error && g.status === 0 ? (g.stdout || "").trim() : null;
-}
-function headSha() {
-  const g = spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" });
-  return !g.error && g.status === 0 ? (g.stdout || "").trim() : null;
-}
-// Runs BEFORE the sync resolution block: if auto-detect fails on a real run,
-// offer (TTY) or honor consent (flag / defaults.autoCreateWorktree) to create
-// a flow-<slug>-<stamp> worktree from current HEAD, then pin WT/WT_PATH so
-// every later sync resolveWorktree() call memoizes it. Never creates in
-// dry-run; a pin (WT_PIN) skips this entirely.
-async function ensureWorktree() {
-  if (WT_PIN || WT || opt.dryRun) return;
-  const w = orca(["worktree", "current"]);
-  const entry = pick(res(w.json), ["worktree"]) || res(w.json);
-  const cur = w.ok ? pick(entry, ["path"]) : null;
-  if (cur) { WT = `path:${cur}`; WT_PATH = cur; return; }   // auto-detect ok — pin like the resolver would
-  const consent = opt.createWorktree || cfg.defaults?.autoCreateWorktree === true;
-  const name = `flow-${slugify(objective)}-${wtStamp()}`;
-  if (!consent) {
-    if (!(process.stdin.isTTY && process.stdout.isTTY)) return;   // resolver die()s with the hint
-    const root = gitRoot();
-    if (!root) die("Cannot create a worktree: the invoking directory is not inside a git repository.");
-    const sha = headSha();
-    if (!sha) die("Cannot create a worktree: this git repository has no commits yet.");
-    const a = await promptChoice(
-      `No Orca worktree detected here. Create "${name}" from HEAD ${sha.slice(0, 8)}? ` +
-      "Uncommitted changes will NOT follow. [y/N] ");
-    if (!/^(y|yes)$/i.test(a.trim())) return;                     // declined — resolver die()s with the hint
-  }
-  const root = gitRoot();
-  if (!root) die("Cannot create a worktree: the invoking directory is not inside a git repository.");
-  const sha = headSha();
-  if (!sha) die("Cannot create a worktree: this git repository has no commits yet.");
-  const c = orca(["worktree", "create", "--repo", `path:${root}`, "--name", name,
-    "--base-branch", sha, "--no-parent"]);
-  if (!c.ok) {
-    const detail = String(c.json?.error || c.stderr || c.raw || "orca worktree create failed").slice(0, 600);
-    die(`Could not create worktree "${name}": ${detail}\n${wtFixHint()}`);
-  }
-  WT = `name:${name}`;                    // memoized by every later resolveWorktree() call
-  const cp = pick(pick(res(c.json), ["worktree"]) || {}, ["path"]);
-  if (cp) WT_PATH = cp;                   // else resolveWorktreePath() fills it via `worktree show`
-  CREATED_WORKTREE = name;
-  log(`[worktree] created ${name}${cp ? " -> " + cp : ""}`);
-}
-function resolveWorktree(soft = false) {
-  if (WT) return WT;
-  if (WT_PIN) {
-    const shown = orca(["worktree", "show", "--worktree", WT_PIN]);
-    const p = pick(res(shown.json).worktree || {}, ["path"]);
-    if (shown.ok && p) { WT = WT_PIN; WT_PATH = p; return WT; }
-    const cands = worktreeCandidates();
-    const msg = `worktree "${WT_PIN}" (from ${wtSource()}) does not exist.\n${wtFixHint()}` +
-      (cands ? `\nAvailable worktrees:\n${cands}` : "");
-    if (soft) { if (!WT_WARNED) { WT_WARNED = true; warn(msg); } return null; }
-    die(msg);
-  }
-  const w = orca(["worktree", "current"]);
-  const entry = pick(res(w.json), ["worktree"]) || res(w.json);
-  const p = pick(entry, ["path"]);
-  if (w.ok && p) { WT = `path:${p}`; WT_PATH = p; return WT; }
-  if (soft) return null;
-  const cands = worktreeCandidates();
-  die("Could not auto-detect the worktree: the invoking directory is not inside an " +
-      `Orca-managed worktree.\n${wtFixHint()}` +
-      (cands ? `\nAvailable worktrees:\n${cands}` : ""));
-}
-function resolveWorktreePath(soft = false) {
-  if (WT_PATH != null) return WT_PATH;
-  const sel = resolveWorktree(soft);
-  if (!sel) return null;
-  if (sel.startsWith("path:")) WT_PATH = sel.slice("path:".length);
-  else {
-    const w = orca(["worktree", "show", "--worktree", sel]);
-    WT_PATH = pick(res(w.json).worktree || {}, ["path"]) || null;
-  }
-  return WT_PATH;
-}
-
-// =============================================================================
-// Live status page (zero-dep). While agents run, the flow keeps a snapshot in
-// <worktree>/<artifactsDir>/:
-//   status.html — written ONCE per run (STATUS_HTML below; static page).
-//   status.js   — rewritten at every step event; contains window.__STATUS={...}.
-// The page re-creates a <script src="status.js"> tag every 2s: classic script
-// tags are NOT CORS-blocked on file:// (fetch is), so a double-clicked page
-// live-updates with no server. Status writes must NEVER kill a run: the first
-// failure warns once, then the page is abandoned.
-// =============================================================================
-STATUS = {
-  meta: {
-    runId: null, objective, config: CONFIG_FILE, worktree: null,
-    startedAt: null, updatedAt: null,
-  },
-  overall: "running",   // running | succeeded | failed | unknown | still-running
-  steps: allSteps.map((s) => ({
-    id: s.id, title: s.title, agent: agentOf(s), writes: s.writes || null,
-    progress: s.progress || null,
-    parallel: isParallel.has(s.id),
-    status: enabledIds.has(s.id) ? "pending" : "skipped",
-    attempt: 0, startedAt: null, endedAt: null, durationMs: null, note: null,
-    tasks: null,
-  })),
-  artifacts: [],
-};
-let STATUS_FAILED = false;
-// Terminal for merge purposes. "unknown" is included beyond the spec's three:
-// a settled-unknown row is more informative than a bare SKIPPED strikethrough.
-const TERMINAL_STATUSES = new Set(["succeeded", "failed", "skipped", "unknown"]);
-function statusDir() { return join(WT_PATH || ".", ART_DIR); }
-const statusJsOf = (S) =>
-  `window.__STATUS=${JSON.stringify(S)};window.__ON_STATUS&&window.__ON_STATUS();`;
-function writeStatusTo(dir, S) { writeFileSync(join(dir, "status.js"), statusJsOf(S)); }
-function writeStatus() {
-  if (STATUS_FAILED) return;
-  try {
-    STATUS.meta.updatedAt = Date.now();
-    writeStatusTo(statusDir(), STATUS);
-  } catch (e) {
-    STATUS_FAILED = true;
-    warn(`status page write failed (${e.message}); continuing without it.`);
-  }
-}
-
-// --- Artifact viewer snapshots: a flat JSONP twin <writes>.js (e.g.
-// PLAN.md.js) next to each artifact, shaped exactly like status.js so the
-// page can lazy-load it with a classic <script> on file://. Rewritten on the
-// same beats as the status rows (init / per-slice while running / settle).
-// Fail-open like writeStatus: the first failure warns once, then snapshots
-// are abandoned — the status page itself is unaffected.
-let ART_FAILED = false;
-function artifactJsOf(name, payload) {
-  return `window.__ARTIFACTS=window.__ARTIFACTS||{};` +
-    `window.__ARTIFACTS[${JSON.stringify(name)}]=${JSON.stringify(payload)};` +
-    `window.__ON_ARTIFACT&&window.__ON_ARTIFACT(${JSON.stringify(name)});`;
-}
-function writeArtifactSnapshotTo(dir, step) {
-  if (!step.writes) return;
-  const payload = { file: step.writes, exists: false, bytes: 0, mtime: null, text: "" };
-  try {
-    const st = statSync(join(dir, step.writes));       // throws when not written yet
-    Object.assign(payload, {
-      exists: true, bytes: st.size, mtime: Math.round(st.mtimeMs),
-      text: readFileSync(join(dir, step.writes), "utf8"),
-    });
-  } catch { /* not written yet / unreadable mid-write — snapshot the miss */ }
-  writeFileSync(join(dir, step.writes + ".js"), artifactJsOf(step.writes, payload));
-}
-function writeArtifactSnapshot(step) {
-  if (ART_FAILED || STATUS_FAILED || !step.writes) return;
-  try { writeArtifactSnapshotTo(statusDir(), step); }
-  catch (e) {
-    ART_FAILED = true;
-    warn(`artifact snapshot write failed (${e.message}); viewer disabled for this run.`);
-  }
-}
-
-// --- Run history: each NEW run snapshots the previous run's flat artifacts
-// into <ART_DIR>/runs/<seq>-<timestamp>/ (COPY — flat files stay in place so
-// readiness/--from resume semantics are untouched). Failures warn and never
-// block a run. Subdirectories (runs/ itself) are skipped.
-function nextRunDirName() {
-  const runsRoot = join(WT_PATH || ".", ART_DIR, "runs");
-  let max = 0;
-  try { for (const e of readdirSync(runsRoot)) { const m = /^(\d{4,})-/.exec(e); if (m) max = Math.max(max, Number(m[1])); } } catch { }
-  const t = new Date(), p2 = (n) => String(n).padStart(2, "0");
-  const stamp = `${t.getFullYear()}${p2(t.getMonth() + 1)}${p2(t.getDate())}-${p2(t.getHours())}${p2(t.getMinutes())}${p2(t.getSeconds())}`;
-  return { runsRoot, name: String(max + 1).padStart(4, "0") + "-" + stamp };
-}
-function copyRunFiles(srcDir, destDir, label) {
-  let copied = 0;
-  try {
-    mkdirSync(destDir, { recursive: true });
-    for (const e of readdirSync(srcDir, { withFileTypes: true })) {
-      if (!e.isFile()) continue;
-      try { copyFileSync(join(srcDir, e.name), join(destDir, e.name)); copied++; }
-      catch (e2) { warn(`[history] could not copy ${e.name} ${label}: ${e2.message}`); }
-    }
-  } catch (e) { warn(`[history] ${label} failed: ${e.message}`); }
-  return copied;
-}
-function archiveCurrentRun() {
-  const artDir = join(WT_PATH || ".", ART_DIR);
-  let hasFiles = false;
-  try { hasFiles = readdirSync(artDir, { withFileTypes: true }).some((e) => e.isFile()); } catch { return; }
-  if (!hasFiles) return;                       // first run: nothing to snapshot
-  const { runsRoot, name } = nextRunDirName();
-  const dest = join(runsRoot, name);
-  const n = copyRunFiles(artDir, dest, "(archive)");
-  if (n > 0) log(`[history] archived previous run's artifacts -> ${ART_DIR}/runs/${name}/ (${n} files)`);
-  else { try { rmdirSync(dest); } catch { } }  // empty archive: free the seq
-}
-
-const statusOf = (id) => STATUS.steps.find((x) => x.id === id) || null;
-function statusSet(id, patch) { const st = statusOf(id); if (st) Object.assign(st, patch); }
-function statusBegin(id) {
-  const st = statusOf(id);
-  if (!st) return;
-  st.status = "running"; st.attempt += 1;
-  st.startedAt = Date.now(); st.endedAt = null; st.durationMs = null; st.note = null;
-  writeStatus();
-}
-function statusEnd(id, outcome, note) {
-  const st = statusOf(id);
-  if (!st) return;
-  st.status = outcome === "succeeded" ? "succeeded"
-    : outcome === "failed" ? "failed"
-    // still-running: its terminal was left open to finish — keep it visually live
-    : outcome === "still-running" ? "running" : "unknown";
-  st.endedAt = Date.now();
-  if (st.startedAt) st.durationMs = st.endedAt - st.startedAt;
-  st.note = note || null;
-  writeStatus();
-}
-function finishStatus(overall) {
-  STATUS.overall = overall;
-  STATUS.artifacts = steps.map((s) => outPath(s.writes));
-  writeStatus();
-  notifyRun(overall);
-}
-
-// ===== usage-report: pure helpers (extract-tested by .orca/usage-test/run-tests.mjs — keep dependency-free) =====
-// These functions reference NOTHING from module scope (no cfg/STATUS/fs/log) so
-// the test harness can lift the whole block out of the file with a regex and
-// execute it. Filesystem work stays in reportUsage() below the end marker.
-
-// Claude Code stores per-project transcripts in ~/.claude/projects/<slug>/ where
-// <slug> is the cwd with every non-alphanumeric char replaced by '-'.
-function claudeProjectSlug(p) {
-  return String(p || "").replace(/[^A-Za-z0-9]/g, "-") || "-";
-}
-// Compare filesystem paths across case and slash conventions (win32).
-function normPath(p) {
-  return String(p || "").replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "");
-}
-// Claude Code session transcript (.jsonl, one JSON object per line):
-//  - entry.cwd / entry.timestamp (ISO) on every record
-//  - user entries: message.content = string | [{type:"text",text}]
-//  - assistant entries: message.usage { input_tokens, output_tokens,
-//    cache_read_input_tokens, cache_creation_input_tokens }
-function parseClaudeSession(text) {
-  const out = { agent: "claude", cwd: null, userText: "", events: [], subagent: false, firstTs: null, lastTs: null, stepId: null };
-  for (const line of String(text || "").split(/\r?\n/)) {
-    if (!line.startsWith("{")) continue;
-    let j; try { j = JSON.parse(line); } catch { continue; }
-    const parsed = j.timestamp ? Date.parse(j.timestamp) : NaN;
-    const ts = Number.isFinite(parsed) ? parsed : null;
-    if (j.cwd && !out.cwd) out.cwd = j.cwd;
-    if (ts != null) {
-      if (out.firstTs == null || ts < out.firstTs) out.firstTs = ts;
-      if (out.lastTs == null || ts > out.lastTs) out.lastTs = ts;
-    }
-    if (j.type === "user" && j.message) {
-      const c = j.message.content;
-      const txt = typeof c === "string" ? c
-        : Array.isArray(c) ? c.filter((b) => b && typeof b.text === "string").map((b) => b.text).join("\n") : "";
-      if (txt && out.userText.length < 40000) out.userText += txt + "\n";
-    }
-    if (j.type === "assistant" && j.message && j.message.usage && ts != null) {
-      const u = j.message.usage;
-      out.events.push({ ts, in: u.input_tokens || 0, out: u.output_tokens || 0,
-        cr: u.cache_read_input_tokens || 0, cw: u.cache_creation_input_tokens || 0 });
-    }
-  }
-  return out;
-}
-// Codex session rollout (.jsonl): session_meta.payload.cwd; user text in
-// event_msg payloads of type "user_message" (.message); usage arrives as
-// EITHER record depending on codex build:
-//  - token_usage_record.payload.usage
-//      { input_tokens, cached_input_tokens, cache_write_input_tokens,
-//        output_tokens }
-//  - event_msg/token_count, payload.info.last_token_usage = PER-TURN delta
-//      { input_tokens, cached_input_tokens, output_tokens,
-//        reasoning_output_tokens }
-//    (info.total_token_usage beside it is a RUNNING total — never summed).
-// Codex semantics differ from Claude's sibling buckets (measured on real
-// rollouts: a record's own total_tokens always equals input + output):
-//  - cached_input_tokens is a SUBSET of input_tokens, so we keep only the
-//    non-cached remainder in `in` — summing buckets never double-counts;
-//  - output_tokens already INCLUDES reasoning_output_tokens — it is not
-//    added again.
-// Some builds emit BOTH record types with identical numbers in one rollout;
-// when any token_count matched, the token_usage_record lines are dropped.
-function parseCodexSession(text) {
-  const out = { agent: "codex", cwd: null, userText: "", events: [], subagent: false, firstTs: null, lastTs: null, stepId: null };
-  const oldEvents = [], countEvents = [];
-  for (const line of String(text || "").split(/\r?\n/)) {
-    if (!line.startsWith("{")) continue;
-    let j; try { j = JSON.parse(line); } catch { continue; }
-    const parsed = j.timestamp ? Date.parse(j.timestamp) : NaN;
-    const ts = Number.isFinite(parsed) ? parsed : null;
-    const cwd = j.payload && j.payload.cwd ? j.payload.cwd : j.cwd;
-    if (cwd && !out.cwd) out.cwd = cwd;
-    if (ts != null) {
-      if (out.firstTs == null || ts < out.firstTs) out.firstTs = ts;
-      if (out.lastTs == null || ts > out.lastTs) out.lastTs = ts;
-    }
-    if (j.type === "event_msg" && j.payload && j.payload.type === "user_message" && typeof j.payload.message === "string") {
-      if (out.userText.length < 40000) out.userText += j.payload.message + "\n";
-    }
-    const isNew = j.type === "event_msg" && j.payload && j.payload.type === "token_count" && j.payload.info;
-    const usage = isNew ? j.payload.info.last_token_usage
-      : j.type === "token_usage_record" && j.payload ? j.payload.usage : null;
-    if (usage && ts != null) {
-      const inp = usage.input_tokens || 0, cached = usage.cached_input_tokens || 0;
-      (isNew ? countEvents : oldEvents).push({ ts, in: Math.max(0, inp - cached), out: usage.output_tokens || 0,
-        cr: cached, cw: usage.cache_write_input_tokens || 0 });
-    }
-  }
-  out.events = countEvents.length ? countEvents : oldEvents;
-  return out;
-}
-// Step signatures for session attribution. The spec HEAD (text before the first
-// {out}/{reads}/{tasks} placeholder) is the discriminator: it is unique per step
-// and cannot appear in another step's session via {reads} substitution (which
-// injects titles + artifact PATHS, not spec text). The resolved {out} path is a
-// weak secondary — later steps cite earlier artifacts in their reads.
-function stepSignatures(stepsIn, outPathFn) {
-  const sigs = [];
-  for (const s of stepsIn) {
-    if (!s || !s.id || !s.spec) continue;
-    const resolved = s.writes ? outPathFn(s.writes) : "";
-    const head = String(s.spec).split(/{(?:out|reads|tasks)}/)[0];
-    sigs.push({ id: s.id, out: resolved, spec: head.length >= 12 ? head : "" });
-  }
-  return sigs;
-}
-function matchSessionToStep(session, sigs) {
-  if (!session.userText) return null;
-  const heads = new Set(), outs = new Set();
-  for (const g of sigs) {
-    if (g.spec && session.userText.includes(g.spec)) heads.add(g.id);
-    if (g.out && session.userText.includes(g.out)) outs.add(g.id);
-    }
-  if (heads.size === 1) return [...heads][0];
-  if (heads.size > 1) return null;            // ambiguous — never guess
-  return outs.size === 1 ? [...outs][0] : null;
-}
-// Attribution + summation. Rules (spec §Attribution):
-//  - prior-run steps (window entirely before this run) are NOT recounted
-//  - per-session attempt class (spec rule 4): a matched session whose events
-//    all precede the recorded window is an "+N extra attempt" (its window
-//    was overwritten in status) and counts within [runStart, reportTs];
-//    every other matched session counts within the window filter below —
-//    including a post-settle re-match of the spec (manual retype)
-//  - window filter [startedAt-60s, endedAt+120s] keeps only this attempt's
-//    tokens; no endedAt (unfinished) -> [startedAt-60s, reportTs]
-//  - subagent transcripts (no spec preamble) go to the unique step window
-//    containing their last event, else to the run-level unattributed bucket;
-//    transcripts from earlier runs are skipped entirely (their run's own
-//    USAGE.md section already counted them)
-//  - unmatched regular sessions are ignored (user-run agents in the worktree)
-function attributeAndSum(input) {
-  const { steps: stepsIn, sessions, runStart, reportTs, adapters } = input;
-  const WIN_PRE = 60000, WIN_POST = 120000;
-  const zero = { in: 0, out: 0, cacheRead: 0, cacheWrite: 0 };
-  const addEvs = (acc, evs, lo, hi) => {
-    for (const e of evs) if (e.ts >= lo && e.ts <= hi) {
-      acc.in += e.in; acc.out += e.out; acc.cacheRead += e.cr; acc.cacheWrite += e.cw;
-    }
-  };
-  const perStep = {};
-  for (const st of stepsIn) perStep[st.id] = { ...zero, total: 0, note: null };
-  const unattributed = { ...zero, count: 0 };
-
-  const byStep = new Map();
-  for (const s of sessions) {
-    if (s.subagent || !s.stepId) continue;
-    if (!byStep.has(s.stepId)) byStep.set(s.stepId, []);
-    byStep.get(s.stepId).push(s);
-  }
-
-  for (const st of stepsIn) {
-    const u = perStep[st.id];
-    if (st.status === "pending" || st.status === "skipped") continue;   // never ran — no row noise
-    if (st.startedAt != null && st.startedAt < runStart - WIN_PRE) { u.note = "prior run"; continue; }
-    const mine = byStep.get(st.id) || [];
-    if (!mine.length) { u.note = adapters.includes(st.agent) ? "no session found" : "no adapter"; continue; }
-    const lo = (st.startedAt ?? mine[0]?.firstTs ?? runStart) - WIN_PRE;
-    const hi = st.endedAt != null ? st.endedAt + WIN_POST : reportTs;
-    const notes = [];
-    let extras = 0;
-    for (const x of mine) {
-      if (x.lastTs != null && x.lastTs < lo) {
-        // older retry attempt whose window was overwritten in status — count
-        // within this run's bounds (spec rule 4: events precede the window)
-        addEvs(u, x.events, runStart, reportTs);
-        extras++;
-      } else {
-        // current attempt OR a post-settle re-match of the spec (manual
-        // retype): the window filter alone decides what counts
-        addEvs(u, x.events, lo, hi);
-      }
-    }
-    if (st.endedAt == null) notes.push("unfinished");
-    if (extras) notes.push("+" + extras + " extra attempt" + (extras > 1 ? "s" : ""));
-    u.note = notes.join("; ") || null;
-  }
-
-  for (const s of sessions) {
-    if (!s.subagent) continue;
-    // earlier run's spend — that run's own USAGE.md section already counted it
-    if (s.lastTs == null || s.lastTs < runStart - WIN_PRE) continue;
-    const hits = stepsIn.filter((st) => st.startedAt != null && st.endedAt != null &&
-      s.lastTs != null && s.lastTs >= st.startedAt - WIN_PRE && s.lastTs <= st.endedAt + WIN_POST);
-    if (hits.length === 1) addEvs(perStep[hits[0].id], s.events, -Infinity, Infinity);
-    else { unattributed.count++; addEvs(unattributed, s.events, -Infinity, Infinity); }
-  }
-
-  const totals = { ...zero };
-  for (const id in perStep) for (const k of ["in", "out", "cacheRead", "cacheWrite"]) totals[k] += perStep[id][k];
-  for (const k of ["in", "out", "cacheRead", "cacheWrite"]) totals[k] += unattributed[k];
-  for (const id in perStep) {
-    const u = perStep[id];
-    u.total = u.in + u.out + u.cacheRead + u.cacheWrite;
-  }
-  totals.total = totals.in + totals.out + totals.cacheRead + totals.cacheWrite;
-  return { perStep, totals, unattributed };
-}
-const fmtDurMs = (ms) => {
-  const s = Math.max(0, Math.round(Number(ms || 0) / 1000));
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
-  return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m ${String(ss).padStart(2, "0")}s`;
-};
-// One USAGE.md section per run (appended at the bottom of the file).
-function renderUsageSection(r) {
-  const n = (v) => (v == null ? "—" : v.toLocaleString("en-US"));
-  const lines = [];
-  lines.push(`## Run ${r.runId} — ${r.endedIso} — ${r.overall} — ${String(r.objective || "").slice(0, 80)} (${r.config})`);
-  lines.push("");
-  lines.push("| Step | Agent | In | Out | Cache R | Cache W | Total | Duration | Note |");
-  lines.push("|---|---|---:|---:|---:|---:|---:|---:|---|");
-  for (const row of r.rows) {
-    const u = row.usage;
-    lines.push(`| ${row.title} | ${row.agent} | ${u ? n(u.in) : "—"} | ${u ? n(u.out) : "—"} | ${u ? n(u.cacheRead) : "—"} | ${u ? n(u.cacheWrite) : "—"} | ${u ? n(u.total) : "—"} | ${row.durationMs != null ? fmtDurMs(row.durationMs) : "—"} | ${row.note || u?.note || ""} |`);
-  }
-  const t = r.totals;
-  lines.push(`| **Total** | | ${n(t.in)} | ${n(t.out)} | ${n(t.cacheRead)} | ${n(t.cacheWrite)} | **${n(t.total)}** | ${r.runDurationMs != null ? fmtDurMs(r.runDurationMs) : "—"} | ${r.unattributedCount ? `${r.unattributedCount} subagent file(s) unattributed` : ""} |`);
-  lines.push("");
-  return lines.join("\n");
-}
-// ===== usage-report: pure helpers end =====
-
-// --- usage-report glue (fs + module state; runs at run end only) ---
-// Post-run collector: scans the agents' local session logs for THIS worktree
-// and THIS run, attributes tokens to steps, appends USAGE.md and writes the
-// numbers back into the status snapshot. Display-only: every failure warns
-// and moves on — it can never change the run's outcome or exit code.
-function reportUsage() {
-  if (!STATUS?.meta?.runId) return;                       // no run ever started
-  const runStart = STATUS.meta.startedAt || STATUS.meta.updatedAt;
-  if (!runStart) return;
-  const nowTs = Date.now();
-  const adapters = ["claude", "codex"];
-  const wtNorm = normPath(WT_PATH || ".");
-  const home = process.env.ORCA_FLOW_USAGE_HOME || homedir();
-
-  const sessions = [];
-  const mtimeOk = (p) => {
-    try { const m = statSync(p).mtimeMs; return m >= runStart - 300000 && m <= nowTs + 60000; }
-    catch { return false; }
-  };
-  // Generic scan: every .jsonl in `dir` (mtime-filtered, cwd-checked), parsed
-  // with parseFn. isSubagentFn(name) flags transcripts with no step preamble.
-  const readSessions = (dir, parseFn, isSubagentFn) => {
-    let names = [];
-    try { names = readdirSync(dir); } catch { return; }
-    for (const name of names) {
-      if (!name.endsWith(".jsonl")) continue;
-      const p = join(dir, name);
-      if (!mtimeOk(p)) continue;
-      let s; try { s = parseFn(readFileSync(p, "utf8")); } catch { continue; }
-      if (!s.events.length) continue;
-      if (!s.cwd || normPath(s.cwd) !== wtNorm) continue;  // another project's session
-      if (isSubagentFn(name)) s.subagent = true;
-      sessions.push(s);
-    }
-  };
-
-  const claudeRoot = join(home, ".claude", "projects");
-  if (existsSync(claudeRoot)) {
-    // Claude Code writes subagent transcripts in two layouts across versions:
-    // old builds next to the session file as agent-*.jsonl, current builds one
-    // level down at <slug>/<session-id>/subagents/agent-*.jsonl (#5) — scan
-    // both. Every file under subagents/ is a subagent transcript (no step
-    // preamble of its own), flagged for window-containment attribution in
-    // BOTH paths.
-    const isSub = (n) => n.startsWith("agent-");
-    const readClaudeDir = (dir) => {
-      readSessions(dir, parseClaudeSession, isSub);
-      let ents = [];
-      try { ents = readdirSync(dir, { withFileTypes: true }); } catch { }
-      for (const e of ents)
-        if (e.isDirectory())
-          readSessions(join(dir, e.name, "subagents"), parseClaudeSession, () => true);
-    };
-    const slugDir = join(claudeRoot, claudeProjectSlug(WT_PATH || "."));
-    if (existsSync(slugDir)) readClaudeDir(slugDir);
-    else {
-      // slug drift (e.g. case-drifted dirs from Git Bash sessions): scan every
-      // project dir — the cwd check inside each file keeps the fallback exact.
-      let dirs = [];
-      try { dirs = readdirSync(claudeRoot, { withFileTypes: true }); } catch { }
-      for (const d of dirs)
-        if (d.isDirectory()) readClaudeDir(join(claudeRoot, d.name));
-    }
-  }
-  // Codex: rollout files under sessions/YYYY/MM/DD (zero-padded; folder-date
-  // convention varies — see the slack comment inside).
-  const codexRoot = join(home, ".codex", "sessions");
-  if (existsSync(codexRoot)) {
-    // ±1 day of slack: the folder-date convention (local vs UTC midnight)
-    // varies across codex versions; the cwd + event-window filters reject
-    // whatever the extra day folders add.
-    const day = new Date(runStart - 300000); day.setHours(0, 0, 0, 0); day.setDate(day.getDate() - 1);
-    const end = new Date(nowTs); end.setHours(0, 0, 0, 0); end.setDate(end.getDate() + 1);
-    for (let i = 0; i < 40 && day <= end; i++) {
-      const dir = join(codexRoot, String(day.getFullYear()), String(day.getMonth() + 1).padStart(2, "0"), String(day.getDate()).padStart(2, "0"));
-      if (existsSync(dir)) readSessions(dir, parseCodexSession, () => false);
-      day.setDate(day.getDate() + 1);
-    }
-  }
-
-  const sigs = stepSignatures(allSteps, outPath);
-  for (const s of sessions) if (!s.subagent) s.stepId = matchSessionToStep(s, sigs);
-  const engine = attributeAndSum({
-    steps: STATUS.steps.map((st) => ({ id: st.id, agent: st.agent, startedAt: st.startedAt, endedAt: st.endedAt, status: st.status })),
-    sessions, runStart, reportTs: nowTs, adapters,
-  });
-
-  // usage only when tokens were actually counted (design: no-numbers rows are
-  // rendered as "—" with the note, never as zeros); notes travel separately.
-  for (const st of STATUS.steps) {
-    const u = engine.perStep[st.id];
-    st.usage = u && u.total > 0 ? { in: u.in, out: u.out, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, total: u.total, note: u.note } : null;
-  }
-  if (engine.totals.total > 0) STATUS.meta.usage = engine.totals;
-
-  try {
-    const mdPath = join(statusDir(), "USAGE.md");
-    const had = existsSync(mdPath);
-    const lastEnd = Math.max(0, ...STATUS.steps.map((s) => s.endedAt || 0));
-    const section = renderUsageSection({
-      runId: STATUS.meta.runId, endedIso: new Date(nowTs).toLocaleString("en-US"),
-      overall: STATUS.overall, objective: STATUS.meta.objective, config: STATUS.meta.config,
-      rows: STATUS.steps.map((st) => ({ title: st.id, agent: st.agent, usage: st.usage, durationMs: st.durationMs, note: engine.perStep[st.id]?.note })),
-      totals: engine.totals, unattributedCount: engine.unattributed.count,
-      runDurationMs: lastEnd ? lastEnd - STATUS.meta.startedAt : null,
-    });
-    appendFileSync(mdPath, (had ? "" : `# Token usage — ${WT || WT_PATH || "worktree"}\n\nPer-run token consumption per pipeline step, read from Claude Code / Codex session logs after each run. Other agents (opencode, gemini, cursor, grok, kiro-cli) have no adapter yet and report no numbers.\n\n`) + section + "\n", "utf8");
-    log(`[usage] ${mdPath} — run total ${engine.totals.total.toLocaleString("en-US")} tokens`);
-  } catch (e) { warn(`[usage] USAGE.md write failed (${e.message})`); }
-  try { STATUS.meta.updatedAt = nowTs; writeStatusTo(statusDir(), STATUS); } catch { }   // page picks up usage on reload
-}
-
-// Parse a progress checklist (e.g. TASKS.md) an agent maintains mid-step.
-// Grammar: one checkbox per line — "- [ ]" todo, "- [~]" doing, "- [x]"/"- [X]"
-// done; an indent of 2+ spaces marks a sub-task. Every other line (headers,
-// prose, blanks) is ignored. Returns the task array, or null when the text has
-// no checkbox at all. DISPLAY ONLY: callers swallow all errors — a missing or
-// mangled file never affects the run.
-function parseProgress(text) {
-  const out = [];
-  for (const line of String(text || "").split(/\r?\n/)) {
-    const m = line.match(/^(\s*)-\s*\[([ xX~])\]\s*(.*)$/);
-    if (!m) continue;
-    out.push({
-      status: m[2] === " " ? "todo" : m[2] === "~" ? "doing" : "done",
-      level: m[1].length >= 2 ? 1 : 0,
-      text: m[3].trim(),
-    });
-  }
-  return out.length ? out : null;
-}
-
-// Display-only refresh of a step's task checklist from its `progress` file.
-// Swallows everything: the file appears only once the agent writes it and may
-// be mid-write at any read — a good parse replaces the snapshot, errors keep it.
-function refreshProgress(step) {
-  if (!step.progress) return;
-  try {
-    const tasks = parseProgress(readFileSync(join(statusDir(), step.progress), "utf8"));
-    if (tasks) statusSet(step.id, { tasks });
-  } catch { /* not written yet / unreadable — keep the last snapshot */ }
-}
-
-// Resume merge: when a previous status.js from the SAME config exists in the
-// artifacts dir, carry its history into this run — a `--from` resume then
-// shows one continuous picture. Steps excluded from THIS run ("skipped",
-// e.g. everything before --from) adopt their previous terminal state and
-// timings; steps that WILL run keep "pending" but continue their attempt
-// counter, so a resumed fix loop renders as attempt 2, 3, ...
-function loadPreviousStatus(dir = statusDir()) {
-  try {
-    const p = join(dir, "status.js");
-    if (!existsSync(p)) return;
-    const m = readFileSync(p, "utf8").match(/window\.__STATUS=([\s\S]*?);window\.__ON_STATUS/);
-    if (!m) return;
-    const prev = JSON.parse(m[1]);
-    if (!prev || !Array.isArray(prev.steps) || prev.meta?.config !== STATUS.meta.config) return;
-    for (const ps of prev.steps) {
-      const cur = statusOf(ps.id);
-      if (!cur) continue;
-      if (cur.status === "skipped" && TERMINAL_STATUSES.has(ps.status)) {
-        Object.assign(cur, { status: ps.status,
-          attempt: Math.max(cur.attempt, ps.attempt || 0),
-          startedAt: ps.startedAt ?? null, endedAt: ps.endedAt ?? null,
-          durationMs: ps.durationMs ?? null, note: ps.note ?? null });
-      } else if (cur.status === "pending" && prev.overall !== "succeeded") {
-        // Attempts carry only across an INCOMPLETE previous run (resume of a
-        // fix loop) — a clean re-run of a fully-succeeded pipeline starts
-        // every step at attempt 1, not a phantom "attempt 2".
-        cur.attempt = Math.max(cur.attempt, ps.attempt || 0);
-      }
-    }
-  } catch { /* unreadable previous status — start fresh */ }
-}
-
-// Called once, right after run-create: fills meta, merges any previous run's
-// status, writes both files, opens the page.
-function initStatus() {
-  STATUS.meta.runId = RUN_ID;
-  STATUS.meta.worktree = WT || WT_PIN || "(auto-detect)";
-  STATUS.meta.startedAt = Date.now();
-  loadPreviousStatus();
-  // Steps whose progress file already exists (an earlier run in this
-  // worktree) start with its checklist — a `--from` resume then shows the
-  // final task list even for steps that will not run again.
-  for (const st of STATUS.steps) refreshProgress(st);
-  // Snapshot artifacts that already exist (an earlier run in this worktree):
-  // a --from resume then has working viewer links for carried-over steps.
-  for (const st of STATUS.steps)
-    if (st.writes && existsSync(join(statusDir(), st.writes))) writeArtifactSnapshot(st);
-  try {
-    writeFileSync(join(statusDir(), "status.html"), STATUS_HTML);
-  } catch (e) {
-    STATUS_FAILED = true;
-    warn(`status page could not be written (${e.message}); continuing without it.`);
-    return;
-  }
-  writeStatus();
-  openStatusPage();
-  log(`Status page: ${join(statusDir(), "status.html")}`);
-}
-// explorer.exe always exits non-zero (even on success) — its exit code is noise.
-function openStatusPage() {
-  if (STATUS_FAILED) return;   // page was abandoned — don't open a dead tab
-  if (opt.noOpenStatus || !(cfg.defaults?.openStatus ?? true)) return;
-  const file = join(statusDir(), "status.html");
-  const r = IS_WIN ? spawnSync("explorer.exe", [file], { timeout: 10000, stdio: "ignore" })
-    : process.platform === "darwin" ? spawnSync("open", [file], { timeout: 10000, stdio: "ignore" })
-    : spawnSync("xdg-open", [file], { timeout: 10000, stdio: "ignore" });
-  if (r.error) warn(`could not auto-open the status page (${r.error.message}) — open it yourself: ${file}`);
-}
-
-// Dev fixture covering EVERY state, rendered without an Orca run. With the
-// shipped flow.config.json the index mapping is: grill skipped (real config),
-// planning/architecture succeeded, detailed-design RUNNING, uiux-design NEXT
-// (both carry the ∥ parallel chip — they form the parallelWith group),
-// coding failed attempt 2, code-review awaiting approval, security-review
-// unknown, testing skipped, documentation pending.
-function previewStatus() {
-  const S = JSON.parse(JSON.stringify(STATUS));
-  S.meta.runId = "preview-run-0000";
-  S.meta.worktree = WT || WT_PIN || "(preview)";
-  S.meta.objective = S.meta.objective || "Build a login page with email + Google sign-in (sample)";
-  S.meta.startedAt = Date.now() - 3720000;
-  S.meta.updatedAt = Date.now();
-  S.overall = "running";
-  const t = Date.now();
-  S.steps.forEach((s, idx) => {
-    if (s.status === "skipped") return;          // keep real config skips visible
-    if (idx < 3) {
-      s.status = "succeeded"; s.attempt = 1;
-      s.startedAt = t - 3720000 + idx * 600000; s.endedAt = s.startedAt + 240000 + idx * 30000;
-      s.durationMs = s.endedAt - s.startedAt;
-      s.usage = { in: 12340 + idx * 800, out: 8900 + idx * 500, cacheRead: 210000 + idx * 1000, cacheWrite: 0, total: 231240 + idx * 2300, note: null };
-    } else if (idx === 3) { s.status = "running"; s.attempt = 1; s.startedAt = t - 757000; }
-    else if (idx === 4) { /* stays pending — renders the NEXT chip */ }
-    else if (idx === 5) { s.status = "failed"; s.attempt = 2; s.startedAt = t - 600000; s.endedAt = t - 300000; s.durationMs = 300000; s.note = "tests failed (preview fixture)"; s.usage = { in: 40200, out: 15800, cacheRead: 660000, cacheWrite: 12000, total: 728000, note: "+1 extra attempt" }; }
-    else if (idx === 6) { s.status = "waiting-approval"; s.attempt = 1; s.startedAt = t - 120000; s.note = "gate open (preview fixture)"; }
-    else if (idx === 7) { s.status = "unknown"; s.attempt = 1; s.note = "no worker_done seen (preview fixture)"; }
-    else if (idx === 8) { s.status = "skipped"; }
-  });
-  // derive run totals from the fabricated rows so the preview never shows
-  // arithmetic the real writer (meta.usage = Σ steps) could not produce
-  const used = S.steps.filter((s) => s.usage);
-  if (used.length) S.meta.usage = used.reduce((a, s) => ({
-    in: a.in + s.usage.in, out: a.out + s.usage.out,
-    cacheRead: a.cacheRead + s.usage.cacheRead, cacheWrite: a.cacheWrite + s.usage.cacheWrite,
-    total: a.total + s.usage.total,
-  }), { in: 0, out: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
-  // Exercise the real parser + the Tasks card: the first step with a
-  // `progress` file (coding in the shipped config, fix-coding in fixbug)
-  // gets a sample checklist parsed by parseProgress itself.
-  const prog = S.steps.find((s) => s.progress);
-  if (prog) prog.tasks = parseProgress(
-    "- [x] Project scaffold + config wiring\n" +
-    "- [x] Data layer: schema + migrations\n" +
-    "  - [x] migration scripts\n" +
-    "  - [ ] seed data\n" +
-    "- [~] Auth API (email + Google sign-in)\n" +
-    "- [ ] Session management + middleware\n" +
-    "- [ ] Integration tests\n" +
-    "- [ ] README updates\n");
-  return S;
-}
-
-// The page itself. Client behaviors: re-creates <script src="status.js"> every
-// 2s (classic scripts load fine from file://), re-renders every 1s so running
-// timers and "updated Xs ago" tick between snapshots, escapes all strings.
-const STATUS_HTML = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Orca Flow — pipeline status</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background:#0d1017; color:#d7dce4; font:14px/1.5 "Segoe UI",system-ui,-apple-system,sans-serif; padding:24px; }
-  .wrap { max-width: 980px; margin: 0 auto; }
-  .card { background:#151a23; border:1px solid #232b38; border-radius:10px; padding:18px 20px; margin-bottom:14px; }
-  .hdrow { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
-  .objective { font-size:16px; font-weight:700; color:#fff; word-wrap:break-word; }
-  .meta { color:#8b949e; font-size:12px; display:flex; flex-wrap:wrap; gap:14px; margin-top:6px; }
-  .badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:700; letter-spacing:.5px; flex:none; }
-  .badge.running { background:#0c2d1b; color:#3fb950; border:1px solid #1d4428; animation:pulse 1s infinite; }
-  .badge.succeeded { background:#0c2d1b; color:#3fb950; border:1px solid #1d4428; }
-  .badge.failed, .badge.unknown { background:#2d0c0e; color:#f85149; border:1px solid #442126; }
-  .badge.still-running { background:#2d230c; color:#d29922; border:1px solid #44361d; }
-  @keyframes pulse { 50% { opacity:.55; } }
-  .bar { height:6px; background:#21262d; border-radius:3px; overflow:hidden; margin-top:10px; }
-  .bar > i { display:block; height:100%; background:#3fb950; transition:width .4s; }
-  .count { color:#8b949e; font-size:12px; }
-  .main { display:flex; padding:0; overflow:hidden; align-items:stretch; }
-  .rail { flex:0 0 250px; border-right:1px solid #1c2330; padding:14px; min-width:0; }
-  .pane { flex:1 1 auto; min-width:0; padding:14px 16px; }
-  .label { color:#8b949e; font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin:0 0 8px; }
-  .pane .label:not(:first-child) { margin-top:16px; }
-  .tl { position:relative; }
-  .tl::before { content:""; position:absolute; left:5px; top:10px; bottom:10px; width:2px; background:#21262d; }
-  .tstep { position:relative; display:flex; gap:10px; padding:4px 0; }
-  .tdot { flex:none; width:12px; height:12px; border-radius:50%; margin-top:4px; background:#0d1017; z-index:1; box-shadow:0 0 0 3px #151a23; }
-  .tdot.done { background:#3fb950; }
-  .tdot.run { background:#d29922; animation:pulse 1s infinite; }
-  .tdot.pend { background:#30363d; }
-  .tdot.fail { background:#f85149; }
-  .tdot.dim { background:#30363d; opacity:.55; }
-  .tt { min-width:0; flex:1; }
-  .tt b { display:block; font-size:12.5px; font-weight:600; }
-  .tt b.st-pend { color:#6e7681; font-weight:400; }
-  .tt b.st-run { color:#d29922; }
-  .tt b.st-fail { color:#f85149; }
-  .tt b.st-dim { color:#6e7681; font-weight:400; text-decoration:line-through; }
-  .tt b.st-unk { color:#8b949e; font-weight:400; }
-  .tsub { color:#8b949e; font-size:10.5px; display:flex; gap:6px; flex-wrap:wrap; }
-  .tsub .a { color:#58a6ff; }
-  .pgrp { margin:2px 0 2px -8px; padding-left:8px; border-left:2px solid #a371f7; background:linear-gradient(90deg, rgba(163,113,247,.08), transparent 70%); }
-  .chip { display:inline-block; font-size:9px; font-weight:700; letter-spacing:.5px; border:1px solid #1f3a5f; color:#58a6ff; border-radius:4px; padding:1px 6px; margin-left:6px; vertical-align:1px; }
-  .chip.retry { color:#d29922; border-color:#44361d; }
-  .chip.par { color:#a371f7; border-color:#372459; }
-  .nowcard { background:#151a23; border:1px solid #238636; border-radius:8px; padding:12px 14px; margin-bottom:10px; }
-  .nowcard.warn { border-color:#44361d; }
-  .nowcard .nh { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
-  .nowcard .t { font-size:16px; font-weight:700; color:#fff; }
-  .nowcard .a { color:#58a6ff; font-size:12px; }
-  .nowcard .e { margin-left:auto; color:#3fb950; font-size:18px; font-weight:700; font-variant-numeric:tabular-nums; }
-  .nowcard .note { color:#d29922; font-size:12px; margin-top:6px; }
-  .minibar { height:5px; background:#21262d; border-radius:3px; overflow:hidden; margin-top:8px; }
-  .minibar > i { display:block; height:100%; background:#a371f7; transition:width .4s; }
-  .tcount { color:#8b949e; font-size:11px; margin-top:4px; }
-  .upnext { display:flex; align-items:baseline; gap:8px; color:#8b949e; font-size:12.5px; padding:3px 0; flex-wrap:wrap; }
-  .upnext .t { color:#d7dce4; font-weight:600; }
-  .upnext .a { color:#58a6ff; }
-  .tcard-title { font-weight:600; margin-bottom:8px; margin-top:14px; }
-  .tcard-title:first-child { margin-top:0; }
-  .trow { display:flex; align-items:baseline; gap:8px; padding:3px 6px; font-size:13px; }
-  .trow.lv1 { padding-left:28px; }
-  .ttext { min-width:0; overflow-wrap:anywhere; }
-  .tglyph { flex:none; width:18px; text-align:center; font-weight:700; }
-  .trow.done .tglyph { color:#3fb950; }
-  .trow.done .ttext { color:#8b949e; text-decoration:line-through; }
-  .trow.doing .tglyph, .trow.doing .ttext { color:#d29922; }
-  .trow.doing .tglyph { animation:pulse 1s infinite; }
-  .trow.todo .tglyph, .trow.todo .ttext { color:#6e7681; }
-  .thint { color:#8b949e; font-size:12px; font-style:italic; }
-  .artchip { display:inline-block; color:#d7dce4; background:#0d1017; border:1px solid #1c2330; border-radius:4px; padding:1px 6px; margin:2px 4px 2px 0; font-size:11.5px; word-break:break-all; }
-  .artchip.dim { color:#6e7681; }
-  .artdone { color:#3fb950; margin-right:4px; font-weight:700; }
-  .tstep.lnk, .artchip.lnk { cursor: pointer; }
-  .tstep.lnk:hover .tt b { color: #58a6ff; }
-  .artchip.lnk:hover { color: #58a6ff; border-color: #1f3a5f; }
-  .avhead { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
-  .avhead .f { font-size: 14px; font-weight: 700; color: #fff; word-break: break-all; }
-  .avhead .m { color: #8b949e; font-size: 12px; }
-  .avhead .a { color: #58a6ff; }
-  .avback { display: inline-block; background: #0d1017; border: 1px solid #1c2330; color: #8b949e; border-radius: 4px; padding: 2px 10px; font-size: 12px; cursor: pointer; }
-  .avback:hover { color: #d7dce4; border-color: #2c3646; }
-  .artdoc { font: 12.5px/1.55 ui-monospace, Consolas, "Cascadia Mono", Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; background: #0d1017; border: 1px solid #1c2330; border-radius: 8px; padding: 14px; }
-  .artdoc.none { color: #6e7681; font-style: italic; border-style: dashed; }
-  @media (max-width:760px) {
-    .main { flex-direction:column; }
-    .rail { flex:none; border-right:none; border-bottom:1px solid #1c2330; }
-  }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card" id="head"></div>
-  <div class="card main">
-    <div class="rail" id="rail"></div>
-    <div class="pane" id="pane"></div>
-  </div>
-</div>
-<script>
-(function () {
-  var S = null;
-  var LABEL = { pending:"PENDING", running:"RUNNING", succeeded:"DONE", failed:"FAILED",
-                skipped:"SKIPPED", unknown:"UNKNOWN", "waiting-approval":"AWAITING APPROVAL",
-                "still-running":"STILL RUNNING" };
-  var DOT = { succeeded:"done", running:"run", "waiting-approval":"run", failed:"fail",
-              pending:"pend", skipped:"dim", unknown:"dim" };
-  var TC = { succeeded:"", running:"st-run", "waiting-approval":"st-run", failed:"st-fail",
-             pending:"st-pend", skipped:"st-dim", unknown:"st-unk" };
-  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
-    return { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]; }); }
-  function dur(ms) {
-    if (ms == null) return "";
-    var s = Math.max(0, Math.round(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-    s %= 60;
-    return h ? h + "h " + String(m).padStart(2, "0") + "m" : m + "m " + String(s).padStart(2, "0") + "s";
-  }
-  function since(ts) { return ts ? Math.max(0, Date.now() - ts) : null; }
-  function tok(n) { if (n == null) return ""; n = Number(n); if (!isFinite(n) || n < 0) return ""; if (n >= 1e6) return (n / 1e6).toFixed(1) + "M"; if (n >= 1e3) return (n / 1e3).toFixed(1) + "k"; return String(n); }
-  function isLive(s) { return s.status === "running" || s.status === "waiting-approval"; }
-
-  // --- artifact viewer (pane mode) ---
-  var VIEW = null;          // file name currently open (null = overview)
-  var VIEW_AT = 0;          // when it was opened — spin guard for missing snapshots
-  var LAST_VIEW = "\\u0000"; // last rendered viewer HTML — skip identical re-renders
-  function stepByFile(f) {
-    for (var i = 0; i < S.steps.length; i++) if (S.steps[i].writes === f) return S.steps[i];
-    return null;
-  }
-  function openView(f) { VIEW = f; VIEW_AT = Date.now(); LAST_VIEW = "\\u0000"; render(); loadArtifact(); }
-  function closeView() { VIEW = null; LAST_VIEW = "\\u0000"; render(); }
-  function loadArtifact() {          // classic <script src> loads fine on file://
-    if (!VIEW) return;
-    var old = document.getElementById("aloader");
-    if (old) old.remove();
-    var sc = document.createElement("script");
-    sc.id = "aloader";
-    sc.src = encodeURIComponent(VIEW) + ".js?ts=" + Date.now();
-    document.head.appendChild(sc);
-  }
-  window.__ON_ARTIFACT = function (f) { if (VIEW === f) render(); };
-
-  function railStep(s, idx, nextIdx) {
-    var d = isLive(s) ? dur(since(s.startedAt)) : (s.status === "skipped" ? "" : dur(s.durationMs));
-    return '<div class="tstep' + (s.writes ? " lnk" : "") + '"' +
-      (s.writes ? ' data-file="' + esc(s.writes) + '"' : "") + '><span class="tdot ' + (DOT[s.status] || "pend") + '"></span>' +
-      '<div class="tt"><b class="' + (TC[s.status] || "") + '">' + esc(s.title) +
-      (s.parallel ? '<span class="chip par">∥</span>' : "") +
-      (idx === nextIdx ? '<span class="chip">NEXT</span>' : "") +
-      (s.attempt > 1 ? '<span class="chip retry">attempt ' + s.attempt + "</span>" : "") +
-      "</b>" +
-      '<div class="tsub">' + (s.agent ? '<span class="a">' + esc(s.agent) + "</span>" : "") +
-      (d ? "<span>" + d + "</span>" : "") +
-      (s.usage && s.usage.total > 0 ? "<span>" + tok(s.usage.total) + " tok</span>" : "") +
-      (s.status === "waiting-approval" ? '<span style="color:#d29922">gate open</span>' : "") +
-      "</div></div></div>";
-  }
-
-  function render() {
-    if (!S) return;
-    var act = [], lastRun = -1;
-    for (var k = 0; k < S.steps.length; k++) {
-      if (isLive(S.steps[k])) { act.push(S.steps[k]); lastRun = k; }
-    }
-    var nextIdx = -1;
-    for (var j = lastRun + 1; j < S.steps.length; j++)
-      if (S.steps[j].status === "pending") { nextIdx = j; break; }
-    var done = 0;
-    S.steps.forEach(function (s) { if (s.status === "succeeded" || s.status === "skipped") done++; });
-    var pct = S.steps.length ? Math.round((done / S.steps.length) * 100) : 0;
-    var countExtra = "";
-    if (act.length === 1)
-      countExtra = " · " + (act[0].title || "") + (act[0].attempt > 1 ? " (attempt " + act[0].attempt + ")" : "");
-    else if (act.length > 1) countExtra = " · " + act.length + " steps in parallel";
-
-    // --- header ---
-    document.getElementById("head").innerHTML =
-      '<div class="hdrow"><span class="badge ' + esc(S.overall) + '">' +
-      esc(LABEL[S.overall] || String(S.overall || "").toUpperCase()) + '</span>' +
-      '<span class="objective">' + esc(S.meta.objective || "(no objective)") + "</span></div>" +
-      '<div class="meta"><span>run: ' + esc(String(S.meta.runId || "").slice(0, 8)) + "</span>" +
-      "<span>worktree: " + esc(S.meta.worktree || "-") + "</span>" +
-      "<span>config: " + esc(S.meta.config || "-") + "</span>" +
-      "<span>elapsed: " + dur(since(S.meta.startedAt)) + "</span>" +
-      (S.meta.usage && S.meta.usage.total > 0 ? "<span>tokens: " + tok(S.meta.usage.total) + "</span>" : "") +
-      "<span>updated " + Math.max(0, Math.round((Date.now() - S.meta.updatedAt) / 1000)) + "s ago</span></div>" +
-      '<div class="bar"><i style="width:' + pct + '%"></i></div>' +
-      '<div class="count">' + done + "/" + S.steps.length + " steps" + countExtra + "</div>";
-
-    // --- rail: vertical pipeline timeline, parallel runs bracketed ---
-    var rail = "";
-    var i = 0;
-    while (i < S.steps.length) {
-      if (S.steps[i].parallel) {
-        var j2 = i;
-        while (j2 < S.steps.length && S.steps[j2].parallel) j2++;
-        rail += '<div class="pgrp">';
-        for (var q = i; q < j2; q++) rail += railStep(S.steps[q], q, nextIdx);
-        rail += "</div>";
-        i = j2;
-        continue;
-      }
-      rail += railStep(S.steps[i], i, nextIdx);
-      i++;
-    }
-    document.getElementById("rail").innerHTML =
-      '<div class="label">Pipeline</div><div class="tl">' + rail + "</div>";
-
-    // --- pane: now running / summary, up next, tasks, artifacts ---
-    var pane = "";
-    if (VIEW) {
-      var vst = stepByFile(VIEW);
-      var va = (window.__ARTIFACTS || {})[VIEW];
-      var vlive = vst && isLive(vst);
-      var vbody;
-      if (va && va.exists) vbody = '<pre class="artdoc">' + esc(va.text || "") + "</pre>";
-      else if (va && !va.exists && vst && !vlive) vbody = '<div class="artdoc none">artifact not produced</div>';
-      else if (vlive) vbody = '<div class="artdoc none">waiting for ' + esc(VIEW) + " — the agent has not saved it yet</div>";
-      else if (vst && !vlive && (vst.status === "pending" || vst.status === "skipped"))
-        vbody = '<div class="artdoc none">artifact not produced yet</div>';
-      else if (Date.now() - VIEW_AT > 6000) vbody = '<div class="artdoc none">snapshot unavailable</div>';
-      else vbody = '<div class="artdoc none">loading…</div>';
-      var vfresh = va && va.exists
-        ? "updated " + Math.max(0, Math.round((Date.now() - (va.mtime || Date.now())) / 1000)) + "s ago"
-        : "";
-      var vhtml = '<div class="avhead"><button class="avback" data-back="1">← back to overview</button>' +
-        '<span class="f">' + esc(VIEW) + "</span>" +
-        '<span class="m">' + (va && va.exists ? va.bytes + " bytes · " : "") +
-        '<span id="avfresh"></span>' +
-        (vst ? ' · <span class="a">' + esc(LABEL[vst.status] || String(vst.status)) + "</span>" : "") +
-        "</span></div>" + vbody;
-      // identical content → skip the re-render (keeps text selection alive
-      // across the 1s render tick); the freshness leaf below is updated
-      // unconditionally — textContent on a leaf span never disturbs a
-      // selection living in the <pre>
-      if (vhtml !== LAST_VIEW) {
-        LAST_VIEW = vhtml;
-        document.getElementById("pane").innerHTML = vhtml;
-      }
-      var fr = document.getElementById("avfresh");
-      if (fr) fr.textContent = vfresh;
-      return;
-    }
-    if (act.length) {
-      pane += '<div class="label">Now running</div>';
-      act.forEach(function (s) {
-        pane += '<div class="nowcard' + (s.note ? " warn" : "") + '">' +
-          '<div class="nh"><span class="t">' + esc(s.title) + "</span>" +
-          '<span class="a">' + esc(s.agent || "") + "</span>" +
-          (s.attempt > 1 ? '<span class="chip retry">attempt ' + s.attempt + "</span>" : "") +
-          '<span class="e">' + dur(since(s.startedAt)) + "</span></div>" +
-          (s.note ? '<div class="note">' + esc(s.note) + "</div>" : "");
-        if (s.tasks && s.tasks.length) {
-          var tdone = 0;
-          s.tasks.forEach(function (t) { if (t.status === "done") tdone++; });
-          var tpct = s.tasks.length ? Math.round((tdone / s.tasks.length) * 100) : 0;
-          pane += '<div class="minibar"><i style="width:' + tpct + '%"></i></div>' +
-            '<div class="tcount">tasks ' + tdone + "/" + s.tasks.length + "</div>";
-        } else if (s.progress) {
-          pane += '<div class="thint">waiting for ' + esc(s.progress) + " — the agent has not written its task list yet</div>";
-        }
-        pane += "</div>";
-      });
-    } else {
-      var failedStep = null, lastEnd = 0;
-      S.steps.forEach(function (s) {
-        if (!failedStep && s.status === "failed") failedStep = s;
-        if (s.endedAt && s.endedAt > lastEnd) lastEnd = s.endedAt;
-      });
-      var total = (S.meta.startedAt && lastEnd) ? dur(lastEnd - S.meta.startedAt) : "";
-      pane += '<div class="nowcard" style="border-color:#232b38">' +
-        '<div class="nh"><span class="badge ' + esc(S.overall) + '">' +
-        esc(LABEL[S.overall] || String(S.overall || "").toUpperCase()) + "</span>" +
-        '<span class="t">' + done + "/" + S.steps.length + " steps" +
-        (total ? " · " + total + " total" : "") + "</span></div>" +
-        (failedStep ? '<div class="note">' + esc(failedStep.title) +
-          (failedStep.note ? " — " + esc(failedStep.note) : "") +
-          " — re-run with --from " + esc(failedStep.id) + "</div>" : "") +
-        "</div>";
-      if (S.meta.usage && S.meta.usage.total > 0) {
-        pane += '<div class="label">Token usage</div>';
-        S.steps.forEach(function (s) {
-          if (!s.usage || !(s.usage.total > 0)) return;
-          pane += '<div class="upnext"><span class="t">' + esc(s.title) + '</span><span class="a">' + esc(s.agent || "") + '</span>' +
-            '<span>in ' + tok(s.usage.in) + " · out " + tok(s.usage.out) + " · cacheR " + tok(s.usage.cacheRead) + " · cacheW " + tok(s.usage.cacheWrite) + '</span>' +
-            '<span><b>' + tok(s.usage.total) + '</b> tok</span>' +
-            (s.usage.note ? '<span style="color:#6e7681">(' + esc(s.usage.note) + ")</span>" : "") + "</div>";
-        });
-        pane += '<div class="upnext" style="color:#6e7681">run total: <b style="color:#d7dce4">' + tok(S.meta.usage.total) + "</b> tok</div>";
-      }
-    }
-
-    if (nextIdx >= 0) {
-      pane += '<div class="label">Up next</div>';
-      var cluster = [S.steps[nextIdx]];
-      if (S.steps[nextIdx].parallel) {
-        var m = nextIdx + 1;
-        while (m < S.steps.length && S.steps[m].parallel && S.steps[m].status === "pending") {
-          cluster.push(S.steps[m]); m++;
-        }
-      }
-      cluster.forEach(function (s) {
-        pane += '<div class="upnext"><span>→</span><span class="t">' + esc(s.title) + "</span>" +
-          '<span class="a">' + esc(s.agent || "") + "</span>" +
-          (s.parallel ? '<span class="chip par">∥</span>' : "") + "</div>";
-      });
-      if (act.length)
-        pane += '<div class="upnext" style="color:#6e7681">starts when the ' + act.length +
-          " running step" + (act.length > 1 ? "s settle" : " settles") + "</div>";
-    }
-
-    var tasksHtml = "";
-    var ordered = S.steps.slice().sort(function (a, b) {
-      return (isLive(a) ? 0 : 1) - (isLive(b) ? 0 : 1);
-    });
-    ordered.forEach(function (s) {
-      if (s.tasks && s.tasks.length) {
-        var tdone = 0;
-        s.tasks.forEach(function (t) { if (t.status === "done") tdone++; });
-        var tpct = s.tasks.length ? Math.round((tdone / s.tasks.length) * 100) : 0;
-        tasksHtml += '<div class="tcard-title">Tasks — ' + esc(s.title) +
-          ' <span class="count">' + tdone + "/" + s.tasks.length + " done</span></div>" +
-          '<div class="bar"><i style="width:' + tpct + '%"></i></div><div style="height:8px"></div>';
-        s.tasks.forEach(function (t) {
-          tasksHtml += '<div class="trow ' + esc(t.status) + (t.level ? " lv1" : "") + '">' +
-            '<span class="tglyph">' + (t.status === "done" ? "✓" : t.status === "doing" ? "◐" : "○") + "</span>" +
-            '<span class="ttext">' + esc(t.text) + "</span></div>";
-        });
-      } else if (s.progress && isLive(s)) {
-        tasksHtml += '<div class="tcard-title">Tasks — ' + esc(s.title) + "</div>" +
-          '<div class="thint">waiting for ' + esc(s.progress) + " — the agent has not written its task list yet</div>";
-      }
-    });
-    if (tasksHtml) pane += '<div class="label">Tasks</div>' + tasksHtml;
-
-    var arts = "";
-    S.steps.forEach(function (s) {
-      if (!s.writes) return;
-      arts += (s.status === "succeeded" ? '<span class="artdone">✓</span>' : "") +
-        '<span class="artchip lnk' + (s.status === "succeeded" ? "" : " dim") + '" data-file="' + esc(s.writes) + '">' + esc(s.writes) + "</span>";
-    });
-    if (arts) pane += '<div class="label">Artifacts</div>' + arts;
-
-    document.getElementById("pane").innerHTML = pane;
-  }
-  window.__ON_STATUS = function () { S = window.__STATUS; render(); };
-  setInterval(render, 1000);   // running timers + "updated Xs ago" stay fresh
-  function load() {            // classic <script src> loads fine on file://
-    var old = document.getElementById("sloader");
-    if (old) old.remove();
-    var sc = document.createElement("script");
-    sc.id = "sloader";
-    sc.src = "status.js?ts=" + Date.now();
-    document.head.appendChild(sc);
-    if (VIEW) {                     // live tail: re-fetch while the owning
-      var st2 = stepByFile(VIEW);   // step is still running/waiting
-      // NB: isLive deliberately reads the PREVIOUS poll's S — the final
-      // fetch lands one cycle after settle, which is what picks up the
-      // settle-beat snapshot. Checking fresh S (e.g. in __ON_STATUS) would
-      // fetch before the final twin is written and park the viewer on stale
-      // text.
-      if (st2 && isLive(st2)) loadArtifact();
-    }
-  }
-  load();
-  setInterval(load, 2000);
-  // Artifact viewer wiring: delegated clicks (rows, chips, back button) + Esc.
-  function onViewClick(e) {
-    var t = e.target;
-    if (!t || !t.closest) return;
-    var back = t.closest("[data-back]");
-    if (back) { closeView(); return; }
-    var lnk = t.closest("[data-file]");
-    if (lnk) openView(lnk.getAttribute("data-file"));
-  }
-  document.getElementById("rail").addEventListener("click", onViewClick);
-  document.getElementById("pane").addEventListener("click", onViewClick);
-  document.addEventListener("keydown", function (e) {
-    if (e.key === "Escape" && VIEW) closeView();
-  });
-})();
-</script>
-</body>
-</html>
-`;
-
-// --- Notifications (.orca/notify.json) --------------------------------------
-// Per-step and run-end chat messages (slack/telegram/teams/whatsapp/generic).
-// Best-effort by contract — the status page's rule: a dead webhook may never
-// slow, kill or alter a run. Delivery runs in a short-lived node child (HTTP
-// POST, 9s abort, 12s spawn cap) so the synchronous architecture is intact
-// and the die()-path message is still attempted before process.exit(1). The
-// FIRST hard failure warns once and flips a latch: a dead endpoint cannot
-// stack timeouts against the run's own budget.
-const NOTIFY_FILE = process.env.ORCA_FLOW_NOTIFY_FILE || join(HERE, "notify.json");
-const NOTIFY = { on: false, events: new Set(), cfg: {}, dead: false };
-function loadNotify() {
-  try { NOTIFY.cfg = JSON.parse(readFileSync(NOTIFY_FILE, "utf8")); }
-  catch (e) {
-    if (e.code !== "ENOENT") warn(`[notify] disabled: notify.json unreadable (${e.message})`);
-    return;
-  }
-  const c = NOTIFY.cfg;
-  // Empty template (provider/url blank) or enabled:false: off, silent — the
-  // shipped default. Only a FILLED-but-invalid file warns.
-  if (c.enabled === false || !String(c.provider ?? "").trim() || !String(c.url ?? "").trim()) return;
-  try { new URL(c.url); } catch { warn(`[notify] disabled: "url" is not a valid URL`); return; }
-  const providers = ["slack", "telegram", "teams", "whatsapp", "generic"];
-  if (!providers.includes(c.provider)) { warn(`[notify] disabled: unknown provider "${c.provider}"`); return; }
-  const need = { telegram: ["chatId"], whatsapp: ["token", "to"] }[c.provider] || [];
-  const missing = need.filter((k) => !String(c[k] ?? "").trim());
-  if (missing.length) { warn(`[notify] disabled: ${c.provider} needs ${missing.map((k) => `"${k}"`).join(", ")}`); return; }
-  NOTIFY.events = new Set(Array.isArray(c.events) ? c.events : ["step", "run"]);   // missing = both; [] = off
-  if (!NOTIFY.events.size) return;
-  NOTIFY.on = true;
-  const unknown = [...NOTIFY.events].filter((e) => e !== "step" && e !== "run");
-  if (unknown.length) warn(`[notify] unknown event(s) ignored: ${unknown.join(", ")}`);
-}
-// Inline delivery agent: POSTs {url, headers, body} as JSON; 2xx -> exit 0.
-// stdin carries the JSON payload — never logged, never visible in argv.
-const NOTIFY_SCRIPT = `
-const req = JSON.parse(require("fs").readFileSync(0, "utf8"));
-const u = new URL(req.url);
-const mod = u.protocol === "http:" ? require("http") : require("https");
-const data = Buffer.from(JSON.stringify(req.body));
-const r = mod.request({ hostname: u.hostname, port: u.port || (u.protocol === "http:" ? 80 : 443),
-  path: u.pathname + u.search, method: "POST",
-  headers: Object.assign({ "content-type": "application/json", "content-length": data.length }, req.headers || {}) },
-  (res) => { res.resume(); res.on("end", () => {
-    if (res.statusCode < 200 || res.statusCode >= 300) console.error("HTTP " + res.statusCode);
-    process.exit(res.statusCode >= 200 && res.statusCode < 300 ? 0 : 1);
-  }); });
-r.setTimeout(9000, () => r.destroy(new Error("timeout after 9s")));
-r.on("error", (e) => { console.error(e.message); process.exit(1); });
-r.end(data);
-`;
-function notifySend(kind, payload, text) {
-  if (!NOTIFY.on || NOTIFY.dead || !NOTIFY.events.has(kind)) return;
-  const p = NOTIFY.cfg.provider;
-  const headers = p === "whatsapp" ? { Authorization: `Bearer ${NOTIFY.cfg.token}` } : {};
-  const body = p === "generic" ? payload
-    : p === "telegram" ? { chat_id: NOTIFY.cfg.chatId, text }
-    : p === "whatsapp" ? { messaging_product: "whatsapp", to: NOTIFY.cfg.to, type: "text", text: { body: text } }
-    : p === "teams" ? { type: "message", attachments: [{ contentType: "application/vnd.microsoft.card.adaptive",
-        content: { type: "AdaptiveCard", version: "1.4", body: [{ type: "TextBlock", text, wrap: true }] } }] }
-    : { text };
-  let r;
-  try {
-    r = spawnSync(process.execPath, ["-e", NOTIFY_SCRIPT],
-      { input: JSON.stringify({ url: NOTIFY.cfg.url, headers, body }), timeout: 12000, encoding: "utf8" });
-  } catch (e) { r = { error: e }; }
-  if (r.error || r.status !== 0) {
-    NOTIFY.dead = true;
-    const reason = r.error ? (r.error.code || r.error.message) : ((r.stderr || "").trim().split(/\r?\n/).pop() || `exit ${r.status}`);
-    warn(`[notify] disabled: delivery failed (${reason}) — further notifications skipped`);
-  }
-}
-function notifyStep(m) {
-  if (!NOTIFY.on || !NOTIFY.events.has("step")) return;
-  const st = statusOf(m.step.id);
-  const text = `[orca-flow] Step "${m.step.title}" ${String(m.outcome || "unknown").toUpperCase()} in ${fmtDurMs(st?.durationMs ?? 0)} (attempt ${st?.attempt ?? 1}) -> ${outPath(m.step.writes)}${m.note ? ` (${m.note})` : ""}`;
-  notifySend("step", { event: "step", run: RUN_ID, objective, step: m.step.id, title: m.step.title,
-    status: m.outcome, attempt: st?.attempt ?? null, durationMs: st?.durationMs ?? null,
-    note: m.note || null, artifact: outPath(m.step.writes) }, text);
-}
-function notifyRun(overall) {
-  if (!NOTIFY.on || !NOTIFY.events.has("run") || !RUN_ID) return;
-  const durMs = Date.now() - (STATUS?.meta?.startedAt ?? Date.now());
-  const obj = objective.length > 80 ? objective.slice(0, 77) + "..." : objective;
-  let text = `[orca-flow] Run ${RUN_ID} ${String(overall).toUpperCase()} in ${fmtDurMs(durMs)} — "${obj}" · artifacts: ${statusDir()}`;
-  if (overall !== "succeeded") {
-    // Mirror the die site's choice of stuck step: a still-running overall
-    // died on the LIVE member (re-running its group would re-dispatch it);
-    // otherwise the failed member. Unknown settles are named as a last
-    // resort — the console's unknown-die also advises --from the step.
-    const firstOf = (st) => (STATUS?.steps || []).find((s) => s.status === st);
-    const bad = (overall === "still-running" ? firstOf("running") : null) || firstOf("failed") || firstOf("running") || firstOf("unknown");
-    if (bad) {
-      // FAILED/UNKNOWN settles are terminal-safe — they resume from the step
-      // itself. Only a LIVE (running) worker was left ALIVE in its terminal:
-      // pointing --from at it would re-dispatch a live task (the
-      // double-dispatch this kit forbids), so point at the next group's first
-      // step — same advice as the console's stop message (falls back to the
-      // stuck step when it is the last one).
-      const gi = groups.findIndex((g) => g.some((s) => s.id === bad.id));
-      const next = gi >= 0 ? (groups[gi + 1] || [])[0] : null;
-      const target = bad.status === "running" ? (next || bad) : bad;
-      text += ` · stuck at: ${bad.id} — continue with: node .orca/flow.mjs --from ${target.id} "<objective>"`;
-    }
-  }
-  notifySend("run", { event: "run", run: RUN_ID, objective, status: overall, durationMs: durMs }, text);
-}
-
-// Terminal command for an agent. Claude Code on Windows can crash with
-// EBADF when its file watcher races the create/delete of
-// ~/.claude/history.jsonl.lock, which is written on every user prompt
-// (anthropics/claude-code#15739) — hit hardest by the interactive grill
-// step. Skipping prompt history for flow-spawned claude agents removes the
-// lock churn. NOTE: the CLI gates on the exact string "true" (not "1").
-// In auto-run, claude agents ALSO get --permission-mode bypassPermissions:
-// an unattended TUI must never block on an approval prompt. The flag is the
-// reliable channel because project-level settings cannot enable this mode
-// (Claude Code v2.1.257+); manual mode (autoRun:false) keeps default
-// prompting — the user is present and overseeing the terminal.
-// CLAUDE_AFK_TIMEOUT_MS (auto-run only) auto-continues a stray
-// AskUserQuestion dialog after 60s — in manual mode it must stay unset,
-// because interview steps legitimately wait minutes for a human answer.
-// A "claude ..." agent string keeps its user flags and still gets the wrap;
-// a permission flag in the string is respected, never duplicated.
-// Only the manual path can inject env/flags; the cold-start fallback
-// (--agent) launches the TUI Orca-side and stays unprotected.
-function agentCommand(agent, model = null) {
-  // Model flag FIRST, before the claude wrap below, so it lands inside the
-  // wrapped command. A model flag already in the agent string wins; kiro-cli
-  // (Kiro terminal chat) has no model selection — warn and run without it.
-  if (model && !MODEL_FLAG_RE.test(agent) && !isKiroCmd(agent)) agent += ` --model ${model}`;
-  else if (model && isKiroCmd(agent) && !MODEL_FLAG_RE.test(agent))
-    warn(`step model "${model}" ignored: kiro-cli has no model selection.`);
-  const isClaude = agent === "claude" || agent.startsWith("claude ");
-  if (!isClaude) return agent;
-  let cmd = agent;
-  if (AUTO_RUN && !cmd.includes("--permission-mode") && !cmd.includes("--dangerously-skip-permissions"))
-    cmd += " --permission-mode bypassPermissions";
-  // AFK guard in AUTO-RUN ONLY: an AskUserQuestion dialog there is
-  // contract-violating noise (the AUTONOMY directive forbids asking), and
-  // auto-continuing it after 60s matches that directive's semantics. In
-  // manual mode the human answers in the terminal — interview steps budget
-  // 60 min idle — so the var must stay unset there.
-  // CLAUDE_CODE_SKIP_PROMPT_HISTORY is deliberately NOT injected anymore: on
-  // Claude Code >= 2.1.263 it disables session transcript persistence outright
-  // (~/.claude/projects/<slug>/*.jsonl never appears), which starves the usage
-  // report (#5). The Windows history.jsonl.lock EBADF crash it dodged
-  // (anthropics/claude-code#15739) no longer reproduces on current builds; a
-  // machine that still hits it can export the var in its own shell.
-  if (!AUTO_RUN) return cmd;   // manual mode: no env wrapper at all
-  return IS_WIN
-    ? `cmd /c "set CLAUDE_AFK_TIMEOUT_MS=60000&& ${cmd}"`
-    : `env CLAUDE_AFK_TIMEOUT_MS=60000 ${cmd}`;
-}
-
-function warmTerminal(agent, model = null, wtSelector = null) {
-  const startedAt = Date.now();
-  const c = orca(["terminal", "create", "--worktree", wtSelector || resolveWorktree(), "--command", agentCommand(agent, model)]);
-  const cr = res(c.json);
-  const handle = pick(cr, ["handle", "terminalHandle"]) || pick(cr.terminal || {}, ["handle"]);
-  if (!c.ok || !handle) {
-    warn(`terminal create ('${agent}') failed: ${c.stderr || c.raw || "no handle"}; cold-starting instead.`);
-    return null;
-  }
-  // `terminal wait --for tui-idle` is satisfied trivially while a TUI is still
-  // BOOTING (no active request = idle), so it cannot prove input readiness.
-  // Instead detect readiness from output activity: the TUI must have rendered
-  // (lastOutputAt moved) and then stayed quiet for QUIET_MS — at that point
-  // the input box is up and an injected prompt is consumed immediately.
-  const QUIET_MS = 8000, MIN_UPTIME_MS = 12000, POLL_MS = 3000;
-  let lastOut = -1, quietSince = Date.now();
-  while (Date.now() - startedAt < WARMUP_TIMEOUT_MS) {
-    sleepMs(POLL_MS);
-    writeStatus();   // startup heartbeat: page stays fresh during TUI warmup
-    const s = orca(["terminal", "show", "--terminal", handle]);
-    const out = pick(pick(res(s.json), ["terminal"]) || {}, ["lastOutputAt"]) || 0;
-    if (out !== lastOut) { lastOut = out; quietSince = Date.now(); }
-    const elapsed = Date.now() - startedAt;
-    if (elapsed >= MIN_UPTIME_MS && Date.now() - quietSince >= QUIET_MS) {
-      log(`  warmed ${agent} terminal ${handle} (${Math.round(elapsed / 1000)}s)`);
-      return handle;
-    }
-  }
-  warn(`agent '${agent}' TUI not ready within ${WARMUP_TIMEOUT_MS}ms; cold-starting instead.`);
-  orca(["terminal", "close", "--terminal", handle]);
-  return null;
-}
-
-// Manual path: returns { dispatchId, terminal } or null. See the comment
-// block above for why we cannot use worker-start's injection on this setup.
-function manualStart(step, taskId, wtSelector = null) {
-  const term = warmTerminal(agentOf(step), modelOf(step), wtSelector);
-  if (!term) return null;
-
-  // Tracking dispatch WITHOUT --inject: no injection, no acceptance window.
-  const d = orca(["orchestration", "dispatch", "--task", taskId, "--to", term, "--run", RUN_ID]);
-  const dr = res(d.json);
-  const dispatchId = pick(pick(dr, ["dispatch"]) || {}, ["id"]) || pick(dr, ["dispatchId", "dispatch_id"]);
-  if (!d.ok || !dispatchId) {
-    warn(`tracking dispatch '${step.title}' failed: ${d.stderr || d.raw}`);
-    orca(["terminal", "close", "--terminal", term]);
-    return null;
-  }
-
-  // Exact worker preamble (includes the TASK spec) with a placeholder id.
-  const p = orca(["orchestration", "dispatch", "--task", taskId, "--to", term, "--run", RUN_ID,
-    "--dry-run", "--return-preamble"]);
-  const preamble = pick(res(p.json), ["preamble"]);
-  if (!p.ok || !preamble) {
-    warn(`preamble fetch '${step.title}' failed: ${p.stderr || p.raw}`);
-    orca(["terminal", "close", "--terminal", term]);
-    return null;
-  }
-
-  const s = orca(["terminal", "send", "--terminal", term, "--text",
-    preamble.split("ctx_dryrun").join(dispatchId), "--enter"]);
-  if (!s.ok) {
-    warn(`terminal send '${step.title}' failed: ${s.stderr || s.raw}`);
-    orca(["terminal", "close", "--terminal", term]);
-    return null;
-  }
-
-  // A large paste can collapse into an input-box chip that swallows the
-  // trailing Enter — the prompt then sits UNsubmitted forever (verified:
-  // a codex terminal frozen on "[Pasted Content 5237 chars]", no heartbeat,
-  // dispatch never settled). A bare Enter a few seconds later submits it,
-  // and is a no-op when the paste already went through (verified on codex;
-  // other TUIs ignore Enter on an empty input).
-  sleepMs(3000);
-  orca(["terminal", "send", "--terminal", term, "--text", "", "--enter"]);
-
-  // A send can be silently DROPPED: TUIs may flush pending input when they
-  // finish booting and switch to their input view (seen with opencode —
-  // warmed quiet, paste sent, the welcome screen never changed and the
-  // worker never started). Verify consumption via the rendered preview and
-  // re-send when nothing happened. Preview unavailable => assume delivered
-  // (older hosts) rather than block a healthy worker.
-  const START_GRACE_MS = cfg.defaults?.startGraceMs ?? 90000;
-  const SEND_ATTEMPTS = cfg.defaults?.sendAttempts ?? 3;
-  const previewOf = (h) =>
-    pick(pick(res(orca(["terminal", "show", "--terminal", h]).json), ["terminal"]) || {}, ["preview"]) ?? null;
-  const before = previewOf(term);
-  for (let attempt = 1; attempt <= SEND_ATTEMPTS; attempt++) {
-    const deadline = Date.now() + START_GRACE_MS;
-    while (Date.now() < deadline) {
-      sleepMs(4000);
-      writeStatus();   // startup heartbeat: page stays fresh while watching the paste
-      const pv = previewOf(term);
-      if (pv == null || before == null || pv !== before) return { dispatchId, terminal: term };
-    }
-    if (attempt < SEND_ATTEMPTS) {
-      // Attempt 2 nudges with a bare Enter (submits a pending paste chip
-      // without duplicating it); attempt 3 re-sends the full preamble.
-      const nudge = attempt === 1;
-      warn(`no sign the '${step.title}' prompt was consumed; ${nudge ? "nudging with Enter" : "re-sending"} (${attempt + 1}/${SEND_ATTEMPTS})`);
-      const s2 = nudge
-        ? orca(["terminal", "send", "--terminal", term, "--text", "", "--enter"])
-        : orca(["terminal", "send", "--terminal", term, "--text",
-            preamble.split("ctx_dryrun").join(dispatchId), "--enter"]);
-      if (!s2.ok) { warn(`re-send '${step.title}' failed: ${s2.stderr || s2.raw}`); break; }
-    }
-  }
-  warn(`prompt for '${step.title}' was not consumed after ${SEND_ATTEMPTS} attempt(s); cold-starting instead.`);
-  orca(["terminal", "close", "--terminal", term]);
-  return null;
-}
-
-// Fallback: Orca-managed cold launch via worker-start --agent. Works only
-// where the agent TUI boots within Orca's short dispatch_input window.
-function coldStart(step, taskId, wtSelector = null) {
-  let retryOf = null;
-  const model = modelOf(step);   // same resolution as the manual path (defaults + "default" = no-op)
-  for (let attempt = 0; attempt <= START_RETRIES; attempt++) {
-    const args = ["orchestration", "worker-start", "--task", taskId, "--run", RUN_ID,
-      "--worktree", wtSelector || resolveWorktree(), "--agent", agentOf(step)];
-    if (model) args.push("--model", model);
-    if (step.effort) args.push("--effort", step.effort);
-    if (step.startTimeoutMs) args.push("--timeout-ms", String(step.startTimeoutMs));
-    if (retryOf) args.push("--retry-of", retryOf);
-
-    const r = orca(args);
-    const result = res(r.json);
-    const dispatchId = pick(result, ["dispatchId", "dispatch_id"]);
-    const state = pick(result, ["state"]);
-    const receiptTurnStart = pick(result, ["turnStart", "turn_start"]) || null;
-    if (r.ok && (state === "ready" || !state)) return { dispatchId, terminal: null, dispatchState: state || null, receiptTurnStart };
-
-    const lastError = pick(result, ["lastError"]) || r.stderr || "unknown error";
-    const failedStage = pick(result, ["failedStage", "stage"]);
-    if (dispatchId && state === "failed") {
-      orca(["orchestration", "worker-release", "--dispatch", dispatchId]);
-    }
-    if (attempt < START_RETRIES) {
-      warn(`worker-start '${step.title}' not ready (stage=${failedStage}, error=${lastError}). ` +
-           `Retrying via --retry-of (attempt ${attempt + 1}/${START_RETRIES})...`);
-      retryOf = dispatchId || retryOf;
-      sleepMs(START_RETRY_DELAY_MS);
-      continue;
-    }
-    die(`worker-start '${step.title}' failed after ${attempt + 1} attempt(s): ` +
-        `stage=${failedStage} error=${lastError}. Raw: ${r.raw || r.stderr}`);
-  }
-}
-
-function startWorker(step, taskId, wtSelector = null) {
-  return manualStart(step, taskId, wtSelector) || coldStart(step, taskId, wtSelector);
-}
-
-// =============================================================================
-// DRY-RUN: print the plan and exit
-// =============================================================================
-function printPlan() {
-  log(`Config: ${CONFIG_FILE}${opt.config ? "" : " (default)"}`);
-  log(`Worktree: ${WT || WT_PIN || "(auto-detect, unresolved in dry-run)"}  (${wtSource()})`);
-  log(`Target branch: ${TARGET_BRANCH} (protected: ${PROTECTED_BRANCHES.join(", ")})`);
-  log(`Auto-run: ${AUTO_RUN ? "on — agents run unattended, gates ignored" : "off — steps with 'gate' block for approval"}`);
-  log(`Notifications: ${NOTIFY.on ? `on (${NOTIFY.cfg.provider}, events: ${[...NOTIFY.events].join(",")})` : "off"}`);
-  if (opt.dryRun) {
-    // Read-only listing: the chooser itself is bypassed in dry-run, but the
-    // user still gets to SEE what previous runs exist before a real launch.
-    const prev = listRuns();
-    if (prev.length) { log(""); printRunList(prev); }
-  }
-  log("Pipeline to run (in order):");
-  steps.forEach((s, i) => {
-    const reads = effectiveReads(s);
-    const model = effectiveModel(s);
-    const flags = [];
-    if (s.onFailGoto && enabledIds.has(s.onFailGoto))
-      flags.push(`onFail->${s.onFailGoto}${s.maxRetries != null ? ` x${s.maxRetries}` : ""}`);
-    if (s.gate && !AUTO_RUN) flags.push("gate");
-    if (s.interactive && !AUTO_RUN) flags.push("interactive");
-    if (s.parallelWith) flags.push(`parallel-with ${s.parallelWith}`);
-    else if (isParallel.has(s.id)) flags.push("parallel-group");
-    if ((s.skills || []).length) flags.push(`skills=${s.skills.join(",")}`);
-    if ((s.mcp || []).length) flags.push(`mcp=${s.mcp.join(",")}`);
-    if (s.isolatedWorktree) flags.push("isolated-wt");
-    const vSum = formatVerifySummary(s.verify);
-    if (vSum) flags.push(`verify=${vSum}`);
-    console.log(
-      `  ${i + 1}. ${s.title.padEnd(26)} agent=${agentOf(s).padEnd(9)}` +
-      `${model ? ` model=${model}` : ""} ` +
-      `reads=[${reads.join(", ") || "-"}] writes=${s.writes}` +
-      (flags.length ? `  {${flags.join(", ")}}` : "")
-    );
-  });
-  const pg = groups.filter((g) => g.length > 1);
-  if (pg.length)
-    log(`Parallel groups: ${pg.map((g) => g.map((m) => m.id).join(" ∥ ")).join("; ")} — each group starts together; the next step waits for all of them.`);
-  const skipped = allSteps.filter((s) => !enabledIds.has(s.id)).map((s) => s.id);
-  if (skipped.length) log(`Skipped: ${skipped.join(", ")}`);
-}
-
-// --status-preview renders a SAMPLE dashboard and exits without calling
-// agents. Combined with a real run's trappings (objective / --only / --from /
-// --agent) it almost certainly means the user wanted a REAL run with the
-// status page — which is already the default and needs no flag. Refuse the
-// ambiguous mix instead of silently skipping the pipeline (verified incident:
-// "--only planning,architecture "<objective>" --status-preview" exited after
-// writing the fixture and no agent ever spawned).
 if (opt.statusPreview && (objective || opt.only || opt.from || Object.keys(opt.agentOverrides).length))
   die("--status-preview renders a SAMPLE status page and exits WITHOUT calling agents, but this command looks like a real run (objective/--only/--from/--agent present). Remove --status-preview to run the pipeline for real — the status page opens automatically — or drop the objective and selectors to see the sample page.");
+if (opt.statusPreview) statusMgr.runPreviewAndExit(HERE);
 
-// Dev fixture: render the status page with every state represented, without
-// an Orca run. ORCA_STATUS_PREVIEW_RESUME=1 additionally exercises the resume
-// merge: a previous run's status.js is simulated, then merged exactly like a
-// --from resume would.
-if (opt.statusPreview) {
-  const dir = join(HERE, "status-preview");
-  try {
-    mkdirSync(dir, { recursive: true });
-    const P = previewStatus();
-    if (process.env.ORCA_STATUS_PREVIEW_RESUME) {
-      writeStatusTo(dir, P);
-      // Pretend this run started --from the 5th step: earlier ones are
-      // excluded ("skipped"), exactly like --from — the merge must then adopt
-      // their previous terminal state for the page.
-      STATUS.steps.forEach((s, idx) => { if (idx < 4) s.status = "skipped"; });
-      STATUS.meta.worktree = WT || WT_PIN || "(preview)";
-      STATUS.meta.startedAt = Date.now() - 3720000;
-      STATUS.meta.updatedAt = Date.now();
-      loadPreviousStatus(dir);
-    }
-    writeFileSync(join(dir, "status.html"), STATUS_HTML);
-    writeStatusTo(dir, process.env.ORCA_STATUS_PREVIEW_RESUME ? STATUS : P);
-    // Sample artifacts + JSONP snapshots so the offline preview demos the
-    // artifact viewer (click a step row / artifact chip). Succeeded steps get
-    // a finished sample; the running step a partial one (live tail look).
-    // Samples derive from pre-merge P: in RESUME mode the merged page may
-    // relabel these rows (throwaway fixture — nothing machine-readable reads it).
-    for (const s of P.steps) {
-      if (!s.writes || !(s.status === "succeeded" || s.status === "running")) continue;
-      const sample = "# " + s.title + "\n\nSample artifact for the --status-preview fixture" +
-        " (status: " + s.status + ").\n\n- deterministic text, written once per preview\n" +
-        (s.status === "running" ? "- the agent is still writing…\n" : "- click a step row or artifact chip to read it\n");
-      // best-effort PER STEP: one locked sample file costs only its own
-      // fixture, never the rest of the preview
-      try {
-        writeFileSync(join(dir, s.writes), sample);
-        writeArtifactSnapshotTo(dir, s);
-      } catch { /* preview is best-effort */ }
-    }
-    log(`Status preview: ${join(dir, "status.html")}` +
-        (process.env.ORCA_STATUS_PREVIEW_RESUME ? " (resume merge exercised)" : ""));
-  } catch (e) { warn(`status preview failed: ${e.message}`); }
-  process.exit(0);
-}
+let WT_DIR = null;
+const runner = createRunner({
+  here: HERE, cfg, opt, objective, configFile: CONFIG_FILE, artDir: ART_DIR, autoRun: AUTO_RUN,
+  targetBranch: TARGET_BRANCH, protectedBranches: PROTECTED_BRANCHES, mergeDangerThresholds: MERGE_DANGER_THRESHOLDS,
+  turnStartWindowMs: TURN_START_WINDOW_MS, turnStartEscalateMs: TURN_START_ESCALATE_MS,
+  readinessRetries: READINESS_RETRIES, readinessMinBytes: READINESS_MIN_BYTES,
+  allSteps, steps, byId, enabledIds, groups, isParallel,
+  agentOf, effectiveModel, timeoutOf, nudgeRetriesOf, nudgeTimeoutOf, outPath,
+  orcaClient, statusMgr, notifier, getLedger: () => LEDGER, getWtDir: () => WT_DIR,
+  isolatedState, preStepTargetRefs: PRE_STEP_TARGET_REFS,
+  setLastMergeDanger: (cls) => { LAST_MERGE_DANGER = cls; },
+  log, warn, die,
+});
 
-// Orca/worktree resolution + the startup chooser already ran ABOVE, before
-// the pipeline was sliced (see the early-bindings block near the top).
-loadNotify();   // validate/announce before the plan prints (dry-run included)
-printPlan();
+notifier.load();
+runner.printPlan();
 if (opt.dryRun) { log("Dry-run — no agents called."); process.exit(0); }
 
-// =============================================================================
-// Execution
-// =============================================================================
-resolveWorktree();          // hard-fail here if still unresolved
-const WT_DIR = resolveWorktreePath();
-if (!WT_DIR) die(`Could not resolve the path of worktree ${WT} (orca worktree show failed). Fix/remove it, then re-run.`);
-
-const runKey = EARLY_RUN_KEY;
+// --- Execute pipeline ---
+orcaClient.resolveWorktree();
+WT_DIR = orcaClient.resolveWorktreePath();
+if (!WT_DIR) die(`Could not resolve the path of worktree ${orcaClient.getWt()} (orca worktree show failed). Fix/remove it, then re-run.`);
 
 const cleanupOnSignal = (sig) => {
-  if (LEDGER) {
-    try {
-      LEDGER.reconcileCloseout({
-        wtDir: WT_DIR || ".",
-        artDirRel: ART_DIR,
-        overall: "interrupted",
-        mergeDanger: LAST_MERGE_DANGER,
-      });
-    } catch { }
-  }
-  if (LOCK_CTX) {
-    try { releaseRunLock(LOCK_CTX); } catch { }
-    LOCK_CTX = null;
-  }
+  if (LEDGER) { try { LEDGER.reconcileCloseout({ wtDir: WT_DIR || ".", artDirRel: ART_DIR, overall: "interrupted", mergeDanger: LAST_MERGE_DANGER }); } catch {} }
+  if (LOCK_CTX) { try { releaseRunLock(LOCK_CTX); } catch {} LOCK_CTX = null; }
   process.exit(sig === "SIGINT" ? 130 : 143);
 };
 process.on("SIGINT", () => cleanupOnSignal("SIGINT"));
 process.on("SIGTERM", () => cleanupOnSignal("SIGTERM"));
-process.on("exit", () => {
-  if (LOCK_CTX) {
-    try { releaseRunLock(LOCK_CTX); } catch { }
-    LOCK_CTX = null;
-  }
-});
+process.on("exit", () => { if (LOCK_CTX) { try { releaseRunLock(LOCK_CTX); } catch {} LOCK_CTX = null; } });
 
-// M2 FIX: Snapshot protected branch SHAs (local + origin) BEFORE any run mutation.
 const initialProtectedShas = snapshotBranchShas(WT_DIR || ".", PROTECTED_BRANCHES);
-
-// Initialize out-of-repo durable Run Ledger (refuses paths inside any repo worktree/git-dir)
 try {
   LEDGER = createRunLedger({
-    runKey,
-    repoDir: WT_DIR || ".",
-    ledgerHome: LEDGER_HOME_CFG,
-    objective,
-    configFile: CONFIG_FILE,
-    targetBranch: TARGET_BRANCH,
-    protectedBranches: PROTECTED_BRANCHES,
-    dedupKey: opt.dedupKey,
-    initialProtectedShas,
-    warn,
+    runKey: EARLY_RUN_KEY, repoDir: WT_DIR || ".", ledgerHome: LEDGER_HOME_CFG,
+    objective, configFile: CONFIG_FILE, targetBranch: TARGET_BRANCH, protectedBranches: PROTECTED_BRANCHES,
+    dedupKey: opt.dedupKey, initialProtectedShas, warn,
   });
   log(`[ledger] out-of-repo run ledger: ${LEDGER.summaryPath}`);
-} catch (e) {
-  die(`[ledger] failed to initialize out-of-repo ledger: ${e.message}`);
-}
+} catch (e) { die(`[ledger] failed to initialize out-of-repo ledger: ${e.message}`); }
 
 mkdirSync(join(WT_DIR || ".", ART_DIR), { recursive: true });
-if (!HISTORY_ARCHIVE_DONE) archiveCurrentRun();
-// Crash recovery: a previous run killed between materialize and restore leaves
-// the manifest behind — put the worktree back before anything else runs.
-if (restoreAgentConfig({ worktree: WT_DIR || ".", warn }))
-  log("[agent-config] restored worktree files left behind by a previous run.");
+if (!HISTORY_ARCHIVE_DONE) statusMgr.archiveCurrentRun();
+if (restoreAgentConfig({ worktree: WT_DIR || ".", warn })) log("[agent-config] restored worktree files left behind by a previous run.");
 for (const isoDir of knownIsolatedWorktreePaths(join(WT_DIR || ".", ART_DIR))) {
-  if (restoreAgentConfig({ worktree: isoDir, warn }))
-    log(`[agent-config] restored isolated worktree files left behind in ${isoDir}.`);
+  if (restoreAgentConfig({ worktree: isoDir, warn })) log(`[agent-config] restored isolated worktree files left behind in ${isoDir}.`);
 }
-if (!orca(["status"]).ok) die("Orca runtime not ready (orca status failed).");
+if (!orcaClient.orca(["status"]).ok) die("Orca runtime not ready (orca status failed).");
 
 log(`Creating Run: ${objective}`);
-const runResp = orca(["orchestration", "run-create", "--objective", objective]);
+const runResp = orcaClient.orca(["orchestration", "run-create", "--objective", objective]);
 if (!runResp.ok) die(`run-create failed: ${runResp.stderr || runResp.raw}`);
-RUN_ID = pick(res(runResp.json).run || {}, ["id"]) || pick(res(runResp.json), ["runId", "run_id"]);
-if (!RUN_ID) die(`Could not read Run ID from run-create. Output: ${runResp.raw}`);
-log(`Run: ${RUN_ID}`);
-LEDGER.setOrcaRunId(RUN_ID);
-initStatus();
+const runId = pick(res(runResp.json).run || {}, ["id"]) || pick(res(runResp.json), ["runId", "run_id"]);
+if (!runId) die(`Could not read Run ID from run-create. Output: ${runResp.raw}`);
+orcaClient.setRunId(runId);
+log(`Run: ${runId}`);
+LEDGER.setOrcaRunId(runId);
+statusMgr.initStatus();
 
-// Create a task per step, keep taskId for reuse on retries
-const taskIds = {};
-function ensureTask(step, stepCtx = null) {
-  if (taskIds[step.id]) {
-    // Reuse on an onFailGoto jump: the cached task settled on its previous
-    // attempt — failed for the gate that demanded the fix, completed for the
-    // fix target and any replayed group siblings — and Orca dispatches only
-    // READY tasks. Reopen it or the replay dies on dispatch (#2). Both
-    // completed->ready and failed->ready are accepted; a status-only update
-    // preserves the recorded result, so the fix note the jump block seeds on
-    // the target survives this second, idempotent update.
-    const u = orca(["orchestration", "task-update", "--id", taskIds[step.id], "--status", "ready"]);
-    if (!u.ok) warn(`reopen of task '${step.title}' (${taskIds[step.id]}) did not confirm: ${u.stderr || u.raw}`);
-    return taskIds[step.id];
-  }
-  // Title becomes the first line of the spec (this build has no --task-title flag).
-  const spec = `# ${step.title}\n\n${renderSpec(step, stepCtx)}`;
-  const r = orca(["orchestration", "task-create", "--run", RUN_ID, "--spec", spec]);
-  const id = pick(res(r.json).task || {}, ["id"]) || pick(res(r.json), ["taskId", "task_id", "id"]);
-  if (!id) die(`task-create '${step.title}' returned no taskId. Output: ${r.raw || r.stderr}`);
-  taskIds[step.id] = id;
-  return id;
-}
-
-// The outcome of a settled worker: worker_done messages carry it inside the
-// `payload` JSON (string or object), not as a top-level field.
-function outcomeOf(done) {
-  if (!done) return null;
-  let o = pick(done, ["outcome", "result"]);
-  if (!o && done.payload != null) {
-    let p = done.payload;
-    if (typeof p === "string") { try { p = JSON.parse(p); } catch { p = null; } }
-    o = pick(p || {}, ["outcome", "result"]);
-  }
-  return o || null;
-}
-
-// Liveness + settlement of the worker started for `taskId`, polled between
-// wait slices. A healthy agent (e.g. a full coding pass) regularly runs LONGER
-// than any fixed wait budget, so an expired wait is NOT a failure signal.
-// Freshness: the terminal's RENDERED PREVIEW changing (TUIs redraw their
-// content constantly while working — and, crucially, an IDLE TUI also ticks
-// lastOutputAt via background repaints, so the timestamp alone CANNOT
-// distinguish "busy" from "sitting at the welcome screen"). Heartbeat /
-// lastOutputAt serve as fallback when no preview is available. Settlement:
-// dispatch.status failed => "failed"; completed => the task record's outcome.
-function workerVitals(taskId, terminal, dispatchId) {
-  const v = { status: null, settled: false, outcome: null, lastBusyMs: 0, heartbeatMs: 0, preview: null, agentWait: null };
-  const d = orca(["orchestration", "dispatch-show", "--task", taskId]);
-  const dd = pick(res(d.json), ["dispatch"]) || {};
-  v.status = pick(dd, ["status"]);
-  const beat = pick(dd, ["last_heartbeat_at"]);
-  if (beat) {
-    const norm = beat.includes("T") ? beat : beat.replace(" ", "T") + (beat.endsWith("Z") ? "" : "Z");
-    const t = Date.parse(norm);
-    if (!Number.isNaN(t)) { v.lastBusyMs = t; v.heartbeatMs = t; }
-  }
-  let tinfo = null;
-  if (terminal) {
-    tinfo = pick(res(orca(["terminal", "show", "--terminal", terminal]).json), ["terminal"]) || {};
-  } else if (dispatchId) {
-    const ws = res(orca(["orchestration", "worker-show", "--dispatch", dispatchId]).json);
-    tinfo = pick(ws, ["terminal"]) || {};
-    v.agentWait = pick(ws, ["agentWait", "agent_wait"]) ?? pick(tinfo, ["agentWait", "agent_wait"]) ?? null;
-  }
-  v.lastBusyMs = Math.max(v.lastBusyMs, pick(tinfo, ["lastOutputAt"]) || 0);
-  v.preview = pick(tinfo, ["preview"]) ?? null;
-  if (v.status === "failed") { v.settled = true; v.outcome = "failed"; }
-  else if (/^(completed|settled|done)$/.test(v.status || "")) {
-    // Worker finished without our wait seeing worker_done (e.g. it landed in
-    // a delivery we already processed). Recover the outcome from the task.
-    v.settled = true;
-    const tl = orca(["orchestration", "task-list", "--run", RUN_ID]);
-    const t = (pick(res(tl.json), ["tasks"]) || []).find((x) => x.id === taskId);
-    let r = t && t.result;
-    if (typeof r === "string") { try { r = JSON.parse(r); } catch { r = null; } }
-    v.outcome = pick(r || {}, ["outcome", "result"]) || "succeeded";
-  }
-  return v;
-}
-
-// Parked-prompt signatures (#4). --permission-mode bypassPermissions does NOT
-// bypass the machine's own permissions.ask rules, and folder-trust / CLI-update
-// dialogs stop a worker the same way: the TUI parks on a question only a human
-// can answer while the flow, seeing a frozen preview, waits to the hard cap.
-// The dialog text lands in the rendered preview verbatim — match it there.
-// Detection ONLY: the flow never answers a prompt itself (auto-confirming a
-// destructive-command ask would be worse than the bug). Order matters — a
-// permission dialog contains several of these; the first (most specific) wins.
-const PARKED_PROMPTS = [
-  { sig: "requires confirmation for this command", label: "a permission-rule confirmation" },
-  { sig: "Do you want to proceed?", label: "a permission confirmation" },
-  { sig: "Quick safety check", label: "the folder-trust check" },
-  { sig: "Yes, I trust this folder", label: "the folder-trust check" },
-  { sig: "Update available", label: "a CLI update prompt" },
-];
-const parkedPromptOf = (preview) =>
-  typeof preview === "string"
-    ? PARKED_PROMPTS.find((p) => preview.includes(p.sig)) || null
-    : null;
-
-// =============================================================================
-// Nudge: auto-retry for missing artifacts (spec: docs/superpowers/specs/
-// 2026-09-18-nudge-auto-retry-design.md). One shared budget per step per
-// dispatch, two triggers: mid-run idle (frozen preview + stale dispatch
-// heartbeat, never while parked on a dialog) and post-settlement
-// (worker_done with the artifact still missing). The artifact file is ground
-// truth (readiness definition: exists and >= readinessMinBytes).
-// =============================================================================
-
-// m.terminal may be null on the cold path — resolve (and cache) the worker's
-// terminal id from the dispatch. Returns null when the host exposes none.
-function nudgeTerminalOf(m) {
-  if (m.terminal) return m.terminal;
-  if (!m.dispatchId) return null;
-  const t = pick(res(orca(["orchestration", "worker-show", "--dispatch", m.dispatchId]).json), ["terminal"]) || {};
-  const id = pick(t, ["id", "terminalId", "terminal_id"]);
-  if (id) m.terminal = id;
-  return id || null;
-}
-
-// Deliver one nudge. Same paste-chip defense as the start ladder: send, then
-// a bare Enter 3 s later. Our own paste rewrites the preview, which resets
-// m.lastBusy — attempts are naturally spaced by nudgeTimeoutMs.
-function nudgeSend(m, text) {
-  const s = orca(["terminal", "send", "--terminal", m.terminal, "--text", text, "--enter"]);
-  if (!s.ok) { warn(`nudge send '${m.step.title}' failed: ${s.stderr || s.raw}`); return false; }
-  sleepMs(3000);
-  orca(["terminal", "send", "--terminal", m.terminal, "--text", "", "--enter"]);
-  m.nudge.left--; m.nudge.count++; m.nudge.sentAt = Date.now();
-  m.lastBusy = Date.now();
-  warn(`[nudge] ${m.nudge.count}/${nudgeRetriesOf(m.step)} sent to "${m.step.title}" (artifact \`${outPath(m.step.writes)}\` missing)`);
-  statusSet(m.step.id, { note: `nudged (${m.nudge.count}/${nudgeRetriesOf(m.step)}) — asked the agent to write ${outPath(m.step.writes)}` });
-  writeStatus();
-  return true;
-}
-
-// Mid-run trigger: called per slice AFTER the parked check (3b). Returns true
-// when a nudge went out. Safety: never fires while parked on a dialog, and
-// demands double idle evidence — preview frozen >= nudgeTimeoutMs AND the
-// dispatch heartbeat stale >= nudgeTimeoutMs (heartbeat unavailable => the
-// frozen preview alone qualifies, per spec fallback).
-function maybeNudgeMidRun(m, v) {
-  if (m.nudge.phase || m.nudge.left <= 0) return false;
-  if (!m.step.writes || artifactReady(m.step.id)) return false;
-  if (v.preview == null || parkedPromptOf(v.preview)) return false;
-  if (Date.now() - m.lastBusy < nudgeTimeoutOf(m.step)) return false;
-  if (v.heartbeatMs > 0 && Date.now() - v.heartbeatMs < nudgeTimeoutOf(m.step)) return false;
-  if (!nudgeTerminalOf(m)) return false;
-  const ok = nudgeSend(m, `[orca-flow] Your response appears truncated — write your complete output to ${outPath(m.step.writes)} now (Markdown). Automated nudge; do not ask questions.`);
-  if (!ok) m.nudge.left = 0;   // undeliverable: stop trying, legacy semantics resume
-  return ok;
-}
-
-// Settlement routing: called with the verdict (worker_done message or
-// vitals-recovered outcome) BEFORE settleMember, while the terminal is still
-// open. Artifact already ready (or no writes) => false, settle now. Nudgeable
-// => send the post-done nudge, stash the verdict, return true (member stays
-// in the wait set). Un-nudgeable paths return false with m.note set; only
-// budget exhaustion WITH delivered attempts sets m.outcome="failed" (we tried
-// and the worker did not comply) — an undeliverable nudge (count 0, e.g. a
-// mid-run send failure already closed the budget) is structurally
-// remedyless, so the ORIGINAL verdict stands. Callers settle with
-// (m.outcome || originalOutcome).
-function holdForNudge(m, outcome, done) {
-  if (!m.step.writes || artifactReady(m.step.id)) return false;
-  if (nudgeRetriesOf(m.step) <= 0) { m.note = "artifact missing (nudge disabled)"; return false; }
-  if (m.nudge.left <= 0) {
-    if (m.nudge.count > 0) { m.note = `artifact missing after ${m.nudge.count} nudge(s)`; m.outcome = "failed"; }
-    else m.note = "artifact missing (nudge undeliverable)";
-    return false;
-  }
-  if (!nudgeTerminalOf(m)) { m.note = "artifact missing (no terminal to nudge)"; return false; }
-  // The one forbidden move is typing into a dialog that parked AFTER
-  // worker_done (folder-trust, CLI update): the bare Enter 3 s later would
-  // submit the dialog's default. Check the live preview before pasting.
-  const tinfo = pick(res(orca(["terminal", "show", "--terminal", m.terminal]).json), ["terminal"]) || {};
-  const parked = parkedPromptOf(pick(tinfo, ["preview"]) ?? null);
-  if (parked) { m.note = `artifact missing (terminal parked on ${parked.label})`; return false; }
-  const ok = nudgeSend(m, `[orca-flow] Your session completed but the output file was not written — write your complete output to ${outPath(m.step.writes)} now (Markdown). Automated nudge; do not ask questions.`);
-  if (!ok) { m.note = "artifact missing (nudge send failed)"; return false; }
-  m.nudge.phase = "post-done";
-  m.nudge.outcome = outcome;
-  m.nudge.done = done;
-  return true;
-}
-
-// Post-done phase machine, called per slice. Ready => settle with the
-// ORIGINAL outcome and a recovered note; each nudgeTimeoutMs without the
-// file spends another attempt; exhausted or hard-capped => settle failed
-// (we hold a verdict — still-running is reserved for the no-verdict case).
-function nudgePoll(m) {
-  if (m.ctx?.isolated) syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: WT_DIR || ".", artDirRel: ART_DIR });
-  if (artifactReady(m.step.id)) {
-    m.note = `artifact recovered via nudge (${m.nudge.count} sent)`;
-    settleMember(m, m.nudge.outcome || "succeeded", m.nudge.done);
-    return;
-  }
-  if (Date.now() - m.startedAt >= m.hardCapMs) {
-    m.note = "artifact still missing after hard cap";
-    settleMember(m, "failed", m.nudge.done);
-    return;
-  }
-  if (Date.now() - m.nudge.sentAt >= nudgeTimeoutOf(m.step)) {
-    if (m.nudge.left > 0) {
-      // Same live-preview parked guard as the first post-done send: a dialog
-      // may have parked BETWEEN nudges (the agent's write attempt can trip a
-      // permissions.ask rule that survives bypassPermissions). Never type
-      // into it — settle with the original outcome per the remedyless rule.
-      const tinfo = pick(res(orca(["terminal", "show", "--terminal", m.terminal]).json), ["terminal"]) || {};
-      const parked = parkedPromptOf(pick(tinfo, ["preview"]) ?? null);
-      if (parked) {
-        m.note = `artifact missing (terminal parked on ${parked.label})`;
-        settleMember(m, m.nudge.outcome || "succeeded", m.nudge.done);
-        return;
-      }
-      if (!nudgeSend(m, `[orca-flow] Still missing ${outPath(m.step.writes)} — write your complete output now. (automated nudge ${m.nudge.count + 1}/${nudgeRetriesOf(m.step)})`))
-        m.nudge.left = 0;
-    } else {
-      m.note = `artifact missing after ${m.nudge.count} nudge(s)`;
-      settleMember(m, "failed", m.nudge.done);
-    }
-  }
-}
-
-// =============================================================================
-// Group execution: launch every member's worker, then ONE shared wait loop.
-// A single step is a group of one — semantics identical to the sequential
-// runner. The critical difference from a per-step loop: the run-scoped
-// `check --wait` can return ANY member's worker_done, so messages are only
-// credited to a member when they name its task id; per-task `workerVitals`
-// remains the authoritative settlement source either way.
-// =============================================================================
-
-// Create the task + start the worker; return the per-member bookkeeping.
-// Budgets mirror the sequential semantics exactly (manual-mode interactive
-// steps get the raised silence/hard caps).
-function launchMember(step, stepCtx = null) {
-  // M10 + m6 FIX: Snapshot pre-step target refs ONCE per step id BEFORE ensureTask/renderSpec.
-  if (step.verify?.mergeDangerCheck && !PRE_STEP_TARGET_REFS[step.id]) {
-    PRE_STEP_TARGET_REFS[step.id] = snapshotTargetRefs(stepCtx?.isolated ? stepCtx.dir : (WT_DIR || "."), TARGET_BRANCH);
-  }
-  const preRefs = PRE_STEP_TARGET_REFS[step.id] || { localSha: null, originSha: null, remoteSha: null, remoteError: null, hasOrigin: false, headSha: null };
-  const preStepTargetSha = preRefs.localSha;
-  const preStepOriginTargetSha = preRefs.originSha;
-  const preStepRemoteTargetSha = preRefs.remoteSha;
-  const preStepRemoteError = preRefs.remoteError;
-  const preStepHasOrigin = preRefs.hasOrigin;
-  const preStepHeadSha = preRefs.headSha;
-  const taskId = ensureTask(step, stepCtx);
-  const wtTag = stepCtx?.isolated ? `, worktree=${stepCtx.wtName}, branch=${stepCtx.branch}` : "";
-  log(`> ${step.title}  (agent=${agentOf(step)}, task=${taskId}${wtTag})`);
-  const requestId = `req-${++ATTEMPT_SEQ}-${step.id}`;
-  if (LEDGER) {
-    LEDGER.recordIntent({
-      requestId,
-      stepId: step.id,
-      title: step.title,
-      agent: agentOf(step),
-      model: effectiveModel(step),
-      attempt: ATTEMPT_SEQ,
-      worktree: stepCtx?.isolated ? stepCtx.wtName : (WT || "integration"),
-      branch: stepCtx?.isolated ? stepCtx.branch : null,
-    });
-  }
-  const launchedAt = Date.now();
-  const started = startWorker(step, taskId, stepCtx?.selector || null);
-  const dispatchedAt = Date.now();
-  const { dispatchId, terminal } = started;
-  const receiptTurnStart = started.receiptTurnStart || (terminal ? "observed" : null);
-  const health = initMemberHealth({
-    startedAt: launchedAt,
-    dispatchedAt,
-    receiptTurnStart,
-    turnStartWindowMs: step.turnStartWindowMs ?? TURN_START_WINDOW_MS,
-    turnStartEscalateMs: step.turnStartEscalateMs ?? TURN_START_ESCALATE_MS,
-  });
-  if (LEDGER) {
-    LEDGER.recordDispatchResult({
-      requestId,
-      stepId: step.id,
-      dispatchId,
-      terminal,
-      turnStart: health.turnStart,
-      state: started.dispatchState || (terminal ? "manual" : "ready"),
-    });
-  }
-  statusSet(step.id, { health: health.state, turnStart: health.turnStart });
-  const interactiveNow = !AUTO_RUN && step.interactive;
-  const baseIdleMs = timeoutOf(step);
-  const baseHardMs = step.hardTimeoutMs ?? cfg.defaults?.hardTimeoutMs ?? 4 * baseIdleMs;
-  const maxIdleMs = interactiveNow ? Math.max(baseIdleMs, 3600000) : baseIdleMs;
-  return {
-    step, ctx: stepCtx, taskId, dispatchId, terminal, requestId, preStepTargetSha, preStepOriginTargetSha, preStepRemoteTargetSha, preStepRemoteError, preStepHasOrigin, preStepHeadSha, health,
-    maxIdleMs,
-    hardCapMs: interactiveNow ? Math.max(baseHardMs, 14400000) : baseHardMs,
-    sliceMs: Math.min(120000, maxIdleMs, health.turnStartWindowMs, health.turnStartEscalateMs),
-    startedAt: launchedAt, lastBusy: launchedAt, lastPreview: undefined,
-    quietWarned: false, parkedSeen: new Set(), parkedLabel: null, settled: false, done: null, note: "", outcome: null,
-    nudge: { left: nudgeRetriesOf(step), phase: null, sentAt: 0, count: 0, outcome: null, done: null },
-  };
-}
-
-// The worker_done payload may name its task; a run-scoped wait cannot
-// otherwise tell two concurrent workers apart. No task id on the message =>
-// credit only when exactly ONE member is unsettled (the old single-step
-// behavior, preserved for singleton groups).
-const taskOfMsg = (m) => pick(m, ["taskId", "task_id", "task"]);
-
-// Settle one member: final progress snapshot, terminal cleanup, status row.
-// still-running members keep their terminal open (done=null) — that is the
-// point of the hard-cap exit.
-function settleMember(m, outcome, done) {
-  m.settled = true;
-  m.outcome = outcome;
-  m.done = done || null;
-  if (m.ctx?.isolated)
-    syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: WT_DIR || ".", artDirRel: ART_DIR });
-  refreshProgress(m.step);   // final snapshot: catch the last ticks
-  writeArtifactSnapshot(m.step);   // final artifact snapshot for the viewer
-  statusEnd(m.step.id, outcome, m.note);
-  notifyStep(m);
-  if (!m.done) return;
-  if (m.terminal) {
-    const c = orca(["terminal", "close", "--terminal", m.terminal]);
-    if (!c.ok) warn(`terminal close '${m.step.title}' did not confirm: ${c.stderr || c.raw}`);
-  } else if (m.dispatchId) {
-    const rel = orca(["orchestration", "worker-release", "--dispatch", m.dispatchId]);
-    if (!rel.ok) warn(`worker-release '${m.step.title}' did not confirm: ${rel.stderr || rel.raw}`);
-  }
-}
-
-// Run one group to settlement of EVERY member. Silence/hard-cap semantics
-// per member are identical to the sequential runner (see workerVitals and
-// launchMember above): timeoutMs = max silence, hardTimeoutMs = absolute
-// cap; a hard-capped member settles as still-running and is dropped from
-// the wait set — the pipeline then stops (main loop) with a resume hint.
-function runGroup(members) {
-  const materializedDirs = [];
-  let M = [];
-  try {
-  // Resolve per-member worktree context inside try so any partial setup is
-  // cleanly restored in finally on exception.
-  const prepared = members.map((s) => ({
-    step: s,
-    ctx: prepareStepWorktree({
-      step: s, objective, runId: RUN_ID, wtSelector: resolveWorktree(), wtDir: WT_DIR || ".",
-      artDirRel: ART_DIR, orca, pick, res, byId, effectiveReads, allSteps,
-      isolatedState, log, warn, die,
-    }),
-  }));
-  // Clear stale output artifacts for verify-guarded or isolated steps BEFORE
-  // launch so an earlier round's VERDICT: PASS can never survive a crash or
-  // skipped rewrite on retry.
-  for (const p of prepared) {
-    if (p.step.verify || p.ctx.isolated)
-      clearStaleStepArtifact(p.step, WT_DIR || ".", p.ctx.dir, ART_DIR);
-  }
-  const sharedMembers = prepared.filter((p) => !p.ctx.isolated).map((p) => ({ ...p.step, agent: agentOf(p.step) }));
-  if (sharedMembers.length) {
-    materializedDirs.push(WT_DIR || ".");
-    materializeAgentConfig({ worktree: WT_DIR || ".", members: sharedMembers, cfg, configDir: HERE, die, warn });
-  }
-  for (const p of prepared.filter((x) => x.ctx.isolated)) {
-    materializedDirs.push(p.ctx.dir);
-    materializeAgentConfig({ worktree: p.ctx.dir, members: [{ ...p.step, agent: agentOf(p.step) }], cfg, configDir: HERE, die, warn });
-  }
-  for (const s of members) statusBegin(s.id);
-  M = prepared.map((p) => launchMember(p.step, p.ctx));
-  while (true) {
-    const open = M.filter((m) => !m.settled);
-    if (!open.length) break;
-    const slice = Math.min(...open.map((m) => m.sliceMs));
-    for (const m of open) {
-      if (m.ctx?.isolated)
-        syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: WT_DIR || ".", artDirRel: ART_DIR });
-      refreshProgress(m.step); writeArtifactSnapshot(m.step);
-    }
-    writeStatus();   // heartbeat: keep the page's "updated Xs ago" fresh each slice
-    const wait = orca(["orchestration", "check", "--run", RUN_ID, "--wait",
-      "--types", "worker_done,escalation,question", "--timeout-ms", String(slice)],
-      { timeoutMs: slice + 60000 });
-    const d = res(wait.json);
-    const did = pick(d, ["deliveryId", "delivery_id"]) ?? pick(d.delivery || {}, ["id"]);
-    const msgs = pick(d, ["messages", "msgs"]) || [];
-    if (did) orca(["orchestration", "check", "--run", RUN_ID, "--ack", did]);
-    // Surface questions/escalations, but they don't settle any member.
-    for (const msg of msgs) {
-      const ty = pick(msg, ["type"]);
-      if (ty === "question" || ty === "escalation")
-        log(`  [${ty}] ${pick(msg, ["subject"]) || ""}`);
-    }
-    for (const m of open) {
-      if (m.nudge.phase === "post-done") { nudgePoll(m); continue; }
-      // 1) Fast path: a worker_done message attributable to THIS member.
-      const wd = msgs.find((msg) => {
-        if (pick(msg, ["type"]) !== "worker_done") return false;
-        const mt = taskOfMsg(msg);
-        return mt === m.taskId || (mt == null && open.length === 1);
-      });
-      if (wd) {
-        if (m.ctx?.isolated)
-          syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: WT_DIR || ".", artDirRel: ART_DIR });
-        if (m.health) {
-          evaluateMemberHealth(m.health, { startedAt: m.startedAt, workerDone: true });
-          statusSet(m.step.id, { health: m.health.state, turnStart: m.health.turnStart });
-        }
-        const out = outcomeOf(wd) || "unknown";
-        if (!holdForNudge(m, out, wd)) settleMember(m, m.outcome || out, wd);
-        continue;
-      }
-      // 2) Authoritative per-task settlement.
-      const v = workerVitals(m.taskId, m.terminal, m.dispatchId);
-      if (v.settled) {
-        // Drain a pending worker_done first — prefer the message's own
-        // payload, and ack it so it cannot leak into the next group's wait
-        // (a bound Run replays unacknowledged deliveries).
-        const drain = orca(["orchestration", "check", "--run", RUN_ID, "--types", "worker_done"]);
-        const dr = res(drain.json);
-        const drid = pick(dr, ["deliveryId", "delivery_id"]) ?? pick(dr.delivery || {}, ["id"]);
-        const drained = (pick(dr, ["messages", "msgs"]) || [])
-          .find((msg) => pick(msg, ["type"]) === "worker_done" && taskOfMsg(msg) === m.taskId) || null;
-        if (drid) orca(["orchestration", "check", "--run", RUN_ID, "--ack", drid]);
-        if (m.ctx?.isolated)
-          syncOutputsFromIsolatedWorktree({ step: m.step, stepWtDir: m.ctx.dir, wtDir: WT_DIR || ".", artDirRel: ART_DIR });
-        const vout = (drained && outcomeOf(drained)) || v.outcome || "unknown";
-        const vdone = drained || { payload: JSON.stringify({ outcome: v.outcome }) };
-        if (!holdForNudge(m, vout, vdone)) settleMember(m, m.outcome || vout, vdone);
-        continue;
-      }
-      // 3) Liveness/freshness per member (identical to the sequential loop):
-      // a CHANGING preview proves the TUI is working; a frozen preview for
-      // maxIdleMs = hung / parked (timestamps are fallback only).
-      const previewSeenBefore = m.lastPreview !== undefined;
-      let previewChanged = false;
-      if (v.preview != null) {
-        previewChanged = !previewSeenBefore || v.preview !== m.lastPreview;
-        if (previewChanged) {
-          m.lastPreview = v.preview;
-          m.lastBusy = Date.now();
-        }
-      } else if (v.lastBusyMs > 0 && Date.now() - v.lastBusyMs < m.maxIdleMs) {
-        m.lastBusy = Date.now();
-      }
-      // 3b) Parked on a prompt (#4): a FROZEN preview carrying a known dialog
-      // signature means the worker is waiting for a human, not working. The
-      // frozen guard matters — a busy agent that merely printed a similar
-      // string keeps redrawing. Observe only, once per distinct prompt: warn,
-      // note the status page, keep waiting (never answer, never fail).
-      if (!previewChanged && v.preview != null) {
-        const parked = parkedPromptOf(v.preview);
-        if (parked && !m.parkedSeen.has(parked.sig)) {
-          m.parkedSeen.add(parked.sig);
-          m.parkedLabel = parked.label;
-          warn(`"${m.step.title}" is PARKED on ${parked.label} (terminal shows "${parked.sig}") — ` +
-              `answer it in that terminal; waiting up to the ${Math.round(m.hardCapMs / 60000)}min hard cap.`);
-          statusSet(m.step.id, { note: `parked on ${parked.label} — answer it in the terminal` });
-        }
-      }
-      maybeNudgeMidRun(m, v);
-      const silenceMs = Date.now() - m.lastBusy;
-      // 3c) Start-proof (turnStart: observed) + 5-state Health evaluation
-      if (m.health) {
-        const stepArtPath = join(m.ctx?.isolated ? m.ctx.dir : (WT_DIR || "."), ART_DIR, m.step.writes || "");
-        let artSize = 0;
-        if (m.step.writes && existsSync(stepArtPath)) {
-          try { artSize = statSync(stepArtPath).size; } catch { artSize = 0; }
-        }
-        const hres = evaluateMemberHealth(m.health, {
-          startedAt: m.startedAt,
-          dispatchStatus: v.status,
-          heartbeatMs: v.heartbeatMs,
-          previewChanged,
-          previewSeenBefore,
-          parkedLabel: m.parkedLabel,
-          agentWait: v.agentWait,
-          artifactSize: artSize,
-          silenceMs,
-          maxIdleMs: m.maxIdleMs,
-        });
-        statusSet(m.step.id, { health: hres.state, turnStart: hres.turnStart });
-        if (hres.changed && LEDGER) {
-          LEDGER.recordHealth({
-            stepId: m.step.id,
-            state: hres.state,
-            turnStart: hres.turnStart,
-            signals: hres.signals,
-            note: hres.note,
-          });
-        }
-        if (hres.turnStartWarnDue) {
-          warn(`[health:unknown] "${m.step.title}" has turnStart=unobserved after ${Math.round((Date.now() - m.startedAt) / 1000)}s (state=ready is not start proof).`);
-          if (!m.parkedSeen.size) statusSet(m.step.id, { note: hres.note });
-        }
-        if (hres.state === "lost") {
-          const drainLost = orca(["orchestration", "check", "--run", RUN_ID, "--types", "worker_done"]);
-          const dl = res(drainLost.json);
-          const dlid = pick(dl, ["deliveryId", "delivery_id"]) ?? pick(dl.delivery || {}, ["id"]);
-          const dlMsgs = pick(dl, ["messages", "msgs"]) || [];
-          const lostDone = dlMsgs
-            .find((msg) => pick(msg, ["type"]) === "worker_done" && taskOfMsg(msg) === m.taskId) || null;
-          // R2-M2 FIX: Only ack when this member is the sole remaining unsettled member (or delivery has no sibling msgs),
-          // so we NEVER drop another parallel worker's worker_done message!
-          const hasSiblingMsg = dlMsgs.some((msg) => taskOfMsg(msg) && taskOfMsg(msg) !== m.taskId);
-          if (dlid && !hasSiblingMsg) orca(["orchestration", "check", "--run", RUN_ID, "--ack", dlid]);
-          if (lostDone) {
-            evaluateMemberHealth(m.health, { startedAt: m.startedAt, workerDone: true });
-            statusSet(m.step.id, { health: m.health.state, turnStart: m.health.turnStart });
-            const out = outcomeOf(lostDone) || "unknown";
-            if (!holdForNudge(m, out, lostDone)) settleMember(m, m.outcome || out, lostDone);
-            continue;
-          }
-          warn(`[health:lost] "${m.step.title}" dispatch terminated (${v.status}) without worker_done — stopping without blind retry.`);
-          m.note = hres.note || `dispatch lost (${v.status})`;
-          settleMember(m, "unknown", null);
-          continue;
-        }
-        if (hres.turnStartEscalateDue) {
-          warn(`[health:unknown] "${m.step.title}" never proved turnStart=observed within ${Math.round(m.health.turnStartEscalateMs / 1000)}s — stopping cleanly instead of waiting to hard cap.`);
-          m.note = hres.note || `turnStart unobserved after ${Math.round((Date.now() - m.startedAt) / 1000)}s`;
-          settleMember(m, "still-running", null);
-          continue;
-        }
-      }
-      // Hard cap first: absolute per-member limit, busy or quiet.
-      if (Date.now() - m.startedAt >= m.hardCapMs) {
-        const mins = Math.round((Date.now() - m.startedAt) / 60000);
-        log(`[warn] "${m.step.title}" not settled after ${mins}min; ` +
-            `leaving its terminal open and stopping the pipeline.`);
-        // Keep the parked diagnosis (3b) in the FINAL note: the status page is
-        // what a human opens after the stop, and the generic text alone loses
-        // the actionable "answer it in that terminal" clue — same guard
-        // philosophy as the quiet-warn block below.
-        m.note = m.parkedLabel
-          ? `parked on ${m.parkedLabel} — not settled after ${mins}min`
-          : `not settled after ${mins}min`;
-        settleMember(m, "still-running", null);
-        continue;
-      }
-      // Silence alone is NOT proof of death (see runStep's comment).
-      if (silenceMs >= m.maxIdleMs && !m.quietWarned) {
-        m.quietWarned = true;
-        warn(`"${m.step.title}" quiet for ${Math.round(silenceMs / 60000)}min but its dispatch is alive (status=${v.status}) — ` +
-             `waiting up to the ${Math.round(m.hardCapMs / 60000)}min hard cap before giving up.`);
-        // A parked-prompt note (3b) is the specific diagnosis — don't overwrite
-        // it with the generic quiet text.
-        if (!m.parkedSeen.size)
-          statusSet(m.step.id, { note: `quiet ${Math.round(silenceMs / 60000)}min but alive — waiting to the hard cap` });
-      }
-    }
-  }
-  writeStatus();
-  return M;
-  } finally {
-    for (const d of new Set(materializedDirs))
-      restoreAgentConfig({ worktree: d, warn });
-    // Inspect isolated worktree dirty/HEAD status AFTER restoring temporary
-    // agent-config files so engine-written skills/MCP never trip dirty=true.
-    for (const m of M) {
-      if (m.ctx?.isolated)
-        finalizeStepWorktree({ step: m.step, stepCtx: m.ctx, outcome: m.outcome, wtDir: WT_DIR || ".", artDirRel: ART_DIR, isolatedState });
-    }
-  }
-}
-
-// Gate after a step (manual mode only — autoRun ignores gates entirely).
-// Blocks until the gate is resolved (or defaults.gateTimeoutMs passes).
-function runGate(step) {
-  const g = orca(["orchestration", "gate-create", "--task", taskIds[step.id],
-    "--question", `Approve the result of step "${step.title}"?`, "--options", '["yes","no"]']);
-  const gateId = pick(res(g.json).gate || {}, ["id"]) || pick(res(g.json), ["gateId", "gate_id", "id"]);
-  log(`  [gate] for "${step.title}". Approve to continue:`);
-  log(`     ${ORCA} orchestration gate-resolve --id ${gateId} --resolution yes --json`);
-  log(`  (Waiting — resolve the gate in Orca or with the command above.)`);
-  statusSet(step.id, { status: "waiting-approval", note: "gate open — approve to continue" });
-  writeStatus();
-  const GATE_TIMEOUT_MS = cfg.defaults?.gateTimeoutMs ?? 3600000;
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < GATE_TIMEOUT_MS) {
-    sleepMs(5000);
-    writeStatus();   // heartbeat: a human may sit on this gate for up to gateTimeoutMs
-    const l = orca(["orchestration", "gate-list", "--run", RUN_ID]);
-    const gates = pick(res(l.json), ["gates"]) || [];
-    const gate = gates.find((x) =>
-      pick(x, ["id"]) === gateId || pick(x, ["gateId", "gate_id"]) === gateId);
-    if (!gate) continue;                       // not listed (yet)
-    const status = String(pick(gate, ["status", "state"]) ?? "");
-    const resolution = pick(gate, ["resolution", "answer", "result"]);
-    if (resolution == null && /^(pending|open|waiting|created)$/i.test(status)) continue;
-    const verdict = String(resolution ?? status).toLowerCase();
-    if (verdict === "yes" || verdict === "approved" || verdict === "resolved") {
-      statusSet(step.id, { status: "succeeded", note: null });
-      writeStatus();
-      return;
-    }
-    statusSet(step.id, { note: "gate rejected" });
-    die(`Gate for "${step.title}" was resolved with "${resolution ?? status}" — stopping the pipeline.`);
-  }
-  warn(`gate for "${step.title}" not resolved within ${Math.round(GATE_TIMEOUT_MS / 60000)}min; continuing anyway.`);
-  statusSet(step.id, { status: "succeeded", note: "gate timeout — continued anyway" });
-  writeStatus();
-}
-
-// =============================================================================
-// Readiness gate: pre-flight check of every member's DECLARED reads
-// =============================================================================
-// Missing/undersized artifact => ask, then repair by re-running the producer
-// (a singleton group, so a parallel sibling is NOT re-run). The artifact file
-// is ground truth: an attempt only counts when the file exists and clears
-// readinessMinBytes, whatever the worker reported.
-function artifactReady(id) {
-  try { return statSync(join(WT_DIR || ".", ART_DIR, byId[id].writes)).size >= READINESS_MIN_BYTES; }
-  catch { return false; }
-}
-
-function readinessOf(step) {
-  const missing = [];
-  for (const id of (step.reads || [])) {
-    if (!byId[id]) continue;
-    if (byId[id].enabled === false) continue;   // config-disabled producer: optional input, auto-removed per config contract
-    const v = verifyStepArtifact(byId[id], join(WT_DIR || ".", ART_DIR), WT_DIR || ".", READINESS_MIN_BYTES, { mode: "readiness" });
-    if (!v.ok) missing.push({ id, title: byId[id].title, path: outPath(byId[id].writes), reason: v.reason });
-  }
-  return missing;
-}
-
-// Always asks, even in auto-run: autoRun governs agent autonomy, not input
-// safety. Enter/anything-but-yes declines; EOF or non-interactive stdin
-// declines (CI-safe). No timeout — a visible human decision point.
-function promptReadiness(question) {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    let settled = false;
-    const done = (v) => {
-      if (settled) return;
-      settled = true;
-      try { rl.close(); } catch { }
-      resolve(v);
-    };
-    rl.on("close", () => done(false));
-    rl.question(question, (answer) => done(/^(y|yes)$/i.test(String(answer ?? "").trim())));
-  });
-}
-
-// --- Startup chooser: list previous runs, let the user resume one or start
-// fresh. Mirrors promptReadiness's EOF contract: EOF/empty/0/invalid = new
-// run, so scripts and CI never block. --from/--only/--new bypass entirely.
-function parseStatusJs(file) {
-  try {
-    const m = readFileSync(file, "utf8").match(/window\.__STATUS=([\s\S]*?);window\.__ON_STATUS/);
-    return m ? JSON.parse(m[1]) : null;
-  } catch { return null; }
-}
-function listRuns() {
-  const artDir = join(WT_PATH || ".", ART_DIR);
-  const out = [];
-  const cur = parseStatusJs(join(artDir, "status.js"));
-  if (cur) out.push({ label: "(current)", dir: null, S: cur });
-  const archived = [];
-  try {
-    for (const e of readdirSync(join(artDir, "runs"), { withFileTypes: true })) {
-      if (!e.isDirectory()) continue;
-      const S = parseStatusJs(join(artDir, "runs", e.name, "status.js"));
-      if (S) archived.push({ label: e.name, dir: join(artDir, "runs", e.name), S });
-    }
-  } catch { }
-  archived.sort((a, b) => b.label.localeCompare(a.label));
-  return [...out, ...archived].slice(0, 10);
-}
-function printRunList(entries) {
-  log("Previous runs in this worktree:");
-  entries.forEach((e, i) => {
-    const succ = (e.S.steps || []).filter((s) => s.status === "succeeded").length;
-    log(`  ${i + 1}) ${e.label} · "${String(e.S.meta?.objective ?? "").slice(0, 60)}" · ${succ}/${(e.S.steps || []).length} steps · ${String(e.S.overall ?? "?").toUpperCase()}`);
-  });
-}
-function promptChoice(question) {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    let settled = false;
-    const done = (v) => { if (settled) return; settled = true; try { rl.close(); } catch { } resolve(v); };
-    rl.on("close", () => done(""));
-    rl.question(question, (a) => done(String(a ?? "")));
-  });
-}
-async function runChooser() {
-  if (opt.dryRun || opt.statusPreview || opt.from || opt.only || opt.newRun) return;
-  const entries = listRuns();
-  if (!entries.length) return;
-  printRunList(entries);
-  const answer = await promptChoice("Choose: <n> = resume that run, 0/Enter = start a new run: ");
-  const t = answer.trim();
-  const idx = /^\d+$/.test(t) ? Number(t) : NaN;
-  const chosen = Number.isInteger(idx) && idx >= 1 && idx <= entries.length ? entries[idx - 1] : null;
-  if (!chosen) return;   // new run — the main call site archives
-  const order = (cfg.pipeline || []).filter((s) => s && s.id && s.enabled !== false).map((s) => s.id);
-  const stOf = (id) => (chosen.S.steps || []).find((s) => s.id === id);
-  const firstPending = order.find((id) => stOf(id)?.status !== "succeeded");
-  if (!firstPending) { log(`[history] run ${chosen.label} already completed — starting a new run instead.`); return; }
-  if (chosen.dir) {
-    archiveCurrentRun();   // protect the newest flat state before overwriting it
-    const n = copyRunFiles(chosen.dir, join(WT_PATH || ".", ART_DIR), "(restore)");
-    log(`[history] restored run ${chosen.label} (${n} files) — resuming from "${firstPending}".`);
-  } else {
-    log(`[history] resuming the current run from "${firstPending}".`);
-  }
-  opt.from = firstPending;
-  HISTORY_ARCHIVE_DONE = true;   // both resume branches must NOT archive again at the call site
-}
-
-async function readinessGate(members) {
-  const missing = [];
-  for (const s of members) for (const x of readinessOf(s)) missing.push({ ...x, consumer: s });
-  if (!missing.length) return;
-  warn("Missing or incomplete input artifact(s):\n" +
-    missing.map((x) => `  - ${x.title} (\`${x.path}\`) — ${x.reason} — needed by "${x.consumer.title}"`).join("\n"));
-  for (const s of members) {
-    const n = missing.filter((x) => x.consumer === s).length;
-    if (n) statusSet(s.id, { note: `waiting: ${n} unready input(s)` });
-  }
-  writeStatus();
-  const yes = await promptReadiness("Run the producing step(s) now to (re)generate missing inputs? [y/N] ");
-  // Transitive closure of missing producers, in pipeline order: a producer's
-  // own declared reads must be ready too — repairing detailed-design while
-  // architecture is missing would launch the design agent blind (the original
-  // hole, one level up). The visited set terminates even on cyclic configs.
-  const ids = new Set(missing.map((x) => x.id));
-  const queue = [...ids];
-  while (queue.length) {
-    const p = byId[queue.shift()];
-    for (const x of readinessOf(p))
-      if (!ids.has(x.id)) { ids.add(x.id); queue.push(x.id); }
-  }
-  const producers = [...ids].map((id) => byId[id])
-    .sort((a, b) => allSteps.indexOf(a) - allSteps.indexOf(b));
-  if (!yes)
-    die(`Missing inputs for "${[...new Set(missing.map((x) => x.consumer.title))].join('", "')}" were not (re)generated. ` +
-        `Generate them first, then resume, e.g.:\n  node .orca/flow.mjs --from ${producers[0].id} "${objective}"`);
-  for (const step of producers) {
-    for (let attempt = 1; ; attempt++) {
-      log(`[readiness] re-running "${step.title}" (attempt ${attempt}/${READINESS_RETRIES})`);
-      const [r] = runGroup([step]);
-      if (r.outcome === "still-running") {
-        STATUS.overall = "still-running";   // die() only overwrites "running"
-        writeStatus();
-        die(`"${step.title}" ${r.note}. Its terminal ${r.terminal || "(dispatch-owned)"} was left OPEN to finish. ` +
-            `Watch it; once it writes ${outPath(step.writes)}, continue with:\n` +
-            `  node .orca/flow.mjs --from ${members[0].id} "${objective}"`);
-      }
-      const repairedCheck = verifyStepArtifact(step, join(WT_DIR || ".", ART_DIR), WT_DIR || ".", READINESS_MIN_BYTES, { mode: "settlement" });
-      if (repairedCheck.ok) {
-        if (step.verify?.requireContractCommit && repairedCheck.contractCommit)
-          recordVerifiedContractCommit(join(WT_DIR || ".", ART_DIR), repairedCheck.contractCommit, WT_DIR || ".");
-        if (r.outcome === "succeeded" && step.gate && !AUTO_RUN) runGate(step);
-        log(`[readiness] "${step.title}" artifact ready -> ${outPath(step.writes)}`);
-        break;
-      }
-      warn(`[readiness] "${step.title}" attempt ${attempt} ended outcome=${r.outcome} without a usable artifact.`);
-      if (attempt >= READINESS_RETRIES)
-        die(`"${step.title}" still has no usable artifact after ${READINESS_RETRIES} readiness retries ` +
-            `(needs ${outPath(step.writes)} with at least ${READINESS_MIN_BYTES} bytes).`);
-      // Only re-dispatch on a DEFINITE outcome — a blind retry has
-      // double-dispatched a live worker before (same doctrine as the
-      // onFailGoto handling in the main loop).
-      if (r.outcome !== "succeeded" && r.outcome !== "failed")
-        die(`"${step.title}" returned outcome=${r.outcome} without producing ${outPath(step.writes)} — ` +
-            `not retrying without a definite outcome. Inspect its terminal, then re-run with --from ${step.id}.`);
-    }
-  }
-  const still = members.flatMap((s) => readinessOf(s));
-  if (still.length)
-    die(`Inputs still unready after repair: ${still.map((x) => x.path).join(", ")}.`);
-}
-
-// =============================================================================
-// Main loop over run-order groups, with onFailGoto retries
-// =============================================================================
 const retriesUsed = {};
 let gi = 0;
 while (gi < groups.length) {
-  await readinessGate(groups[gi]);   // never launch a step on unready reads
-  const results = runGroup(groups[gi]);   // settles EVERY member (incl. hard-capped)
-
-  // Post-join outcome handling, in array order. The first terminal action
-  // (die / retry jump) wins; a retry re-runs the whole group anyway.
+  await runner.readinessGate(groups[gi]);
+  const results = runner.runGroup(groups[gi]);
   let jumped = false;
   for (const r of results) {
     let vres = null;
     if (r.outcome === "succeeded" && r.step.verify) {
       const checkDir = r.ctx?.isolated ? r.ctx.dir : (WT_DIR || ".");
       vres = verifyStepArtifact(r.step, join(WT_DIR || ".", ART_DIR), checkDir, READINESS_MIN_BYTES, {
-        mode: "settlement",
-        targetBranch: TARGET_BRANCH,
-        allowOneWayMerge: opt.allowOneWayMerge,
-        preStepTargetSha: r.preStepTargetSha,
-        preStepOriginTargetSha: r.preStepOriginTargetSha,
-        preStepRemoteTargetSha: r.preStepRemoteTargetSha,
-        preStepRemoteError: r.preStepRemoteError,
-        preStepHasOrigin: r.preStepHasOrigin,
-        preStepHeadSha: r.preStepHeadSha,
+        mode: "settlement", targetBranch: TARGET_BRANCH, allowOneWayMerge: opt.allowOneWayMerge,
+        preStepTargetSha: r.preStepTargetSha, preStepOriginTargetSha: r.preStepOriginTargetSha,
+        preStepRemoteTargetSha: r.preStepRemoteTargetSha, preStepRemoteError: r.preStepRemoteError,
+        preStepHasOrigin: r.preStepHasOrigin, preStepHeadSha: r.preStepHeadSha,
         mergeDangerThresholds: MERGE_DANGER_THRESHOLDS,
       });
       if (vres.mergeDanger) LAST_MERGE_DANGER = vres.mergeDanger;
@@ -3019,32 +422,17 @@ while (gi < groups.length) {
         warn(`[gate-verify] "${r.step.title}" failed hard gate verification: ${vres.reason} — overriding outcome to failed.`);
         r.outcome = "failed";
         r.note = r.note ? `${r.note}; gate verify failed: ${vres.reason}` : `gate verify failed: ${vres.reason}`;
-        statusSet(r.step.id, { status: "failed", note: r.note });
+        statusMgr.statusSet(r.step.id, { status: "failed", note: r.note });
       } else {
-        if (r.step.verify.requireContractCommit && vres.contractCommit)
-          recordVerifiedContractCommit(join(WT_DIR || ".", ART_DIR), vres.contractCommit, WT_DIR || ".");
-        if (r.step.verify.requireMergedTasks)
-          recordMergedAfterContract(join(WT_DIR || ".", ART_DIR), WT_DIR || ".");
+        if (r.step.verify.requireContractCommit && vres.contractCommit) recordVerifiedContractCommit(join(WT_DIR || ".", ART_DIR), vres.contractCommit, WT_DIR || ".");
+        if (r.step.verify.requireMergedTasks) recordMergedAfterContract(join(WT_DIR || ".", ART_DIR), WT_DIR || ".");
         if (vres.pendingHumanMerge) {
           PENDING_HUMAN_MERGE = true;
-          statusSet(r.step.id, { note: `ONE-WAY DOOR: PR held open for human merge (${(vres.mergeDanger?.triggers || []).join(", ")})` });
-          if (LEDGER) {
-            LEDGER.recordPendingHumanMerge({
-              targetBranch: TARGET_BRANCH,
-              door: "one-way",
-              triggers: vres.mergeDanger?.triggers || [],
-              artifact: outPath(r.step.writes),
-              headSha: headSha(),
-            });
-          }
+          statusMgr.statusSet(r.step.id, { note: `ONE-WAY DOOR: PR held open for human merge (${(vres.mergeDanger?.triggers || []).join(", ")})` });
+          LEDGER?.recordPendingHumanMerge({ targetBranch: TARGET_BRANCH, door: "one-way", triggers: vres.mergeDanger?.triggers || [], artifact: outPath(r.step.writes), headSha: headSha() });
         }
       }
     }
-    // F1 FIX: Unconditionally enforce rogue target-ref mutation detection on EVERY
-    // mergeDangerCheck step (whether non-succeeded, early-failed on missing/bad VERDICT,
-    // or failed inside verifyStepArtifact). Check structured mdCheck.targetRefMoved
-    // directly (never regex-matching prose) and die() immediately — never retry after
-    // an unauthorized one-way target-branch mutation!
     if (r.step.verify?.mergeDangerCheck && !opt.allowOneWayMerge) {
       let mdCheck = vres?.mergeDangerResult || null;
       if (!mdCheck) {
@@ -3052,16 +440,10 @@ while (gi < groups.length) {
         const artPath = join(WT_DIR || ".", ART_DIR, r.step.writes || "");
         const artText = (r.step.writes && existsSync(artPath)) ? readFileSync(artPath, "utf8") : "";
         mdCheck = verifyMergeDangerGate({
-          text: artText,
-          gitDir: checkDir,
-          targetBranch: TARGET_BRANCH,
-          allowOneWayMerge: false,
-          preStepTargetSha: r.preStepTargetSha,
-          preStepOriginTargetSha: r.preStepOriginTargetSha,
-          preStepRemoteTargetSha: r.preStepRemoteTargetSha,
-          preStepRemoteError: r.preStepRemoteError,
-          preStepHasOrigin: r.preStepHasOrigin,
-          preStepHeadSha: r.preStepHeadSha,
+          text: artText, gitDir: checkDir, targetBranch: TARGET_BRANCH, allowOneWayMerge: false,
+          preStepTargetSha: r.preStepTargetSha, preStepOriginTargetSha: r.preStepOriginTargetSha,
+          preStepRemoteTargetSha: r.preStepRemoteTargetSha, preStepRemoteError: r.preStepRemoteError,
+          preStepHasOrigin: r.preStepHasOrigin, preStepHeadSha: r.preStepHeadSha,
           thresholds: MERGE_DANGER_THRESHOLDS,
         });
         if (mdCheck.classification) LAST_MERGE_DANGER = mdCheck.classification;
@@ -3071,127 +453,68 @@ while (gi < groups.length) {
         warn(msg);
         r.outcome = "failed";
         r.note = r.note ? `${r.note}; ${mdCheck.reason}` : mdCheck.reason;
-        statusSet(r.step.id, { status: "failed", note: r.note });
-        if (LEDGER) {
-          LEDGER.recordStepSettled({
-            stepId: r.step.id,
-            outcome: "failed",
-            note: r.note,
-            verifyOk: false,
-            verifyReason: mdCheck.reason,
-            contractCommit: vres?.contractCommit || null,
-          });
-        }
+        statusMgr.statusSet(r.step.id, { status: "failed", note: r.note });
+        LEDGER?.recordStepSettled({ stepId: r.step.id, outcome: "failed", note: r.note, verifyOk: false, verifyReason: mdCheck.reason, contractCommit: vres?.contractCommit || null });
         die(msg);
       }
     }
     if (LEDGER) {
-      LEDGER.recordStepSettled({
-        stepId: r.step.id,
-        outcome: r.outcome,
-        note: r.note || null,
-        verifyOk: vres ? vres.ok : null,
-        verifyReason: vres ? vres.reason : null,
-        contractCommit: vres?.contractCommit || null,
-      });
+      LEDGER.recordStepSettled({ stepId: r.step.id, outcome: r.outcome, note: r.note || null, verifyOk: vres ? vres.ok : null, verifyReason: vres ? vres.reason : null, contractCommit: vres?.contractCommit || null });
       if (r.outcome === "succeeded") {
         LEDGER.updateIntegrationHead(WT_DIR || ".");
-        const isImplStep = Boolean(
-          r.ctx?.isolated
-          || /(?:worker|coding|impl|fix|integration)/i.test(r.step.id)
-        );
+        const isImplStep = Boolean(r.ctx?.isolated || /(?:worker|coding|impl|fix|integration)/i.test(r.step.id));
         if (isImplStep && r.step.writes) {
-          const ev = r.ctx?.isolated
-            ? `worktree:${r.ctx.wtName}@${r.ctx.branch}#${outPath(r.step.writes)}`
-            : `artifact:${outPath(r.step.writes)}@HEAD=${headSha() || "uncommitted"}`;
+          const ev = r.ctx?.isolated ? `worktree:${r.ctx.wtName}@${r.ctx.branch}#${outPath(r.step.writes)}` : `artifact:${outPath(r.step.writes)}@HEAD=${headSha() || "uncommitted"}`;
           LEDGER.recordAcceptanceLevel("implemented", { status: true, evidenceRef: ev, detail: `step ${r.step.id} succeeded` });
         }
         if (r.step.verify?.requireMergedTasks) {
           const curHead = headSha();
-          if (curHead) {
-            LEDGER.recordAcceptanceLevel("integrated", {
-              status: true,
-              evidenceRef: `gate:requireMergedTasks@HEAD=${curHead}`,
-              detail: `step ${r.step.id} merged & verified isolated task branches`,
-            });
-          }
+          if (curHead) LEDGER.recordAcceptanceLevel("integrated", { status: true, evidenceRef: `gate:requireMergedTasks@HEAD=${curHead}`, detail: `step ${r.step.id} merged & verified isolated task branches` });
         }
       }
     }
     if (r.outcome === "succeeded") {
       log(`[ok] ${r.step.title} done -> ${outPath(r.step.writes)}`);
-      if (r.step.gate && !AUTO_RUN) runGate(r.step);
+      if (r.step.gate && !AUTO_RUN) runner.runGate(r.step);
       continue;
     }
-
-    // Healthy but endless worker: the terminal stays open so it can finish.
-    // Tell the user exactly how to continue instead of looping or dying blindly.
     if (r.outcome === "still-running") {
-      STATUS.overall = "still-running";   // die() only overwrites "running"
-      writeStatus();
-      const nextGroup = groups[gi + 1];
-      const next = nextGroup ? nextGroup[0] : null;
-      die(`"${r.step.title}" ${r.note}. Its terminal ${r.terminal || "(dispatch-owned)"} was left OPEN to finish. ` +
-          `Watch it; once it reports done and writes ${outPath(r.step.writes)}, continue with:\n` +
-          `  node .orca/flow.mjs --from ${next ? next.id : r.step.id} "<objective>"`);
+      statusMgr.STATUS.overall = "still-running";
+      statusMgr.writeStatus();
+      const next = (groups[gi + 1] || [])[0] || null;
+      die(`"${r.step.title}" ${r.note}. Its terminal ${r.terminal || "(dispatch-owned)"} was left OPEN to finish. Watch it; once it reports done and writes ${outPath(r.step.writes)}, continue with:\n  node .orca/flow.mjs --from ${next ? next.id : r.step.id} "<objective>"`);
     }
-
-    // Only a POSITIVE failed outcome may trigger the onFailGoto fix loop.
-    // Anything else ("unknown": silent worker, lost report) means we could not
-    // tell — a blind retry has double-dispatched a live task before (the
-    // reviewer was still working when the coder was re-started under it).
     if (r.outcome !== "failed")
-      die(`"${r.step.title}" returned outcome=${r.outcome}${r.note ? ` (${r.note})` : ""}. ` +
-          `Not retrying without a definite failure — inspect the terminal/artifacts, then re-run with --from ${r.step.id}.`);
+      die(`"${r.step.title}" returned outcome=${r.outcome}${r.note ? ` (${r.note})` : ""}. Not retrying without a definite failure — inspect the terminal/artifacts, then re-run with --from ${r.step.id}.`);
 
     const gotoId = r.step.onFailGoto;
     if (gotoId && enabledIds.has(gotoId)) {
-      const budget = maxRetriesOf(r.step);   // per-step override, else the global cap
+      const budget = maxRetriesOf(r.step);
       const key = `${r.step.id}->${gotoId}`;
       retriesUsed[key] = (retriesUsed[key] || 0) + 1;
-      if (retriesUsed[key] > budget) {
-        die(`"${r.step.title}" failed and exhausted ${budget} retries. See ${outPath(r.step.writes)}.`);
-      }
+      if (retriesUsed[key] > budget) die(`"${r.step.title}" failed and exhausted ${budget} retries. See ${outPath(r.step.writes)}.`);
       log(`[fail] ${r.step.title} FAILED${r.note ? ` (${r.note})` : ""} -> back to "${byId[gotoId].title}" (attempt ${retriesUsed[key]}/${budget})`);
-      // Reopen the fix target for another attempt. task-update has no --spec
-      // on this build, so we drop a fix note into the result the target's
-      // next run reads (its spec + the failing report tell it what to fix).
-      orca(["orchestration", "task-update", "--id", taskIds[gotoId], "--status", "ready",
-        "--result", JSON.stringify({ reason: `fix from ${r.step.id} #${retriesUsed[key]}`, see: outPath(r.step.writes) })]);
-      gi = groups.findIndex((g) => g.some((m) => m.id === gotoId));   // re-run its group
+      orcaClient.orca(["orchestration", "task-update", "--id", runner.taskIds[gotoId], "--status", "ready", "--result", JSON.stringify({ reason: `fix from ${r.step.id} #${retriesUsed[key]}`, see: outPath(r.step.writes) })]);
+      gi = groups.findIndex((g) => g.some((m) => m.id === gotoId));
       jumped = true;
       break;
     }
-
     die(`"${r.step.title}" returned outcome=${r.outcome}${r.note ? ` (${r.note})` : ""} and has no valid onFailGoto. Stopping.`);
   }
-  if (jumped) continue;
-  gi++;
+  if (!jumped) gi++;
 }
 
 const finalStatus = PENDING_HUMAN_MERGE ? "pending-human-merge" : "succeeded";
 let closeout = null;
 if (LEDGER) {
-  try {
-    closeout = LEDGER.reconcileCloseout({
-      wtDir: WT_DIR || ".",
-      artDirRel: ART_DIR,
-      overall: finalStatus,
-      mergeDanger: LAST_MERGE_DANGER,
-    });
-  } catch (e) {
-    die(`[ledger] closeout failed (refusing fail-open completion): ${e.message}`);
-  }
+  try { closeout = LEDGER.reconcileCloseout({ wtDir: WT_DIR || ".", artDirRel: ART_DIR, overall: finalStatus, mergeDanger: LAST_MERGE_DANGER }); }
+  catch (e) { die(`[ledger] closeout failed (refusing fail-open completion): ${e.message}`); }
 }
 if (closeout?.protectedViolations?.length) {
   die(`[closeout] PROTECTED BRANCH VIOLATION: ${closeout.protectedViolations.map((v) => `${v.branch} (${(v.before ?? "∅").slice(0, 8)} -> ${(v.after ?? "∅").slice(0, 8)})`).join(", ")}`);
 }
-finishStatus(finalStatus);
-if (PENDING_HUMAN_MERGE) {
-  log("Pipeline HELD (PENDING HUMAN MERGE — One-Way Door). Artifacts in " + ART_DIR + ":");
-} else {
-  log("Pipeline COMPLETE. Artifacts in " + ART_DIR + ":");
-}
+statusMgr.finishStatus(finalStatus);
+log(PENDING_HUMAN_MERGE ? `Pipeline HELD (PENDING HUMAN MERGE — One-Way Door). Artifacts in ${ART_DIR}:` : `Pipeline COMPLETE. Artifacts in ${ART_DIR}:`);
 for (const s of steps) log(`  ${s.title.padEnd(26)} -> ${s.writes}`);
 if (closeout) {
   const acc = closeout.acceptance;
@@ -3202,6 +525,11 @@ if (closeout) {
     log(`  node .orca/ledger.mjs closeout --run ${LEDGER.runKey} --repo "${WT_DIR || "."}" --target-branch ${TARGET_BRANCH}`);
   }
 }
-if (CREATED_WORKTREE)
-  log(`[worktree] created by this run: name:${CREATED_WORKTREE} — remove later with: orca worktree rm name:${CREATED_WORKTREE}`);
-try { reportUsage(); } catch (e) { warn(`[usage] report skipped (${e.message})`); }
+if (orcaClient.getCreatedWorktree())
+  log(`[worktree] created by this run: name:${orcaClient.getCreatedWorktree()} — remove later with: orca worktree rm name:${orcaClient.getCreatedWorktree()}`);
+try {
+  reportUsage({
+    STATUS: statusMgr.STATUS, wt: orcaClient.getWt(), wtPath: orcaClient.getWtPath(),
+    allSteps, outPath, statusDir: statusMgr.statusDir, writeStatusTo, log, warn,
+  });
+} catch (e) { warn(`[usage] report skipped (${e.message})`); }

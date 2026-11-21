@@ -1,23 +1,20 @@
 #!/usr/bin/env node
-// orca-pod — npx scaffolder (delivery only, not pipeline logic).
-// Copies the customized 3-Track Orca SDLC kit into the CWD (the user's project root).
-// Zero dependencies: Node builtins only.
+// orca-pod — zero-dep scaffolder + local agent scanner + pre-dev strategy wizard.
 //
 // Usage:
-//   npx /path/to/orca-pod                    # install (existing user files kept safely)
-//   npx github:shown1985/orca-pod            # install directly from GitHub
-//   npx /path/to/orca-pod --upgrade-engine   # refresh engine/runtime files only (preserve custom configs/docs)
-//   npx /path/to/orca-pod --force            # overwrite all existing files
-//
-// Rules:
-//   - explicit whitelist ONLY: the repo's .orca/ also holds dev/runtime junk
-//     (artifacts/, status-preview/, usage-test/) that must never ship.
-//   - never clobber existing files without --force (safe upgrades + merge hint).
-//   - no interactive prompts (must be scriptable in CI).
+//   npx orca-pod                             # install kit (+ interactive strategy wizard in TTY)
+//   npx orca-pod --scan [--json]             # scan local agents & subscriptions, print recommendation
+//   npx orca-pod --setup                     # run pre-dev conversational strategy wizard in CWD
+//   npx orca-pod --apply-recommended         # install + auto-apply recommended local agent routing
+//   npx orca-pod --upgrade-engine            # refresh engine/runtime modules only (preserve configs/docs)
+//   npx orca-pod --force                     # overwrite all existing files
+//   npx orca-pod --no-interactive            # skip TTY wizard prompt (CI-safe)
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { scanLocalAgents, recommendStrategy, formatScanReport } from "../.orca/agent-scanner.mjs";
+import { runStrategyWizard } from "../.orca/strategy-wizard.mjs";
 
 const KIT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const log = (...a) => console.log("[orca-pod]", ...a);
@@ -27,29 +24,30 @@ const die = (m) => { console.error("[orca-pod] ERROR:", m); process.exit(1); };
 const FILES = [
   ".orca/flow.mjs",
   ".orca/agent-config.mjs",
+  ".orca/agent-scanner.mjs",
+  ".orca/strategy-wizard.mjs",
   ".orca/gate-verify.mjs",
   ".orca/worktree-isolation.mjs",
   ".orca/merge-danger.mjs",
   ".orca/health.mjs",
   ".orca/ledger.mjs",
-  ".orca/designer.mjs",
-  ".orca/designer.html",
+  ".orca/lib/orca-cli.mjs",
+  ".orca/lib/status.mjs",
+  ".orca/lib/status-template.html",
+  ".orca/lib/usage.mjs",
+  ".orca/lib/notify.mjs",
+  ".orca/lib/nudge.mjs",
+  ".orca/lib/runner.mjs",
   ".orca/flow.config.json",
   ".orca/flow-hotfix.json",
   ".orca/flow-feature.json",
   ".orca/flow-epic.json",
-  ".orca/fixbug.config.json",
-  ".orca/cr.config.json",
   ".orca/CONFIGURATION.md",
   ".orca/README.md",
   ".orca/notify.json",
   ".orca/prompts/triage-po.md",
   ".orca/prompts/frontend-worker.md",
   ".orca/prompts/senior-auditor.md",
-  ".orca/workflow-template/README.md",
-  ".orca/workflow-template/sdlc.config.json",
-  ".orca/workflow-template/fixbug.config.json",
-  ".orca/workflow-template/cr.config.json",
   "AGENTS.md",
   "DESIGN.md",
   ".worktreeinclude",
@@ -58,7 +56,6 @@ const FILES = [
   "orca.yaml",
 ];
 
-// Files that users frequently customize in their own repos — highlight merge hints if skipped.
 const MERGE_SENSITIVE = new Set([
   "AGENTS.md",
   "DESIGN.md",
@@ -72,21 +69,58 @@ const MERGE_SENSITIVE = new Set([
 const ENGINE_FILES = new Set([
   ".orca/flow.mjs",
   ".orca/agent-config.mjs",
+  ".orca/agent-scanner.mjs",
+  ".orca/strategy-wizard.mjs",
   ".orca/gate-verify.mjs",
   ".orca/worktree-isolation.mjs",
   ".orca/merge-danger.mjs",
   ".orca/health.mjs",
   ".orca/ledger.mjs",
-  ".orca/designer.mjs",
-  ".orca/designer.html",
+  ".orca/lib/orca-cli.mjs",
+  ".orca/lib/status.mjs",
+  ".orca/lib/status-template.html",
+  ".orca/lib/usage.mjs",
+  ".orca/lib/notify.mjs",
+  ".orca/lib/nudge.mjs",
+  ".orca/lib/runner.mjs",
   ".orca/CONFIGURATION.md",
   ".orca/README.md",
 ]);
+
 const args = process.argv.slice(2);
 const force = args.includes("--force");
 const upgradeEngine = args.includes("--upgrade-engine");
+const scanOnly = args.includes("--scan");
+const setupOnly = args.includes("--setup");
+const asJson = args.includes("--json");
+const noOrca = args.includes("--no-orca");
+const applyRecommended = args.includes("--apply-recommended") || args.includes("--yes");
+const noInteractive = args.includes("--no-interactive");
 
-// --- Package sanity: verify every source file exists before touching anything ---
+// --- Scan-only mode (no filesystem changes) ---
+if (scanOnly) {
+  const scan = scanLocalAgents({ queryOrca: !noOrca });
+  const recommendation = recommendStrategy(scan);
+  if (asJson) console.log(JSON.stringify({ scan, recommendation }, null, 2));
+  else console.log(formatScanReport(scan, recommendation));
+  process.exit(0);
+}
+
+// --- Setup-only mode (interactive strategy wizard on existing project) ---
+if (setupOnly) {
+  const scan = scanLocalAgents({ queryOrca: !noOrca });
+  const recommendation = recommendStrategy(scan);
+  await runStrategyWizard({
+    projectDir: process.cwd(),
+    scan,
+    recommendation,
+    interactive: !applyRecommended && !noInteractive && Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    applyRecommended,
+  });
+  process.exit(0);
+}
+
+// --- Package sanity check ---
 const missing = FILES.filter((f) => !existsSync(join(KIT_ROOT, f)));
 if (missing.length) die(`corrupt package — missing: ${missing.join(", ")}`);
 
@@ -100,12 +134,12 @@ try {
       continue;
     }
     mkdirSync(dirname(f), { recursive: true });
-    writeFileSync(f, readFileSync(join(KIT_ROOT, f)));   // Buffer copy = byte-exact
+    writeFileSync(f, readFileSync(join(KIT_ROOT, f)));
     copied.push(f);
   }
 } catch (e) { die(`copy failed: ${e.message}`); }
 
-// --- .gitignore: append the artifacts line exactly once ---
+// --- .gitignore: append .orca/artifacts/ once ---
 const GI_LINE = ".orca/artifacts/";
 const gi = existsSync(".gitignore") ? readFileSync(".gitignore", "utf8") : "";
 const gitignoreAdded = !gi.split(/\r?\n/).includes(GI_LINE);
@@ -115,14 +149,15 @@ if (gitignoreAdded) {
   catch (e) { die(`could not update .gitignore: ${e.message}`); }
 }
 
-// --- Report + merge hints + next steps ---
+// --- Report ---
 log(`installing into ${process.cwd()}`);
 for (const f of copied) log(`  installed   ${f}`);
 for (const f of skipped) log(`  kept yours  ${f}  (already exists; --force to overwrite)`);
 if (gitignoreAdded) log(`  updated     .gitignore  (+ ${GI_LINE})`);
+
 if (upgradeEngine) {
   log("");
-  log("Engine upgraded. Review template workflow updates (e.g. isolatedWorktree, verify, targetBranch):");
+  log("Engine upgraded. Review template workflow updates:");
   for (const tf of [".orca/flow-epic.json", ".orca/flow-feature.json", ".orca/flow-hotfix.json"]) {
     log(`  diff -u "${tf}" "${join(KIT_ROOT, tf)}"`);
   }
@@ -130,13 +165,26 @@ if (upgradeEngine) {
 if (mergeHints.length) {
   log("");
   log("Safe merge hint — the following existing files were preserved:");
-  for (const f of mergeHints) {
-    log(`  diff -u "${f}" "${join(KIT_ROOT, f)}"`);
-  }
+  for (const f of mergeHints) log(`  diff -u "${f}" "${join(KIT_ROOT, f)}"`);
 }
+
+// --- Local agent scan + pre-dev strategy confirmation ---
+if (!upgradeEngine && (applyRecommended || (!noInteractive && process.stdin.isTTY && process.stdout.isTTY))) {
+  const scan = scanLocalAgents({ queryOrca: !noOrca });
+  const recommendation = recommendStrategy(scan);
+  await runStrategyWizard({
+    projectDir: process.cwd(),
+    scan,
+    recommendation,
+    interactive: !applyRecommended && Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    applyRecommended,
+  });
+}
+
 log("");
-log("Next steps (3-Track Workflow):");
-log("  1. Track 0 (Hotfix, <=3 files):  node .orca/flow.mjs --config flow-hotfix.json --dry-run \"#hotfix ...\"");
-log("  2. Track 1 (Feature, default):   node .orca/flow.mjs --dry-run \"#feat ...\"");
-log("  3. Track 2 (Epic / 0->1):        node .orca/flow.mjs --config flow-epic.json --dry-run \"#epic ...\"");
-log("  4. CI Secrets: set TOKENHUB_API_KEY in GitHub/Gitea repo secrets for headless PR summaries.");
+log("Next steps:");
+log("  1. Scan local agents & subscriptions:  node .orca/flow.mjs --scan");
+log("  2. Confirm / tweak dev strategy:       node .orca/flow.mjs --setup");
+log("  3. Track 0 (Hotfix, <=3 files):        node .orca/flow.mjs --config flow-hotfix.json --dry-run \"#hotfix ...\"");
+log("  4. Track 1 (Feature, default):         node .orca/flow.mjs --dry-run \"#feat ...\"");
+log("  5. Track 2 (Epic / 0->1):              node .orca/flow.mjs --config flow-epic.json --dry-run \"#epic ...\"");

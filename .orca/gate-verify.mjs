@@ -40,6 +40,8 @@ import { verifyMergeDangerGate } from "./merge-danger.mjs";
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 const ALLOWED_VERIFY_KEYS = new Set(["requireVerdict", "requireContractCommit", "requireMergedTasks", "mergeDangerCheck"]);
+const O_NOFOLLOW_FLAG = constants.O_NOFOLLOW ?? 0;
+const O_NONBLOCK_FLAG = typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0;
 
 export function validateVerifyConfig(step, die) {
   if (step.verify == null) return;
@@ -119,11 +121,25 @@ function normalizeMarkerLine(raw) {
   return s;
 }
 
-function readManifestSafe(artDir) {
-  if (!artDir) return null;
+function readManifestSafe(artDir, { gitDir = null, wtRootDir = null } = {}) {
+  if (!artDir) {
+    return { ok: false, manifest: null, missing: true, reason: "WORKTREES.json is missing" };
+  }
+  const walkRoot = resolveTrustedWalkRoot(artDir, gitDir, wtRootDir);
   const p = join(artDir, "WORKTREES.json");
-  if (!existsSync(p)) return null;
-  try { return JSON.parse(readFileSync(p, "utf8")); } catch { return null; }
+  try {
+    const { text } = readFileNoFollow(walkRoot, artDir, p, { encoding: "utf8", label: "[gate-verify]" });
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { ok: false, manifest: null, missing: false, reason: "WORKTREES.json must be a JSON object" };
+    }
+    return { ok: true, manifest: parsed, missing: false, reason: null };
+  } catch (e) {
+    if (e && e.code === "ENOENT") {
+      return { ok: false, manifest: null, missing: true, reason: "WORKTREES.json is missing" };
+    }
+    return { ok: false, manifest: null, missing: false, reason: e?.message || "invalid WORKTREES.json" };
+  }
 }
 
 /**
@@ -132,9 +148,10 @@ function readManifestSafe(artDir) {
  * Options:
  *  - gitDir: integration worktree directory
  *  - artDir: artifacts directory (used to consult WORKTREES.json)
+ *  - wtRootDir: optional explicit worktree root directory for containment checks
  *  - mode: "settlement" (strict HEAD match) | "readiness" (allows post-merge ancestor match)
  */
-export function verifyArtifactContent(text, verify, { gitDir = null, artDir = null, mode = "settlement", targetBranch = "dev", allowOneWayMerge = false, preStepTargetSha = null, preStepOriginTargetSha = null, preStepRemoteTargetSha = null, preStepRemoteError = null, preStepHasOrigin = false, preStepHeadSha = null, mergeDangerThresholds = null } = {}) {
+export function verifyArtifactContent(text, verify, { gitDir = null, artDir = null, wtRootDir = null, mode = "settlement", targetBranch = "dev", allowOneWayMerge = false, preStepTargetSha = null, preStepOriginTargetSha = null, preStepRemoteTargetSha = null, preStepRemoteError = null, preStepHasOrigin = false, preStepHeadSha = null, mergeDangerThresholds = null } = {}) {
   if (!verify || typeof verify !== "object") {
     return { ok: true, reason: null, verdict: null, contractCommit: null, expectedCommit: null };
   }
@@ -236,7 +253,8 @@ export function verifyArtifactContent(text, verify, { gitDir = null, artDir = nu
       // In readiness mode AFTER task-review-merge has merged approved task branches,
       // HEAD advances to the merge commit. Allow the pinned verifiedContractCommit
       // if (and only if) it was verified at settlement and is an ancestor of HEAD.
-      const mf = mode === "readiness" ? readManifestSafe(artDir) : null;
+      const mfRes = mode === "readiness" ? readManifestSafe(artDir, { gitDir, wtRootDir }) : null;
+      const mf = mfRes?.ok ? mfRes.manifest : null;
       const isRealGit = gitDir ? spawnSync("git", ["-C", gitDir, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" }).status === 0 : false;
       const postMergeAllowed = Boolean(
         mode === "readiness" &&
@@ -256,10 +274,31 @@ export function verifyArtifactContent(text, verify, { gitDir = null, artDir = nu
   }
 
   if (verify.requireMergedTasks && mode === "settlement") {
-    const mf = readManifestSafe(artDir);
-    const tasks = mf && mf.tasks ? Object.values(mf.tasks) : [];
+    const mfRes = readManifestSafe(artDir, { gitDir, wtRootDir });
+    if (!mfRes.ok) {
+      return {
+        ok: false,
+        reason: `invalid or missing WORKTREES.json for requireMergedTasks: ${mfRes.reason}`,
+        verdict: foundVerdict, contractCommit: foundCommit, expectedCommit,
+      };
+    }
+    if (!mfRes.manifest.tasks || typeof mfRes.manifest.tasks !== "object" || Array.isArray(mfRes.manifest.tasks)) {
+      return {
+        ok: false,
+        reason: "invalid or missing WORKTREES.json for requireMergedTasks: manifest.tasks must be an object",
+        verdict: foundVerdict, contractCommit: foundCommit, expectedCommit,
+      };
+    }
+    const tasks = Object.values(mfRes.manifest.tasks);
     const isRealGit = gitDir ? spawnSync("git", ["-C", gitDir, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" }).status === 0 : false;
     for (const t of tasks) {
+      if (!t || typeof t !== "object" || Array.isArray(t)) {
+        return {
+          ok: false,
+          reason: "invalid or missing WORKTREES.json for requireMergedTasks: malformed task entry",
+          verdict: foundVerdict, contractCommit: foundCommit, expectedCommit,
+        };
+      }
       if (t.status !== "succeeded") {
         return {
           ok: false,
@@ -608,9 +647,6 @@ export function assertSafePathFromRoot(trustedRootDir, containerDir, targetPath,
     throw new Error(`${errPrefix} ${check.reason}`);
   }
 }
-
-const O_NOFOLLOW_FLAG = constants.O_NOFOLLOW ?? 0;
-const O_NONBLOCK_FLAG = typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0;
 
 /**
  * P0-01b: Read a regular file inside `containerDir` (anchored at `walkRoot`) from a
@@ -988,7 +1024,7 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
       let contentRes = { ok: true, reason: null };
       if (step.verify) {
         contentRes = verifyArtifactContent(scopedText, step.verify, {
-          gitDir, artDir, mode: opts.mode || "settlement", targetBranch: opts.targetBranch || "dev",
+          gitDir, artDir, wtRootDir: opts.wtRootDir || null, mode: opts.mode || "settlement", targetBranch: opts.targetBranch || "dev",
           allowOneWayMerge: Boolean(opts.allowOneWayMerge), preStepTargetSha: opts.preStepTargetSha || null,
           preStepOriginTargetSha: opts.preStepOriginTargetSha || null, preStepRemoteTargetSha: opts.preStepRemoteTargetSha || null,
           preStepRemoteError: opts.preStepRemoteError || null, preStepHasOrigin: Boolean(opts.preStepHasOrigin),
@@ -1068,7 +1104,7 @@ export function verifyStepArtifact(step, artDir, gitDir, minBytes = 200, opts = 
       };
     }
   }
-  return verifyArtifactContent(text, step.verify, { gitDir, artDir, mode: opts.mode || "settlement", targetBranch: opts.targetBranch || "dev", allowOneWayMerge: Boolean(opts.allowOneWayMerge), preStepTargetSha: opts.preStepTargetSha || null, preStepOriginTargetSha: opts.preStepOriginTargetSha || null, preStepRemoteTargetSha: opts.preStepRemoteTargetSha || null, preStepRemoteError: opts.preStepRemoteError || null, preStepHasOrigin: Boolean(opts.preStepHasOrigin), preStepHeadSha: opts.preStepHeadSha || null, mergeDangerThresholds: opts.mergeDangerThresholds || null });
+  return verifyArtifactContent(text, step.verify, { gitDir, artDir, wtRootDir: opts.wtRootDir || null, mode: opts.mode || "settlement", targetBranch: opts.targetBranch || "dev", allowOneWayMerge: Boolean(opts.allowOneWayMerge), preStepTargetSha: opts.preStepTargetSha || null, preStepOriginTargetSha: opts.preStepOriginTargetSha || null, preStepRemoteTargetSha: opts.preStepRemoteTargetSha || null, preStepRemoteError: opts.preStepRemoteError || null, preStepHasOrigin: Boolean(opts.preStepHasOrigin), preStepHeadSha: opts.preStepHeadSha || null, mergeDangerThresholds: opts.mergeDangerThresholds || null });
 }
 
 export function formatVerifySummary(verify) {

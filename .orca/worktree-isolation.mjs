@@ -145,13 +145,13 @@ function emptyWorktreesManifest() {
 }
 
 export function readWorktreesManifest(artDir, wtRootDir = null) {
+  if (!artDir) return emptyWorktreesManifest();
   const walkRoot = resolveTrustedWalkRoot(artDir, null, wtRootDir);
   const p = join(artDir, WORKTREES_MANIFEST);
-  if (!verifySafePathFromRoot(walkRoot, artDir, p).ok) return emptyWorktreesManifest();
-  if (!existsSync(p)) return emptyWorktreesManifest();
   try {
     const { text } = readFileNoFollow(walkRoot, artDir, p, { encoding: "utf8", label: "[worktree-isolation]" });
     const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return emptyWorktreesManifest();
     return {
       runId: parsed.runId ?? null,
       integrationWorktree: parsed.integrationWorktree ?? null,
@@ -159,7 +159,7 @@ export function readWorktreesManifest(artDir, wtRootDir = null) {
       baseCommit: parsed.baseCommit ?? null,
       verifiedContractCommit: parsed.verifiedContractCommit ?? null,
       mergedAfterContract: Boolean(parsed.mergedAfterContract),
-      tasks: parsed.tasks && typeof parsed.tasks === "object" ? parsed.tasks : {},
+      tasks: parsed.tasks && typeof parsed.tasks === "object" && !Array.isArray(parsed.tasks) ? parsed.tasks : {},
     };
   } catch {
     return emptyWorktreesManifest();
@@ -210,14 +210,13 @@ export function recordMergedAfterContract(artDir, wtDir) {
 }
 
 function readGateClaims(artDir, wtRootDir = null) {
+  if (!artDir) return {};
   const walkRoot = resolveTrustedWalkRoot(artDir, null, wtRootDir);
   const p = join(artDir, DISPATCH_GATE_CLAIMS_FILE);
-  if (!verifySafePathFromRoot(walkRoot, artDir, p).ok) return {};
-  if (!existsSync(p)) return {};
   try {
     const { text } = readFileNoFollow(walkRoot, artDir, p, { encoding: "utf8", label: "[worktree-isolation]" });
     const parsed = JSON.parse(text);
-    return parsed && typeof parsed === "object" ? parsed : {};
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
   } catch {
     return {};
   }

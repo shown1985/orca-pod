@@ -8,7 +8,7 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { closeSync, constants, existsSync, fstatSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readlinkSync, readSync } from "node:fs";
 import { join } from "node:path";
 import { sanitizeText } from "./lib/sanitize.mjs";
 
@@ -234,17 +234,33 @@ export function detectOutputLoop(history, latestLines = [], { threshold = 4 } = 
   return null;
 }
 
+function hashSymlinkTarget(filePath) {
+  const target = readlinkSync(filePath);
+  const h = createHash("sha256");
+  h.update(`symlink:${target.length}:${target}`);
+  return { exists: true, partial: false, size: target.length, digest: h.digest("hex").slice(0, 24) };
+}
+
 /**
  * Stream-hash file content in 64KB chunks so large files (>512KB) are content-hashed
  * without heap spikes; marks `partial: true` if file exceeds `maxBytes` or cannot be read.
+ * Uses `lstatSync` first (never following symlinks); when `allowSymlinkTarget === true`
+ * (Git working tree entries), hashes the symlink target string via `readlinkSync` without
+ * opening or following the target.
  */
-function hashFileStreaming(filePath, maxBytes = MAX_STREAM_FILE_BYTES) {
+function hashFileStreaming(filePath, maxBytes = MAX_STREAM_FILE_BYTES, { allowSymlinkTarget = false } = {}) {
   let fd = null;
   try {
-    const s = statSync(filePath);
-    if (!s.isFile()) return { exists: false, partial: false, size: 0, digest: null };
-    if (s.size > maxBytes) {
-      return { exists: true, partial: true, size: s.size, digest: null };
+    const lst = lstatSync(filePath);
+    if (lst.isSymbolicLink()) {
+      if (!allowSymlinkTarget) {
+        return { exists: false, partial: false, size: 0, digest: null };
+      }
+      return hashSymlinkTarget(filePath);
+    }
+    if (!lst.isFile()) return { exists: false, partial: false, size: 0, digest: null };
+    if (lst.size > maxBytes) {
+      return { exists: true, partial: true, size: lst.size, digest: null };
     }
     const h = createHash("sha256");
     fd = openSync(
@@ -268,6 +284,16 @@ function hashFileStreaming(filePath, maxBytes = MAX_STREAM_FILE_BYTES) {
     return { exists: true, partial: false, size: fst.size, digest: h.digest("hex").slice(0, 24) };
   } catch (e) {
     if (e && e.code === "ENOENT") return { exists: false, partial: false, size: 0, digest: null };
+    if (e && (e.code === "ELOOP" || e.code === "EMLINK" || e.code === "EFTYPE")) {
+      if (allowSymlinkTarget) {
+        try {
+          return hashSymlinkTarget(filePath);
+        } catch {
+          return { exists: false, partial: false, size: 0, digest: null };
+        }
+      }
+      return { exists: false, partial: false, size: 0, digest: null };
+    }
     return { exists: false, partial: true, size: 0, digest: null };
   } finally {
     if (fd !== null) { try { closeSync(fd); } catch {} }
@@ -311,7 +337,7 @@ export function probeWorktreeActivity(worktreeDir, {
           break;
         }
         inspected++;
-        const info = hashFileStreaming(join(worktreeDir, relPath));
+        const info = hashFileStreaming(join(worktreeDir, relPath), MAX_STREAM_FILE_BYTES, { allowSymlinkTarget: true });
         if (info.partial) {
           gitPartial = true;
           break;

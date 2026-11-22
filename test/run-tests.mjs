@@ -8430,6 +8430,371 @@ if (mode === "canonical_fifo") {
 });
 
 // ---------------------------------------------------------------------------
+// V21 — Round 13 Final Release Closure Suite:
+//   P1-A: Non-blocking WORKTREES.json FIFO rejection & fail-closed requireMergedTasks
+//   P1-B: Watchdog preserves Git progress across dirty Git-tracked symlinks + equal-length code edits
+// ---------------------------------------------------------------------------
+scenario("V21: Round 13 non-blocking WORKTREES.json manifest gate (fail-closed requireMergedTasks) & Git-tracked symlink fingerprinting in watchdog", async () => {
+  const { execFileSync, spawnSync } = await import("node:child_process");
+  const { symlinkSync, unlinkSync } = await import("node:fs");
+  const { pathToFileURL } = await import("node:url");
+
+  const { verifyStepArtifact } = await import(join(REPO, ".orca", "gate-verify.mjs"));
+  const { bindStepArtifactDispatchClaim } = await import(join(REPO, ".orca", "worktree-isolation.mjs"));
+  const { probeWorktreeActivity, createWatchdogTracker, evaluateWatchdog } = await import(join(REPO, ".orca", "watchdog.mjs"));
+
+  const tmpV21 = mkdtempSync(join(tmpdir(), "orca-v21-"));
+  dirsOfCurrentScenario.push(tmpV21);
+
+  // -------------------------------------------------------------------------
+  // P1-A: WORKTREES.json non-blocking FIFO & fail-closed requireMergedTasks
+  // -------------------------------------------------------------------------
+  const mergeStep = {
+    id: "task-review-merge",
+    writes: "TASK_REVIEW_MERGE.md",
+    verify: { requireVerdict: "PASS", requireMergedTasks: true },
+  };
+  const validMergeReport = [
+    "<!-- orca-dispatch: disp-merge -->",
+    "# Task Review & Merge Report",
+    "",
+    "Verified and merged isolated worker branches into integration HEAD cleanly.",
+    "",
+    "VERDICT: PASS",
+    "",
+  ].join("\n");
+
+  // 1) Writerless POSIX FIFO at .orca/artifacts/WORKTREES.json (bounded 2000ms child process)
+  let mkfifoAvailable = false;
+  if (process.platform !== "win32") {
+    const probeFifo = join(tmpV21, "probe.fifo");
+    const mk = spawnSync("mkfifo", [probeFifo], { encoding: "utf8" });
+    if (!mk.error && mk.status === 0) {
+      mkfifoAvailable = true;
+      rmSync(probeFifo, { force: true });
+    }
+  }
+
+  if (mkfifoAvailable) {
+    const gateVerifyUrl = pathToFileURL(join(REPO, ".orca", "gate-verify.mjs")).href;
+    const wtIsoUrl = pathToFileURL(join(REPO, ".orca", "worktree-isolation.mjs")).href;
+    const v21FifoRunner = join(tmpV21, "v21-manifest-fifo-runner.mjs");
+    writeFileSync(v21FifoRunner, `
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import { join } from "node:path";
+
+const { verifyStepArtifact } = await import(${JSON.stringify(gateVerifyUrl)});
+const { bindStepArtifactDispatchClaim, readWorktreesManifest } = await import(${JSON.stringify(wtIsoUrl)});
+
+const root = process.argv[2];
+const wt = join(root, "wt-manifest-fifo");
+const art = join(wt, ".orca", "artifacts");
+fs.mkdirSync(join(art, ".dispatch-disp-merge"), { recursive: true });
+
+const step = {
+  id: "task-review-merge",
+  writes: "TASK_REVIEW_MERGE.md",
+  verify: { requireVerdict: "PASS", requireMergedTasks: true },
+};
+bindStepArtifactDispatchClaim(wt, ".orca/artifacts", step, {
+  dispatchId: "disp-merge",
+  fsEpochMtimeMs: 0,
+  clearedAtMs: 0,
+});
+fs.writeFileSync(join(art, ".dispatch-disp-merge", "TASK_REVIEW_MERGE.md"), ${JSON.stringify(validMergeReport)});
+
+const mk = spawnSync("mkfifo", [join(art, "WORKTREES.json")], { encoding: "utf8" });
+if (mk.error || mk.status !== 0) throw new Error("mkfifo failed");
+
+const rSettlement = verifyStepArtifact(step, art, wt, 20, {
+  mode: "settlement",
+  wtRootDir: wt,
+  dispatchId: "disp-merge",
+  clearedBeforeDispatch: true,
+});
+
+// Also verify readiness postMergeAllowed lookup and readWorktreesManifest never block on FIFO!
+const contractStep = {
+  id: "contract-review",
+  writes: "CONTRACT_REVIEW.md",
+  verify: { requireVerdict: "PASS", requireContractCommit: "HEAD" },
+};
+fs.writeFileSync(join(art, "CONTRACT_REVIEW.md"), [
+  "# Contract Review",
+  "Contract-Commit: 1111111111111111111111111111111111111111",
+  "Details padding past minBytes check cleanly.",
+  "VERDICT: PASS",
+].join("\\n"));
+process.env.ORCA_TEST_MODE = "1";
+process.env.ORCA_VERIFY_HEAD_SHA = "2222222222222222222222222222222222222222";
+const rReadiness = verifyStepArtifact(contractStep, art, wt, 20, {
+  mode: "readiness",
+  wtRootDir: wt,
+});
+const mfFallback = readWorktreesManifest(art, wt);
+
+console.log(JSON.stringify({
+  settlementOk: rSettlement.ok,
+  settlementReason: rSettlement.reason,
+  readinessOk: rReadiness.ok,
+  mfTasksEmpty: Object.keys(mfFallback.tasks || {}).length === 0,
+}));
+`);
+
+    const fifoRes = await new Promise((resolveCase) => {
+      const t0Case = Date.now();
+      let timedOut = false;
+      let out = "";
+      let err = "";
+      const ch = spawn(NODE, [v21FifoRunner, tmpV21], {
+        cwd: REPO,
+        env: { ...process.env, NODE_OPTIONS: "" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const tmr = setTimeout(() => {
+        timedOut = true;
+        ch.kill("SIGKILL");
+      }, 2000);
+      ch.stdout.on("data", (d) => (out += d));
+      ch.stderr.on("data", (d) => (err += d));
+      ch.on("exit", (code) => {
+        clearTimeout(tmr);
+        let json = null;
+        try { json = JSON.parse(out.trim().split(/\r?\n/).pop()); } catch {}
+        resolveCase({ timedOut, code, dtMs: Date.now() - t0Case, json, err });
+      });
+    });
+
+    eq("V21 P1-A1: writerless FIFO at WORKTREES.json exits cleanly <2s without blocking and fails closed",
+      [fifoRes.timedOut, fifoRes.code, fifoRes.json?.settlementOk, fifoRes.json?.readinessOk, fifoRes.json?.mfTasksEmpty],
+      [false, 0, false, false, true]);
+    ok("V21 P1-A1b: FIFO manifest rejection reason cites invalid or missing WORKTREES.json",
+      /invalid or missing WORKTREES\.json/.test(String(fifoRes.json?.settlementReason || "")));
+  } else {
+    ok("V21 POSIX FIFO manifest probe skipped on platform without mkfifo", true);
+  }
+
+  // 2) Missing, symlinked, failed-task, and succeeded-merged WORKTREES.json in real Git repo
+  const gitMergeWt = join(tmpV21, "git-merge-wt");
+  mkdirSync(gitMergeWt, { recursive: true });
+  execFileSync("git", ["init", "-b", "dev"], { cwd: gitMergeWt });
+  execFileSync("git", ["config", "user.email", "test@orca.local"], { cwd: gitMergeWt });
+  execFileSync("git", ["config", "user.name", "Orca Test"], { cwd: gitMergeWt });
+  writeFileSync(join(gitMergeWt, "base.txt"), "contract\n");
+  execFileSync("git", ["add", "base.txt"], { cwd: gitMergeWt });
+  execFileSync("git", ["commit", "-m", "contract"], { cwd: gitMergeWt });
+  const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: gitMergeWt, encoding: "utf8" }).trim();
+
+  execFileSync("git", ["checkout", "-b", "task/worker-be"], { cwd: gitMergeWt });
+  writeFileSync(join(gitMergeWt, "be.js"), "export const be = true;\n");
+  execFileSync("git", ["add", "be.js"], { cwd: gitMergeWt });
+  execFileSync("git", ["commit", "-m", "feat: backend"], { cwd: gitMergeWt });
+  const taskSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: gitMergeWt, encoding: "utf8" }).trim();
+
+  execFileSync("git", ["checkout", "-b", "epic/merge-test", baseSha], { cwd: gitMergeWt });
+  execFileSync("git", ["merge", "--no-ff", "task/worker-be", "-m", "merge task/worker-be"], { cwd: gitMergeWt });
+
+  const setupMergeGateAttempt = (subName) => {
+    const wt = subName ? join(tmpV21, subName) : gitMergeWt;
+    const art = join(wt, ".orca", "artifacts");
+    rmSync(art, { recursive: true, force: true });
+    mkdirSync(join(art, ".dispatch-disp-merge"), { recursive: true });
+    bindStepArtifactDispatchClaim(wt, ".orca/artifacts", mergeStep, {
+      dispatchId: "disp-merge",
+      fsEpochMtimeMs: 0,
+      clearedAtMs: 0,
+    });
+    writeFileSync(join(art, ".dispatch-disp-merge", "TASK_REVIEW_MERGE.md"), validMergeReport);
+    return { wt, art };
+  };
+
+  // (a) Missing WORKTREES.json -> ok === false
+  {
+    const { wt, art } = setupMergeGateAttempt(null);
+    const rMissing = verifyStepArtifact(mergeStep, art, wt, 20, {
+      mode: "settlement",
+      wtRootDir: wt,
+      dispatchId: "disp-merge",
+      clearedBeforeDispatch: true,
+    });
+    eq("V21 P1-A2: missing WORKTREES.json fails closed for requireMergedTasks", rMissing.ok, false);
+    ok("V21 P1-A2b: missing WORKTREES.json reason mentions missing manifest",
+      /WORKTREES\.json is missing/.test(String(rMissing.reason || "")));
+  }
+
+  // (b) Symlinked WORKTREES.json -> ok === false
+  {
+    const extMf = join(tmpV21, "external-worktrees.json");
+    writeFileSync(extMf, JSON.stringify({
+      tasks: { "worker-be": { stepId: "worker-be", branch: "task/worker-be", status: "succeeded", dirty: false, headCommit: taskSha } },
+    }));
+    const { wt, art } = setupMergeGateAttempt(null);
+    let symCreated = true;
+    try {
+      symlinkSync(extMf, join(art, "WORKTREES.json"));
+    } catch {
+      symCreated = false;
+    }
+    if (symCreated) {
+      const rSymlink = verifyStepArtifact(mergeStep, art, wt, 20, {
+        mode: "settlement",
+        wtRootDir: wt,
+        dispatchId: "disp-merge",
+        clearedBeforeDispatch: true,
+      });
+      eq("V21 P1-A3: symlinked WORKTREES.json fails closed for requireMergedTasks", rSymlink.ok, false);
+    } else {
+      ok("V21 P1-A3: symlink creation skipped cleanly", true);
+    }
+  }
+
+  // (c) Valid WORKTREES.json with failed task -> ok === false
+  {
+    const { wt, art } = setupMergeGateAttempt(null);
+    writeFileSync(join(art, "WORKTREES.json"), JSON.stringify({
+      tasks: {
+        "worker-be": { stepId: "worker-be", branch: "task/worker-be", status: "failed", dirty: false, headCommit: taskSha },
+      },
+    }));
+    const rFailedTask = verifyStepArtifact(mergeStep, art, wt, 20, {
+      mode: "settlement",
+      wtRootDir: wt,
+      dispatchId: "disp-merge",
+      clearedBeforeDispatch: true,
+    });
+    eq("V21 P1-A4: WORKTREES.json with failed task fails closed for requireMergedTasks", rFailedTask.ok, false);
+  }
+
+  // (d) Valid WORKTREES.json with succeeded & merged task -> ok === true
+  {
+    const { wt, art } = setupMergeGateAttempt(null);
+    writeFileSync(join(art, "WORKTREES.json"), JSON.stringify({
+      tasks: {
+        "worker-be": { stepId: "worker-be", branch: "task/worker-be", status: "succeeded", dirty: false, headCommit: taskSha },
+      },
+    }));
+    const rMergedOk = verifyStepArtifact(mergeStep, art, wt, 20, {
+      mode: "settlement",
+      wtRootDir: wt,
+      dispatchId: "disp-merge",
+      clearedBeforeDispatch: true,
+    });
+    eq("V21 P1-A5: valid WORKTREES.json with succeeded merged task returns ok=true",
+      [rMergedOk.ok, rMergedOk.verdict],
+      [true, "PASS"]);
+  }
+
+  // -------------------------------------------------------------------------
+  // P1-B: Watchdog preserves Git progress when repo has a dirty Git-tracked symlink
+  // -------------------------------------------------------------------------
+  const symRepo = join(tmpV21, "git-dirty-symlink-wt");
+  mkdirSync(symRepo, { recursive: true });
+  execFileSync("git", ["init", "-b", "main"], { cwd: symRepo });
+  execFileSync("git", ["config", "user.email", "test@orca.local"], { cwd: symRepo });
+  execFileSync("git", ["config", "user.name", "Orca Test"], { cwd: symRepo });
+  writeFileSync(join(symRepo, "target-a.txt"), "alpha\n");
+  writeFileSync(join(symRepo, "target-b.txt"), "beta\n");
+  writeFileSync(join(symRepo, "z-code.js"), "const v = 1;\n");
+
+  let gitSymSupported = true;
+  try {
+    symlinkSync("target-a.txt", join(symRepo, "a-link"));
+  } catch {
+    gitSymSupported = false;
+  }
+
+  if (gitSymSupported) {
+    execFileSync("git", ["add", "target-a.txt", "target-b.txt", "a-link", "z-code.js"], { cwd: symRepo });
+    execFileSync("git", ["commit", "-m", "init symlink + code"], { cwd: symRepo });
+
+    // Re-point Git-tracked symlink `a-link` -> `target-b.txt` (dirty symlink in git status)
+    unlinkSync(join(symRepo, "a-link"));
+    symlinkSync("target-b.txt", join(symRepo, "a-link"));
+
+    const tStart = 1_000_000;
+    const probe1 = probeWorktreeActivity(symRepo);
+    const wd = createWatchdogTracker({
+      step: {
+        id: "worker",
+        watchdog: {
+          enabled: true,
+          stallTimeoutMs: 5000,
+          extendOnActivity: true,
+          activityFreshMs: 60000,
+          fallbackOnStall: true,
+        },
+      },
+      cfg: {},
+      startedAt: tStart,
+      worktreeDir: symRepo,
+      sharedWorktree: false,
+    });
+
+    // Seed initial preview so subsequent evaluation has zero new terminal output past stall threshold
+    evaluateWatchdog(wd, {
+      now: tStart + 1000,
+      preview: "compiling module...\n",
+      previewChanged: true,
+      previewSeenBefore: false,
+      fallbackAvailable: true,
+    });
+
+    // Equal-length edit to z-code.js while `a-link` remains a dirty Git-tracked symlink!
+    writeFileSync(join(symRepo, "z-code.js"), "const v = 2;\n");
+    const probe2 = probeWorktreeActivity(symRepo);
+    const evalAfterCodeEdit = evaluateWatchdog(wd, {
+      now: tStart + 10000, // 9s since last output (> 5s stallTimeoutMs!)
+      preview: "compiling module...\n",
+      previewChanged: false,
+      previewSeenBefore: true,
+      fallbackAvailable: true,
+    });
+
+    ok("V21 P1-B1: gitFingerprint is non-null before and after equal-length code edit alongside dirty symlink",
+      Boolean(probe1.gitFingerprint && probe2.gitFingerprint && !probe1.gitPartial && !probe2.gitPartial));
+    ok("V21 P1-B2: gitFingerprint changes on equal-length edit to z-code.js despite dirty symlink a-link",
+      probe1.gitFingerprint !== probe2.gitFingerprint);
+    eq("V21 P1-B3: watchdog detects Git progress and returns action='extend' (never stalled_hang/fallback)",
+      [evalAfterCodeEdit.status, evalAfterCodeEdit.action, evalAfterCodeEdit.gitChanged],
+      ["healthy", "extend", true]);
+
+    // Re-pointing `a-link` itself to a non-existent dangling target AND to a writerless FIFO
+    // changes `gitFingerprint` without following the symlink target or blocking!
+    unlinkSync(join(symRepo, "a-link"));
+    symlinkSync("non-existent-dangling-target.txt", join(symRepo, "a-link"));
+    const probeDangling = probeWorktreeActivity(symRepo);
+    ok("V21 P1-B4: re-pointing dirty symlink to dangling target updates gitFingerprint without error",
+      Boolean(probeDangling.gitFingerprint && !probeDangling.gitPartial && probeDangling.gitFingerprint !== probe2.gitFingerprint));
+
+    if (mkfifoAvailable) {
+      const trapFifo = join(tmpV21, "watchdog-trap.fifo");
+      spawnSync("mkfifo", [trapFifo], { encoding: "utf8" });
+      unlinkSync(join(symRepo, "a-link"));
+      symlinkSync(trapFifo, join(symRepo, "a-link"));
+      const probeFifoTarget = probeWorktreeActivity(symRepo);
+      ok("V21 P1-B5: re-pointing dirty symlink to writerless FIFO hashes link target without opening FIFO",
+        Boolean(probeFifoTarget.gitFingerprint && !probeFifoTarget.gitPartial && probeFifoTarget.gitFingerprint !== probeDangling.gitFingerprint));
+    }
+
+    // Artifact symlinks remain ignored (allowSymlinkTarget=false by default)
+    const symArtDir = join(symRepo, ".orca", "artifacts");
+    mkdirSync(symArtDir, { recursive: true });
+    symlinkSync(join(symRepo, "z-code.js"), join(symArtDir, "LINKED_REPORT.md"));
+    const probeArtSym = probeWorktreeActivity(symRepo, {
+      artifactPath: join(symArtDir, "LINKED_REPORT.md"),
+      artDirPath: symArtDir,
+      sharedWorktree: false,
+    });
+    eq("V21 P1-B6: symlinked artifactPath/artDirPath entries are never followed by watchdog",
+      [probeArtSym.ownArtifactFingerprint, probeArtSym.dirArtifactFingerprint, probeArtSym.artifactSize],
+      ["", "", 0]);
+  } else {
+    ok("V21 Git symlink test skipped cleanly on platform without symlink privileges", true);
+  }
+});
+
+// ---------------------------------------------------------------------------
 (async () => {
   const t0 = Date.now();
   for (const s of scenarios) {
